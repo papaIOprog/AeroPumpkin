@@ -654,6 +654,13 @@ impl Level {
             self.loaded_chunk_changes
                 .push(LoadedChunkChange::Loaded(pos));
         }
+        // A chunk loaded back from disk can carry saved scheduled ticks
+        // (redstone, repeaters, fluids). The tick pump only drains chunks in
+        // this set, so register it or the circuit stays frozen after a
+        // chunk unload-load cycle.
+        if chunk.block_ticks.has_ticks() || chunk.fluid_ticks.has_ticks() {
+            self.chunks_with_scheduled_ticks.insert(pos);
+        }
         f(&chunk)
     }
 

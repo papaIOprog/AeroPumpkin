@@ -211,6 +211,39 @@ const FACING: &str = "facing";
 const LAST_PROGRESS: &str = "progress";
 const EXTENDING: &str = "extending";
 const SOURCE: &str = "source";
+const BLOCK_STATE: &str = "blockState";
+
+impl PistonBlockEntity {
+    /// Vanilla `saveAdditional`/`getUpdateTag`: the client's
+    /// `PistonMovingBlockEntity` animates from `blockState`, `facing` (an
+    /// int in vanilla, not the byte this used to write), `progress`,
+    /// `extending` and `source`.
+    fn write_common_nbt(&self, nbt: &mut NbtCompound) {
+        let block = Block::from_state_id(self.pushed_block_state.id);
+        let mut state_comp = NbtCompound::new();
+        let name = if block.name.starts_with("minecraft:") {
+            block.name.to_string()
+        } else {
+            format!("minecraft:{}", block.name)
+        };
+        state_comp.put_string("Name", name);
+        if let Some(props) = block.properties(self.pushed_block_state.id) {
+            let prop_vec = props.to_props();
+            if !prop_vec.is_empty() {
+                let mut props_comp = NbtCompound::new();
+                for (k, v) in prop_vec {
+                    props_comp.put_string(k, v.to_string());
+                }
+                state_comp.put_compound("Properties", props_comp);
+            }
+        }
+        nbt.put_compound(BLOCK_STATE, state_comp);
+        nbt.put_int(FACING, i32::from(self.facing.to_index()));
+        nbt.put_float(LAST_PROGRESS, self.last_progress.load());
+        nbt.put_bool(EXTENDING, self.extending);
+        nbt.put_bool(SOURCE, self.source);
+    }
+}
 
 impl BlockEntity for PistonBlockEntity {
     fn resource_location(&self) -> &'static str {
@@ -256,9 +289,18 @@ impl BlockEntity for PistonBlockEntity {
     where
         Self: Sized,
     {
-        // TODO
-        let pushed_block_state = Block::AIR.default_state;
-        let facing = nbt.get_byte(FACING).unwrap_or(0);
+        let pushed_block_state = nbt
+            .get_compound(BLOCK_STATE)
+            .and_then(|state_comp| state_comp.get_string("Name"))
+            .and_then(|name| {
+                let key = name.strip_prefix("minecraft:").unwrap_or(name);
+                Block::from_registry_key(key).map(|block| block.default_state)
+            })
+            .unwrap_or(Block::AIR.default_state);
+        let facing = nbt
+            .get_int(FACING)
+            .or_else(|| nbt.get_byte(FACING).map(i32::from))
+            .unwrap_or(0);
         let last_progress = nbt.get_float(LAST_PROGRESS).unwrap_or(0.0);
         let extending = nbt.get_bool(EXTENDING).unwrap_or(false);
         let source = nbt.get_bool(SOURCE).unwrap_or(false);
@@ -274,21 +316,12 @@ impl BlockEntity for PistonBlockEntity {
     }
 
     fn write_nbt(&self, nbt: &mut NbtCompound) {
-        // TODO: pushed_block_state
-        nbt.put_byte(FACING, self.facing.to_index() as i8);
-        nbt.put_float(LAST_PROGRESS, self.last_progress.load());
-        nbt.put_bool(EXTENDING, self.extending);
-        nbt.put_bool(SOURCE, self.source);
+        self.write_common_nbt(nbt);
     }
 
     fn chunk_data_nbt(&self) -> Option<NbtCompound> {
         let mut nbt = NbtCompound::new();
-        // TODO: pushed_block_state
-        nbt.put_byte(FACING, self.facing.to_index() as i8);
-        nbt.put_float(LAST_PROGRESS, self.last_progress.load());
-        nbt.put_bool(EXTENDING, self.extending);
-        nbt.put_bool(SOURCE, self.source);
-        // TODO: duplicated code because of async :c
+        self.write_common_nbt(&mut nbt);
         Some(nbt)
     }
 
