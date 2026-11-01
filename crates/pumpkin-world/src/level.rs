@@ -589,9 +589,14 @@ impl Level {
                 ticks.block_ticks.append(&mut chunk.block_ticks.step_tick());
                 ticks.fluid_ticks.append(&mut chunk.fluid_ticks.step_tick());
 
-                // Remove from set if it no longer has ticks
-                if !chunk.block_ticks.has_ticks() && !chunk.fluid_ticks.has_ticks() {
-                    self.chunks_with_scheduled_ticks.remove(&pos);
+                // Remove first, then re-check: block updates can run off the
+                // tick thread (lever clicks) and schedule into this chunk
+                // between draining and the emptiness test. Checking first
+                // would unregister a chunk that just got a tick, freezing
+                // its redstone for good.
+                self.chunks_with_scheduled_ticks.remove(&pos);
+                if chunk.block_ticks.has_ticks() || chunk.fluid_ticks.has_ticks() {
+                    self.chunks_with_scheduled_ticks.insert(pos);
                 }
             } else {
                 self.chunks_with_scheduled_ticks.remove(&pos); // Chunk unloaded
