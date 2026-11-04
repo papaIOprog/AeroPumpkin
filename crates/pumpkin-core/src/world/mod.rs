@@ -3888,6 +3888,11 @@ impl World {
 
     #[allow(clippy::too_many_lines)]
     pub async fn respawn_player(self: &Arc<Self>, player: &Arc<Player>, alive: bool) {
+        // Vanilla creates a fresh entity on respawn, which drops the vehicle
+        // links; pumpkin reuses the Player, so detach explicitly -- a dead
+        // rider that stays on the horse teleports back to it on respawn.
+        let player_entity: Arc<dyn crate::entity::EntityBase> = player.clone();
+        player.get_entity().un_ride(&player_entity);
         let last_pos = player.get_entity().last_pos.load();
         let death_dimension = ResourceLocation::from(player.world().dimension.minecraft_name);
         let death_location = BlockPos(Vector3::new(

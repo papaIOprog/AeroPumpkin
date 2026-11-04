@@ -3455,6 +3455,35 @@ impl Entity {
             .any(|passenger| passenger.get_entity().entity_id == id)
     }
 
+    /// Vanilla `Entity.unRide`: leave the vehicle and eject anything riding
+    /// this entity. Used where the dismount repositioning would fight a
+    /// teleport that follows (respawn, dimension change).
+    pub fn un_ride(&self, dyn_self: &Arc<dyn EntityBase>) {
+        self.eject_passengers(dyn_self);
+        let vehicle = self
+            .vehicle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(vehicle) = vehicle {
+            vehicle
+                .get_entity()
+                .remove_passenger_before_teleport(self.entity_id);
+        }
+    }
+
+    /// Vanilla `Entity.ejectPassengers`: drop everything riding this entity.
+    pub fn eject_passengers(&self, dyn_self: &Arc<dyn EntityBase>) {
+        let passengers: Vec<_> = self
+            .passengers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for passenger in passengers {
+            self.remove_passenger(passenger.get_entity().entity_id);
+        }
+    }
+
     pub fn has_vehicle(&self) -> bool {
         self.vehicle
             .lock()
