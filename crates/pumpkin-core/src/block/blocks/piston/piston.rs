@@ -99,9 +99,15 @@ impl BlockBehaviour for PistonBlock {
                 return;
             }
 
-            args.world.break_block(&pos, None, BlockFlags::SKIP_DROPS);
+            // Vanilla destroys the head/moving-piston neighbour with updates, so
+            // the removal has to reach clients too.
+            args.world
+                .break_block(&pos, None, BlockFlags::NOTIFY_ALL | BlockFlags::SKIP_DROPS);
         } else if &Block::MOVING_PISTON == block_to_check {
-            args.world.break_block(&pos, None, BlockFlags::SKIP_DROPS);
+            // Vanilla destroys the head/moving-piston neighbour with updates, so
+            // the removal has to reach clients too.
+            args.world
+                .break_block(&pos, None, BlockFlags::NOTIFY_ALL | BlockFlags::SKIP_DROPS);
         }
     }
 
