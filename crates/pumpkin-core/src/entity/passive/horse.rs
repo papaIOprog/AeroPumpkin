@@ -19,8 +19,9 @@ use crate::entity::{
     ageable::{AgeableData, AgeableMob},
     ai::goal::{
         breed::BreedGoal, escape_danger::EscapeDangerGoal, follow_parent::FollowParentGoal,
-        look_around::RandomLookAroundGoal, look_at_entity::LookAtEntityGoal, swim::SwimGoal,
-        tempt::TemptGoal, wander_around::WanderAroundGoal,
+        look_around::RandomLookAroundGoal, look_at_entity::LookAtEntityGoal,
+        run_around_like_crazy::RunAroundLikeCrazyGoal, swim::SwimGoal, tempt::TemptGoal,
+        wander_around::WanderAroundGoal,
     },
     mob::{Mob, MobEntity},
     passive::animal::Animal,
@@ -79,6 +80,10 @@ impl HorseEntity {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
 
             goal_selector.add_goal(0, Box::new(SwimGoal::default()));
+            goal_selector.add_goal(
+                1,
+                Box::new(RunAroundLikeCrazyGoal::new(mob_arc.clone(), 1.2)),
+            );
             goal_selector.add_goal(1, EscapeDangerGoal::new(1.2));
             goal_selector.add_goal(2, BreedGoal::new(1.0));
             goal_selector.add_goal(3, Box::new(TemptGoal::new(1.25, TEMPT_ITEMS, false)));
@@ -234,6 +239,8 @@ impl Mob for HorseEntity {
             return true;
         }
 
+        // Vanilla `doPlayerRide`: any non-baby horse can be ridden; an
+        // untamed one throws the rider off via RunAroundLikeCrazyGoal.
         if !self.is_baby() && !self.is_food(item_stack) {
             let world = player.world();
             let ent = &self.mob_entity.living_entity.entity;
