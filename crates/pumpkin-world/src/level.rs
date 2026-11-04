@@ -593,9 +593,15 @@ impl Level {
                 // tick thread (lever clicks) and schedule into this chunk
                 // between draining and the emptiness test. Checking first
                 // would unregister a chunk that just got a tick, freezing
-                // its redstone for good.
+                // its redstone for good. The re-check re-fetches the chunk,
+                // so a chunk republished (replaced) mid-iteration with fresh
+                // ticks is not lost either.
                 self.chunks_with_scheduled_ticks.remove(&pos);
-                if chunk.block_ticks.has_ticks() || chunk.fluid_ticks.has_ticks() {
+                let current = self.loaded_chunks.get(&pos).map(|c| {
+                    let c = c.value();
+                    (c.block_ticks.has_ticks(), c.fluid_ticks.has_ticks())
+                });
+                if current.is_some_and(|(block, fluid)| block || fluid) {
                     self.chunks_with_scheduled_ticks.insert(pos);
                 }
             } else {
