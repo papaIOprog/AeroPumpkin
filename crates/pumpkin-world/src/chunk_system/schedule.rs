@@ -56,6 +56,10 @@ pub struct GenerationSchedule {
     send_level: Arc<LevelChannel>,
 
     public_chunk_map: Arc<DashMap<Vector2<i32>, SyncChunk>>,
+    /// `Level::chunks_with_scheduled_ticks`: chunks the tick pump drains.
+    /// A published chunk that loaded back with saved ticks must join it, or
+    /// its scheduled ticks (redstone repeaters, fluids) never fire.
+    scheduled_tick_chunks: Arc<dashmap::DashSet<Vector2<i32>>>,
     loaded_chunk_changes: Arc<crossbeam::queue::SegQueue<LoadedChunkChange>>,
     chunk_map: HashMap<ChunkPos, ChunkHolder>,
     unload_chunks: HashSetType<ChunkPos>,
@@ -81,6 +85,9 @@ pub struct GenerationSchedule {
 
 impl GenerationSchedule {
     fn publish_chunk(&self, pos: ChunkPos, chunk: SyncChunk) -> Option<SyncChunk> {
+        if chunk.block_ticks.has_ticks() || chunk.fluid_ticks.has_ticks() {
+            self.scheduled_tick_chunks.insert(pos);
+        }
         let previous = self.public_chunk_map.insert(pos, chunk);
         if previous.is_none() {
             self.loaded_chunk_changes
@@ -155,6 +162,7 @@ impl GenerationSchedule {
                     last_high_priority: Vec::new(),
                     send_level: level_channel,
                     public_chunk_map: level_sched.loaded_chunks.clone(),
+                    scheduled_tick_chunks: level_sched.chunks_with_scheduled_ticks.clone(),
                     loaded_chunk_changes: level_sched.loaded_chunk_changes.clone(),
                     unload_chunks: HashSetType::default(),
                     waiting_for_chunks: HashSetType::default(),
