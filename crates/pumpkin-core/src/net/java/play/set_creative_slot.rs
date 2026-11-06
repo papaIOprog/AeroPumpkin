@@ -10,11 +10,11 @@ impl JavaClient {
         if player.gamemode.load() != GameMode::Creative {
             return Err(InventoryError::PermissionError);
         }
-        let is_negative = packet.slot < 0;
-        let valid_slot = packet.slot >= 1 && packet.slot as usize <= 45;
         let item_stack = packet
             .clicked_item
             .to_stack_for_version(&pumpkin_data::packet::CURRENT_MC_VERSION);
+        let is_negative = packet.slot < 0;
+        let valid_slot = packet.slot >= 1 && packet.slot as usize <= 45;
         let mut creative_event =
             crate::plugin::api::events::inventory::inventory_creative::InventoryCreativeEvent::new(
                 player.clone(),
@@ -70,8 +70,10 @@ impl JavaClient {
 
             player_screen_handler
                 .get_slot(packet.slot as usize)
-                .set_stack(item_stack.clone());
-            player_screen_handler.set_received_stack(packet.slot as usize, item_stack);
+                .set_stack(item_stack);
+            // Vanilla `setByPlayer` + `broadcastChanges` echoes the new stack
+            // back to the client; recording it as already-sent left creative
+            // inventory actions like the destroy-slot wipe stale until relog.
             player_screen_handler.send_content_updates();
             drop(player_screen_handler);
         } else if is_negative && is_legal {
