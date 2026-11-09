@@ -142,7 +142,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "26.3-era vanilla baseline; re-baseline after re-dumping vanilla 1.21.1 data"]
     fn dimensions_taller_than_their_noise_settings_generate_all_sections() {
         for (dimension, terrain_state) in [
             (

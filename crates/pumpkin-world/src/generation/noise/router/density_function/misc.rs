@@ -30,13 +30,17 @@ impl EndIsland {
         }
     }
 
-    fn sample_2d(sampler: &SimplexNoiseSampler, x: i32, z: i32) -> f32 {
+    pub fn sample_2d(sampler: &SimplexNoiseSampler, x: i32, z: i32) -> f32 {
         let i = x / 2;
         let j = z / 2;
         let k = x % 2;
         let l = z % 2;
 
-        let mut f = -100.0f32;
+        // Vanilla main island: a distance falloff cone of roughly 100 blocks
+        // around the origin. The loop below only raises small outer islands
+        // on top of this base.
+        let mut f = 100.0f32 - ((x * x + z * z) as f32).sqrt() * 8.0;
+        f = f.clamp(-100.0, 80.0);
 
         for m in -12..=12 {
             for n in -12..=12 {
