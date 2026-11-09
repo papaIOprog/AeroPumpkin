@@ -5919,11 +5919,13 @@ impl Player {
 
     /// Vanilla `ServerPlayer.openHorseInventory`: mount inventories have no
     /// menu type, the client opens them through the mount screen open packet.
+    /// `inventory_columns` is the chest-column count from the packet (0 for a
+    /// plain horse).
     pub fn open_horse_inventory(
         &self,
         screen_handler_factory: &dyn ScreenHandlerFactory,
         entity_id: i32,
-        container_slots: usize,
+        inventory_columns: i32,
     ) -> Option<u8> {
         if !self
             .current_screen_handler
@@ -5966,7 +5968,7 @@ impl Player {
                     .sync_id();
 
                 let java_packet =
-                    COpenMountScreen::new(sync_id, (container_slots as i32).into(), entity_id);
+                    COpenMountScreen::new(sync_id, inventory_columns.into(), entity_id);
                 self.try_send_client_packet(&java_packet);
 
                 self.on_screen_handler_opened(&screen_handler);

@@ -270,10 +270,9 @@ impl Mob for HorseEntity {
             .iter()
             .any(|passenger| passenger.get_entity().entity_uuid == player.get_entity().entity_uuid);
         if (!entity.has_passengers() || opened_by_rider) && self.is_tame() {
-            // Vanilla opens the saddle-slot inventory; the body armor slot is
-            // the entity's equipment and not part of the container size.
-            let container_slots = self.saddle_inventory.size();
-            player.open_horse_inventory(self, entity.entity_id, container_slots);
+            // Vanilla opens the saddle-slot inventory; the packet asks for
+            // chest columns, and a horse carries no chest.
+            player.open_horse_inventory(self, entity.entity_id, 0);
         }
     }
 
