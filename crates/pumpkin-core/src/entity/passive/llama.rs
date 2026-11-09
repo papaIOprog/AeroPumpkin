@@ -9,8 +9,17 @@ use pumpkin_data::item::Item;
 use pumpkin_data::item_stack::ItemStack;
 use pumpkin_data::sound::{Sound, SoundCategory};
 use pumpkin_data::tag::{self, Taggable};
+use pumpkin_inventory::mount_screen_handler::{
+    MountEquipFilter, MountEquipFilters, MountScreenHandler,
+};
+use pumpkin_inventory::screen_handler::{
+    InventoryPlayer, ScreenHandlerFactory, SharedScreenHandler,
+};
+use pumpkin_inventory::{Inventory, SimpleInventory};
 use pumpkin_nbt::compound::NbtCompound;
+use pumpkin_nbt::tag::NbtTag;
 use pumpkin_protocol::codec::var_int::VarInt;
+use pumpkin_util::text::TextComponent;
 use rand::RngExt;
 use uuid::Uuid;
 
@@ -18,10 +27,17 @@ use crate::entity::{
     Entity, EntityBase,
     ageable::{AgeableData, AgeableMob},
     ai::goal::{
-        active_target::ActiveTargetGoal, breed::BreedGoal, escape_danger::EscapeDangerGoal,
-        follow_parent::FollowParentGoal, look_around::RandomLookAroundGoal,
-        look_at_entity::LookAtEntityGoal, ranged_attack::RangedAttackGoal, revenge::RevengeGoal,
-        run_around_like_crazy::RunAroundLikeCrazyGoal, swim::SwimGoal, tempt::TemptGoal,
+        active_target::ActiveTargetGoal,
+        breed::BreedGoal,
+        escape_danger::EscapeDangerGoal,
+        follow_parent::FollowParentGoal,
+        look_around::RandomLookAroundGoal,
+        look_at_entity::LookAtEntityGoal,
+        ranged_attack::RangedAttackGoal,
+        revenge::RevengeGoal,
+        run_around_like_crazy::{RunAroundLikeCrazyGoal, TemperamentalMount},
+        swim::SwimGoal,
+        tempt::TemptGoal,
         wander_around::WanderAroundGoal,
     },
     mob::{Mob, MobEntity, RangedAttackMob},
@@ -86,6 +102,10 @@ pub struct LlamaEntity {
     pub has_chest: AtomicBool,
     pub temper: AtomicI32,
     pub owner: AtomicCell<Option<Uuid>>,
+    /// Vanilla keeps the llama's carpet in the body-armor slot of the mount
+    /// screen; the chest holds `strength` columns when a chest is attached.
+    pub carpet_inventory: Arc<SimpleInventory>,
+    pub chest_inventory: Arc<SimpleInventory>,
 }
 
 impl LlamaEntity {
@@ -105,6 +125,8 @@ impl LlamaEntity {
             has_chest: AtomicBool::new(false),
             temper: AtomicI32::new(0),
             owner: AtomicCell::new(None),
+            carpet_inventory: Arc::new(SimpleInventory::new(1)),
+            chest_inventory: Arc::new(SimpleInventory::new(strength as usize * 3)),
         };
         let mob_arc = Arc::new(llama);
         let mob_weak: Weak<dyn Mob> = {
@@ -222,6 +244,63 @@ impl LlamaEntity {
         entity.set_synced_data(pumpkin_data::tracked_data::llama::CHEST, val);
     }
 
+    /// Mirrors the carpet item in the body-armor slot into the swag color
+    /// (vanilla derives it from the body equipment item). The tracked-data
+    /// entry for the swag color is not in the generated set yet, so the
+    /// color is only stored, like before.
+    pub fn sync_carpet_color(&self) {
+        let stack = self.carpet_inventory.get_stack(0);
+        let color = if stack.is_empty() {
+            None
+        } else {
+            get_carpet_color_from_item(stack.item)
+        };
+        if self.carpet_color.load() != color {
+            self.carpet_color.store(color);
+        }
+    }
+}
+
+impl ScreenHandlerFactory for LlamaEntity {
+    fn create_screen_handler(
+        &self,
+        sync_id: u8,
+        player_inventory: &Arc<pumpkin_inventory::player::player_inventory::PlayerInventory>,
+        _player: &dyn InventoryPlayer,
+    ) -> Option<SharedScreenHandler> {
+        // The slot list must match the client's menu: llamas show no saddle
+        // slot, a carpet slot, and chest columns only when chested.
+        let chest: Arc<dyn Inventory> = if self.has_chest() {
+            self.chest_inventory.clone()
+        } else {
+            Arc::new(SimpleInventory::new(0))
+        };
+        let columns = if self.has_chest() {
+            self.get_strength()
+        } else {
+            0
+        };
+        let handler = MountScreenHandler::new(
+            sync_id,
+            player_inventory,
+            chest,
+            Arc::new(SimpleInventory::new(1)),
+            self.carpet_inventory.clone(),
+            MountEquipFilters {
+                saddle: MountEquipFilter::None,
+                armor: MountEquipFilter::Carpet,
+            },
+            columns as usize,
+        );
+        Some(Arc::new(std::sync::Mutex::new(handler)) as SharedScreenHandler)
+    }
+
+    fn get_display_name(&self) -> TextComponent {
+        TextComponent::translate("container.horse", vec![])
+    }
+}
+
+impl LlamaEntity {
     pub fn spit(&self, target: &Arc<dyn EntityBase>) {
         let entity = self.get_entity();
         let world = entity.world.load_full();
@@ -313,6 +392,25 @@ impl Mob for LlamaEntity {
         Some(self)
     }
 
+    /// Vanilla `AbstractHorse.openCustomInventoryScreen`.
+    fn open_custom_inventory_screen(&self, player: &Arc<Player>) {
+        let entity = self.get_entity();
+        let opened_by_rider = entity
+            .passengers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|passenger| passenger.get_entity().entity_uuid == player.get_entity().entity_uuid);
+        if (!entity.has_passengers() || opened_by_rider) && self.is_tame() {
+            let columns = if self.has_chest() {
+                self.get_strength()
+            } else {
+                0
+            };
+            player.open_horse_inventory(self, entity.entity_id, columns);
+        }
+    }
+
     fn mob_write_nbt(&self, nbt: &mut NbtCompound) {
         self.write_ageable_nbt(nbt);
         nbt.put_int("Variant", self.get_variant().id());
@@ -322,6 +420,27 @@ impl Mob for LlamaEntity {
         nbt.put_int("Temper", self.temper.load(Ordering::Relaxed));
         if let Some(owner) = self.owner.load() {
             nbt.put_uuid("Owner", owner);
+        }
+        let carpet = self.carpet_inventory.get_stack(0);
+        if !carpet.is_empty() {
+            let mut carpet_nbt = NbtCompound::new();
+            carpet.write_item_stack(&mut carpet_nbt);
+            nbt.put_compound("ArmorItem", carpet_nbt);
+        }
+        if self.has_chest() {
+            let mut items = Vec::new();
+            for (slot, stack) in (1..=self.chest_inventory.size())
+                .map(|i| (i, self.chest_inventory.get_stack(i - 1)))
+                .filter(|(_, stack)| !stack.is_empty())
+            {
+                let mut item_nbt = NbtCompound::new();
+                item_nbt.put_byte("Slot", slot as i8);
+                stack.write_item_stack(&mut item_nbt);
+                items.push(NbtTag::Compound(item_nbt));
+            }
+            if !items.is_empty() {
+                nbt.put_list("Items", items);
+            }
         }
     }
 
@@ -345,6 +464,27 @@ impl Mob for LlamaEntity {
         if let Some(owner) = nbt.get_uuid("Owner") {
             self.owner.store(Some(owner));
         }
+        if let Some(carpet_nbt) = nbt.get_compound("ArmorItem")
+            && let Some(carpet) = ItemStack::read_item_stack(carpet_nbt)
+            && get_carpet_color_from_item(carpet.item).is_some()
+        {
+            self.carpet_inventory.set_stack(0, carpet);
+        }
+        if let Some(items) = nbt.get_list("Items") {
+            for tag in items {
+                if let NbtTag::Compound(item_nbt) = tag
+                    && let Some(stack) = ItemStack::read_item_stack(item_nbt)
+                    && let Some(slot) = item_nbt.get_byte("Slot")
+                    && slot >= 1
+                {
+                    let index = (slot - 1) as usize;
+                    if index < self.chest_inventory.size() {
+                        self.chest_inventory.set_stack(index, stack);
+                    }
+                }
+            }
+        }
+        self.sync_carpet_color();
     }
 
     fn get_mob_entity(&self) -> &MobEntity {
@@ -352,6 +492,7 @@ impl Mob for LlamaEntity {
     }
 
     fn mob_tick(&self, _caller: &dyn EntityBase) {
+        self.sync_carpet_color();
         self.ageable_ai_step();
     }
 
@@ -377,50 +518,74 @@ impl Mob for LlamaEntity {
     }
 
     fn mob_interact(&self, player: &Arc<Player>, item_stack: &mut ItemStack) -> bool {
+        // Vanilla `Llama.mobInteract` on top of the `AbstractHorse` order.
+        let entity = self.get_entity();
+
+        // A ridden or baby llama only responds to feeding.
+        if entity.has_passengers() || self.is_baby() {
+            return self.animal_interact(player, item_stack, Sound::EntityLlamaAmbient);
+        }
+
+        // Secondary use (shift) on a tamed llama opens its inventory.
+        if self.is_tame() && player.get_entity().is_sneaking() {
+            self.open_custom_inventory_screen(player);
+            return true;
+        }
+
         let item = item_stack.get_item();
+        if !item_stack.is_empty() {
+            if self.is_food(item_stack) {
+                return self.animal_interact(player, item_stack, Sound::EntityLlamaAmbient);
+            }
+            // Any other item on an untamed llama just angers it.
+            if !self.is_tame() {
+                self.make_mad();
+                return true;
+            }
 
-        if self.is_tame() && item == &Item::CHEST && !self.has_chest() && !self.is_baby() {
-            self.set_has_chest(true);
-            item_stack.decrement_unless_creative(player.gamemode.load(), 1);
-            let entity = self.get_entity();
-            let world = entity.world.load();
-            world.play_sound(
-                Sound::EntityDonkeyChest,
-                SoundCategory::Neutral,
-                &entity.pos.load(),
-            );
-            return true;
-        }
-
-        if self.is_tame()
-            && !self.is_baby()
-            && let Some(color) = get_carpet_color_from_item(item)
-        {
-            self.carpet_color.store(Some(color));
-            item_stack.decrement_unless_creative(player.gamemode.load(), 1);
-            let entity = self.get_entity();
-            let world = entity.world.load();
-            world.play_sound(
-                Sound::EntityLlamaSwag,
-                SoundCategory::Neutral,
-                &entity.pos.load(),
-            );
-            return true;
-        }
-
-        if !self.is_baby() && !self.get_entity().has_passengers() && !self.is_food(item_stack) {
-            let world = player.world();
-            let ent = &self.mob_entity.living_entity.entity;
-            if player.get_entity().can_ride()
-                && let Some(vehicle) = world.get_entity_by_id(ent.entity_id)
-                && let Some(passenger) = world.get_player_by_id(player.entity_id())
+            // Vanilla `equipBodyArmor`: carpets go to the body-armor slot.
+            if get_carpet_color_from_item(item).is_some()
+                && self.carpet_inventory.get_stack(0).is_empty()
             {
-                ent.add_passenger(vehicle, passenger as Arc<dyn EntityBase>);
+                let mut carpet = item_stack.clone();
+                carpet.item_count = 1;
+                self.carpet_inventory.set_stack(0, carpet);
+                item_stack.decrement_unless_creative(player.gamemode.load(), 1);
+                self.sync_carpet_color();
+                let world = entity.world.load();
+                world.play_sound(
+                    Sound::EntityLlamaSwag,
+                    SoundCategory::Neutral,
+                    &entity.pos.load(),
+                );
+                return true;
+            }
+
+            // Vanilla `equipChest`: attaching a chest grows the inventory.
+            if item == &Item::CHEST && !self.has_chest() {
+                self.set_has_chest(true);
+                item_stack.decrement_unless_creative(player.gamemode.load(), 1);
+                let world = entity.world.load();
+                world.play_sound(
+                    Sound::EntityDonkeyChest,
+                    SoundCategory::Neutral,
+                    &entity.pos.load(),
+                );
                 return true;
             }
         }
 
-        self.animal_interact(player, item_stack, Sound::EntityLlamaAmbient)
+        // Vanilla `doPlayerRide`.
+        let world = player.world();
+        if player.get_entity().can_ride()
+            && let Some(vehicle) = world.get_entity_by_id(entity.entity_id)
+            && let Some(passenger) = world.get_player_by_id(player.entity_id())
+        {
+            entity.add_passenger(vehicle, passenger as Arc<dyn EntityBase>);
+            return true;
+        }
+
+        false
     }
 }
 

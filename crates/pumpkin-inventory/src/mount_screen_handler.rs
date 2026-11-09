@@ -3,12 +3,77 @@ use std::sync::Arc;
 
 use crate::inventory::Inventory;
 use crate::inventory::SimpleInventory;
-use pumpkin_data::data_component_impl::EquipmentSlot;
+use crate::slot::{NormalSlot, Slot};
+use pumpkin_data::item::Item;
 use pumpkin_data::item_stack::ItemStack;
 
 use crate::player::player_inventory::PlayerInventory;
 use crate::screen_handler::{InventoryPlayer, ScreenHandler, ScreenHandlerBehaviour};
-use crate::slot::{ArmorSlot, NormalSlot};
+
+/// What a mount's saddle or body-armor slot accepts.
+///
+/// Mirrors the vanilla per-entity overrides (`isSaddleable`,
+/// `isBodyArmorItem`, `canUseSlot`). The client keeps both slot indices in
+/// every mount menu even when it hides them, so the handler always has the
+/// two slots.
+/// The saddle and armor slot filters for one mount type.
+#[derive(Clone, Copy)]
+pub struct MountEquipFilters {
+    pub saddle: MountEquipFilter,
+    pub armor: MountEquipFilter,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MountEquipFilter {
+    /// `Items.SADDLE` on saddleable mounts.
+    Saddle,
+    /// Equestrian animal armor (horses).
+    HorseArmor,
+    /// Wool carpets, worn as decor (`Llama.isBodyArmorItem`).
+    Carpet,
+    /// The client hides this slot for this mount; accept nothing.
+    None,
+}
+
+struct MountEquipSlot(NormalSlot, MountEquipFilter);
+
+impl MountEquipSlot {
+    fn new(inventory: Arc<dyn Inventory>, filter: MountEquipFilter) -> Self {
+        Self(NormalSlot::new(inventory, 0), filter)
+    }
+}
+
+impl Slot for MountEquipSlot {
+    fn get_inventory(&self) -> Arc<dyn Inventory> {
+        self.0.get_inventory()
+    }
+
+    fn get_index(&self) -> usize {
+        self.0.get_index()
+    }
+
+    fn set_id(&self, id: usize) {
+        self.0.set_id(id);
+    }
+
+    fn can_insert(&self, stack: &ItemStack) -> bool {
+        match self.1 {
+            MountEquipFilter::Saddle => stack.item == &Item::SADDLE,
+            MountEquipFilter::HorseArmor => stack.item.registry_key.ends_with("_horse_armor"),
+            MountEquipFilter::Carpet => stack.item.registry_key.ends_with("_carpet"),
+            MountEquipFilter::None => false,
+        }
+    }
+
+    fn mark_dirty(&self) {
+        self.0.mark_dirty();
+    }
+
+    /// Mount equipment slots hold a single item.
+    fn get_max_item_count(&self) -> u8 {
+        1
+    }
+}
 
 pub struct MountScreenHandler {
     behaviour: ScreenHandlerBehaviour,
@@ -35,6 +100,7 @@ impl MountScreenHandler {
         mount_inventory: Arc<dyn Inventory>,
         saddle_inventory: Arc<dyn Inventory>,
         armor_inventory: Arc<dyn Inventory>,
+        filters: MountEquipFilters,
         inventory_columns: usize,
     ) -> Self {
         let mut handler = Self {
@@ -45,15 +111,13 @@ impl MountScreenHandler {
             inventory_columns,
         };
 
-        handler.add_slot(Arc::new(ArmorSlot::new(
+        handler.add_slot(Arc::new(MountEquipSlot::new(
             saddle_inventory,
-            0,
-            EquipmentSlot::SADDLE,
+            filters.saddle,
         )));
-        handler.add_slot(Arc::new(ArmorSlot::new(
+        handler.add_slot(Arc::new(MountEquipSlot::new(
             armor_inventory,
-            0,
-            EquipmentSlot::BODY,
+            filters.armor,
         )));
 
         let mount_size = handler.mount_inventory.size();
@@ -190,6 +254,10 @@ impl HorseScreenHandler {
                 Arc::new(SimpleInventory::new(0)),
                 saddle_inventory,
                 armor_inventory,
+                MountEquipFilters {
+                    saddle: MountEquipFilter::Saddle,
+                    armor: MountEquipFilter::HorseArmor,
+                },
                 0,
             ),
         }
@@ -242,6 +310,10 @@ impl NautilusInventoryScreenHandler {
                 nautilus_inventory,
                 saddle_inventory,
                 armor_inventory,
+                MountEquipFilters {
+                    saddle: MountEquipFilter::Saddle,
+                    armor: MountEquipFilter::Carpet,
+                },
                 inventory_columns,
             ),
         }
