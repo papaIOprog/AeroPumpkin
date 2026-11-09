@@ -98,6 +98,13 @@ impl JavaClient {
                                     return;
                                 }
                             }
+                            if event.action == ActionType::InteractAt {
+                                // Vanilla runs only `Entity.interactAt` for
+                                // this packet, which no Pumpkin entity
+                                // overrides; the client follows up with a
+                                // plain interact packet for mob logic.
+                                return;
+                            }
                             let mut stack = player.inventory().held_item();
 
                             let item_id = stack.item.id;

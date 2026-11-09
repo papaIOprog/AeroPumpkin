@@ -168,7 +168,7 @@ impl Mob for StriderEntity {
             return true;
         }
 
-        if self.is_saddled() && !self.is_food(item_stack) {
+        if self.is_saddled() && !self.get_entity().has_passengers() && !self.is_food(item_stack) {
             let world = player.world();
             let ent = &self.mob_entity.living_entity.entity;
             if player.get_entity().can_ride()

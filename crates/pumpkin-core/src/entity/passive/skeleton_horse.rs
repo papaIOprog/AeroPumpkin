@@ -190,7 +190,7 @@ impl Mob for SkeletonHorseEntity {
             return true;
         }
 
-        if !self.is_baby() {
+        if !self.is_baby() && !self.get_entity().has_passengers() {
             let world = player.world();
             let ent = &self.mob_entity.living_entity.entity;
             if player.get_entity().can_ride()

@@ -3512,6 +3512,22 @@ impl Entity {
     }
 
     pub fn add_passenger(&self, vehicle: Arc<dyn EntityBase>, passenger: Arc<dyn EntityBase>) {
+        // Vanilla `startRiding` never mounts an entity twice; refuse a
+        // duplicate before it double-fires dismount teleports later.
+        {
+            let passenger_vehicle = passenger
+                .get_entity()
+                .vehicle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if passenger_vehicle
+                .as_ref()
+                .is_some_and(|v| v.get_entity().entity_id == self.entity_id)
+            {
+                return;
+            }
+        }
+
         let mut mount_event =
             crate::plugin::api::events::entity::entity_mount::EntityMountEvent::new(
                 passenger.get_entity().entity_id,
@@ -3677,8 +3693,11 @@ impl Entity {
                 None
             };
 
-            // Vanilla: ridingCooldown = 60 (prevents immediate re-mount)
-            passenger_entity.riding_cooldown.store(60, Relaxed);
+            // Vanilla sets ridingCooldown = 60 here, but `Player.removeVehicle`
+            // immediately resets it to zero, so players can remount at once.
+            if passenger.get_player().is_none() {
+                passenger_entity.riding_cooldown.store(60, Relaxed);
+            }
             // TODO: world.emitGameEvent(passenger, GameEvent.ENTITY_DISMOUNT, vehicle.pos)
 
             // Send CSetPassengers directly to the dismounting player before broadcasting it.
