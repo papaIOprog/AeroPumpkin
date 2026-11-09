@@ -9,7 +9,9 @@ use pumpkin_data::item::Item;
 use pumpkin_data::item_stack::ItemStack;
 use pumpkin_data::sound::{Sound, SoundCategory};
 use pumpkin_data::tag::{self, Taggable};
-use pumpkin_inventory::mount_screen_handler::{MountEquipFilter, MountEquipFilters, MountScreenHandler};
+use pumpkin_inventory::mount_screen_handler::{
+    MountEquipFilter, MountEquipFilters, MountScreenHandler,
+};
 use pumpkin_inventory::screen_handler::{
     InventoryPlayer, ScreenHandlerFactory, SharedScreenHandler,
 };
