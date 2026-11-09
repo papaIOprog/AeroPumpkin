@@ -35,12 +35,22 @@ impl BlockBehaviour for EndGatewayBlock {
 
         end_gateway.trigger_cooldown(args.world, *args.position);
 
-        if let Some(destination) = end_gateway.get_portal_position(args.world, *args.position) {
-            let yaw = entity.yaw.load();
-            let pitch = entity.pitch.load();
-            args.entity
-                .teleport(destination, Some(yaw), Some(pitch), args.world.clone());
-        }
+        // The exit can be a thousand blocks out in ungenerated chunks; the
+        // teleport runs once those exist (vanilla loads them synchronously).
+        let entity_id = entity.entity_id;
+        let yaw = entity.yaw.load();
+        let pitch = entity.pitch.load();
+        let world = args.world.clone();
+        let entry = *args.position;
+        tokio::spawn(async move {
+            let Some(entity) = world.get_entity_by_id(entity_id) else {
+                return;
+            };
+            let entity_base = entity.get_entity();
+            entity_base.yaw.store(yaw);
+            entity_base.pitch.store(pitch);
+            EndGatewayBlockEntity::teleport_when_ready(&world, &entity, entry).await;
+        });
     }
 
     fn on_synced_block_event(&self, args: OnSyncedBlockEventArgs<'_>) -> bool {

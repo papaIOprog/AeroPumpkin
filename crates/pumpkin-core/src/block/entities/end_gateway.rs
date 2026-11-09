@@ -273,7 +273,10 @@ impl EndGatewayBlockEntity {
         Self::find_tallest_block(level, exit_portal_pos, 16, true)
     }
 
-    fn find_exit_portal_xz_pos_tentative(level: &World, end_gateway_pos: BlockPos) -> Vector3<f64> {
+    pub(crate) fn find_exit_portal_xz_pos_tentative(
+        level: &World,
+        end_gateway_pos: BlockPos,
+    ) -> Vector3<f64> {
         let mut dir = Vector3::new(end_gateway_pos.0.x as f64, 0.0, end_gateway_pos.0.z as f64);
         let len = dir.x.hypot(dir.z);
         if len > 0.0 {
@@ -468,5 +471,59 @@ impl EndGatewayBlockEntity {
                 }
             }
         }
+    }
+
+    /// Runs a gateway teleport once the destination chunks exist. Vanilla
+    /// loads the exit chunks synchronously; Pumpkin's chunk system is async,
+    /// so the exit search and its fallback island would otherwise read and
+    /// write into ungenerated chunks and drop the player into the void.
+    pub(crate) async fn teleport_when_ready(
+        world: &Arc<World>,
+        entity: &Arc<dyn crate::entity::EntityBase>,
+        entry: BlockPos,
+    ) {
+        let exit_chunk = {
+            let Some(block_entity) = world.get_block_entity(&entry) else {
+                return;
+            };
+            let Some(gateway) = block_entity.as_any().downcast_ref::<Self>() else {
+                return;
+            };
+            gateway
+                .exit_portal
+                .lock()
+                .ok()
+                .and_then(|exit| *exit)
+                .map_or_else(
+                    || {
+                        let xz = Self::find_exit_portal_xz_pos_tentative(world, entry);
+                        Vector2::new((xz.x / 16.0).floor() as i32, (xz.z / 16.0).floor() as i32)
+                    },
+                    |exit| Vector2::new(exit.0.x >> 4, exit.0.z >> 4),
+                )
+        };
+
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                world
+                    .level
+                    .get_or_fetch_chunk(Vector2::new(exit_chunk.x + dx, exit_chunk.y + dz), |_| ())
+                    .await;
+            }
+        }
+
+        let Some(block_entity) = world.get_block_entity(&entry) else {
+            return;
+        };
+        let Some(gateway) = block_entity.as_any().downcast_ref::<Self>() else {
+            return;
+        };
+        let Some(destination) = gateway.get_portal_position(world, entry) else {
+            return;
+        };
+        let entity_base = entity.get_entity();
+        let yaw = entity_base.yaw.load();
+        let pitch = entity_base.pitch.load();
+        entity.teleport(destination, Some(yaw), Some(pitch), world.clone());
     }
 }
