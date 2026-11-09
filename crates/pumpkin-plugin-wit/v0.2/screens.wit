@@ -22,7 +22,6 @@ interface screens {
     lectern,
     loom,
     merchant,
-    horse,
     shulker-box,
     smithing,
     smoker,

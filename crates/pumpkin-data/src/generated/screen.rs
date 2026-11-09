@@ -21,7 +21,6 @@ pub enum WindowType {
     Lectern,
     Loom,
     Merchant,
-    Horse,
     ShulkerBox,
     Smithing,
     Smoker,

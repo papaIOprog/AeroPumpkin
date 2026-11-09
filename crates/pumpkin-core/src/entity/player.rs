@@ -269,13 +269,14 @@ use pumpkin_protocol::java::client::play::{
     Animation, CAcknowledgeBlockChange, CActionBar, CAwardStats, CBlockUpdate, CChangeDifficulty,
     CCloseContainer, CCombatDeath, CCustomPayload, CDisguisedChatMessage, CEntityAnimation,
     CEntityVelocity, CGameEvent, CHurtAnimation, CItemCooldown, CMapItemData, COpenBook,
-    COpenScreen, COpenSignEditor, CParticle, CPlayServerLinks, CPlayerAbilities, CPlayerInfoUpdate,
-    CPlayerPosition, CPlayerSpawnPosition, CRespawn, CSetCamera, CSetContainerContent,
-    CSetContainerProperty, CSetContainerSlot, CSetExperience, CSetHealth, CSetSelectedSlot,
-    CSoundEffect, CStopSound, CSubtitle, CSystemChatMessage, CTabList, CTeleportEntity,
-    CTitleAnimation, CTitleText, CUnloadChunk, CUnlockRecipes, CUpdateMobEffect, CUpdateTime,
-    GameEvent, MapIcon, MapPatch, PlayerAction, PlayerInfoFlags, PlayerSpawnData, PreviousMessage,
-    RECIPE_BOOK_STATE_ADD, RECIPE_BOOK_STATE_INIT, RECIPE_BOOK_STATE_REMOVE, Statistic,
+    COpenMountScreen, COpenScreen, COpenSignEditor, CParticle, CPlayServerLinks, CPlayerAbilities,
+    CPlayerInfoUpdate, CPlayerPosition, CPlayerSpawnPosition, CRespawn, CSetCamera,
+    CSetContainerContent, CSetContainerProperty, CSetContainerSlot, CSetExperience, CSetHealth,
+    CSetSelectedSlot, CSoundEffect, CStopSound, CSubtitle, CSystemChatMessage, CTabList,
+    CTeleportEntity, CTitleAnimation, CTitleText, CUnloadChunk, CUnlockRecipes, CUpdateMobEffect,
+    CUpdateTime, GameEvent, MapIcon, MapPatch, PlayerAction, PlayerInfoFlags, PlayerSpawnData,
+    PreviousMessage, RECIPE_BOOK_STATE_ADD, RECIPE_BOOK_STATE_INIT, RECIPE_BOOK_STATE_REMOVE,
+    Statistic,
 };
 use pumpkin_protocol::java::server::play::{
     SClickSlot, SContainerButtonClick, SRenameItem, SlotActionType,
@@ -5914,6 +5915,68 @@ impl Player {
 
             None
         }
+    }
+
+    /// Vanilla `ServerPlayer.openHorseInventory`: mount inventories have no
+    /// menu type, the client opens them through the mount screen open packet.
+    pub fn open_horse_inventory(
+        &self,
+        screen_handler_factory: &dyn ScreenHandlerFactory,
+        entity_id: i32,
+        container_slots: usize,
+    ) -> Option<u8> {
+        if !self
+            .current_screen_handler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_any()
+            .is::<PlayerScreenHandler>()
+        {
+            self.close_handled_screen();
+        }
+
+        let server = self.world().server.upgrade();
+        if let Some(server) = server
+            && let Some(player_arc) = self.world().get_player_by_uuid(self.gameprofile.id)
+        {
+            let mut event =
+                crate::plugin::api::events::inventory::inventory_open::InventoryOpenEvent::new(
+                    player_arc,
+                );
+            server.plugin_manager.fire_blocking(&server, &mut event);
+            if event.cancelled {
+                return None;
+            }
+        }
+
+        self.increment_screen_handler_sync_id();
+
+        screen_handler_factory
+            .create_screen_handler(
+                self.screen_handler_sync_id.load(Ordering::Relaxed),
+                &self.inventory,
+                self,
+            )
+            .map(|screen_handler| {
+                let sync_id = screen_handler
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .sync_id();
+
+                let java_packet =
+                    COpenMountScreen::new(sync_id, (container_slots as i32).into(), entity_id);
+                self.try_send_client_packet(&java_packet);
+
+                self.on_screen_handler_opened(&screen_handler);
+                *self
+                    .current_screen_handler
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = screen_handler;
+                self.open_container_pos.store(None);
+                self.screen_handler_sync_id.load(Ordering::Relaxed)
+            })
     }
 
     pub fn open_handled_screen_direct(

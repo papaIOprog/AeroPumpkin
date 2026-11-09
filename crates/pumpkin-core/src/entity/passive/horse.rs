@@ -178,6 +178,38 @@ impl HorseEntity {
     }
 }
 
+impl crate::entity::ai::goal::run_around_like_crazy::TemperamentalMount for HorseEntity {
+    fn is_tame(&self) -> bool {
+        self.has_flag(FLAG_TAME)
+    }
+
+    fn set_tame(&self, tame: bool) {
+        self.set_flag(FLAG_TAME, tame);
+    }
+
+    fn max_temper(&self) -> i32 {
+        // Vanilla `AbstractHorse.getMaxTemper` (the Horse override returns
+        // the base 100).
+        100
+    }
+
+    fn temper(&self) -> i32 {
+        self.temper.load(Ordering::Relaxed)
+    }
+
+    fn set_temper(&self, temper: i32) {
+        self.temper.store(temper, Ordering::Relaxed);
+    }
+
+    fn set_owner(&self, owner: Uuid) {
+        self.owner.store(Some(owner));
+    }
+
+    fn make_mad(&self) {
+        Self::make_mad(self);
+    }
+}
+
 impl ScreenHandlerFactory for HorseEntity {
     fn create_screen_handler(
         &self,
@@ -238,7 +270,10 @@ impl Mob for HorseEntity {
             .iter()
             .any(|passenger| passenger.get_entity().entity_uuid == player.get_entity().entity_uuid);
         if (!entity.has_passengers() || opened_by_rider) && self.is_tame() {
-            player.open_handled_screen(self, None);
+            // Vanilla opens the saddle-slot inventory; the body armor slot is
+            // the entity's equipment and not part of the container size.
+            let container_slots = self.saddle_inventory.size();
+            player.open_horse_inventory(self, entity.entity_id, container_slots);
         }
     }
 
@@ -380,7 +415,8 @@ impl Mob for HorseEntity {
         // Vanilla `doPlayerRide`: any non-baby horse can be ridden; an
         // untamed one throws the rider off via RunAroundLikeCrazyGoal.
         let world = player.world();
-        if let Some(vehicle) = world.get_entity_by_id(entity.entity_id)
+        if player.get_entity().can_ride()
+            && let Some(vehicle) = world.get_entity_by_id(entity.entity_id)
             && let Some(passenger) = world.get_player_by_id(player.entity_id())
         {
             entity.add_passenger(vehicle, passenger as Arc<dyn EntityBase>);

@@ -5,7 +5,6 @@ use crate::inventory::Inventory;
 use crate::inventory::SimpleInventory;
 use pumpkin_data::data_component_impl::EquipmentSlot;
 use pumpkin_data::item_stack::ItemStack;
-use pumpkin_data::screen::WindowType;
 
 use crate::player::player_inventory::PlayerInventory;
 use crate::screen_handler::{InventoryPlayer, ScreenHandler, ScreenHandlerBehaviour};
@@ -170,7 +169,8 @@ impl ScreenHandler for MountScreenHandler {
 }
 
 /// Vanilla `HorseInventoryMenu` for a horse (no chest rows): a saddle slot,
-/// a body armor slot and the player inventory.
+/// a body armor slot and the player inventory. Opened through the mount
+/// screen open packet, not a window type.
 pub struct HorseScreenHandler {
     pub mount_handler: MountScreenHandler,
 }
@@ -211,10 +211,6 @@ impl ScreenHandler for HorseScreenHandler {
 
     fn get_behaviour_mut(&mut self) -> &mut ScreenHandlerBehaviour {
         self.mount_handler.get_behaviour_mut()
-    }
-
-    fn window_type(&self) -> Option<WindowType> {
-        Some(WindowType::Horse)
     }
 
     fn on_closed(&mut self, player: &dyn InventoryPlayer) {
