@@ -116,7 +116,9 @@ impl EnchantingTableScreenHandler {
 
                 for i in 0..3 {
                     let level = self.calculate_level_requirement(&mut random, i);
-                    self.level_requirements[i] = level;
+                    // Vanilla drops a cost the player could never pay with that
+                    // few levels, hiding the option row entirely.
+                    self.level_requirements[i] = if level < i as i32 + 1 { 0 } else { level };
                 }
 
                 for i in 0..3 {
@@ -167,8 +169,8 @@ impl EnchantingTableScreenHandler {
 
         match slot {
             0 => (level / 3).max(1),
-            1 => (level * 2 / 3 + 7).max(1),
-            2 => level.max(b * 2).max(1),
+            1 => level * 2 / 3 + 1,
+            2 => level.max(b * 2),
             _ => 0,
         }
     }
@@ -195,8 +197,10 @@ impl EnchantingTableScreenHandler {
 
         let mut available = Vec::new();
         for enchant in Enchantment::all() {
+            // Vanilla `getAvailableEnchantmentResults`: primary items, plus any
+            // table enchantment when the stack is a plain book.
             if enchant.has_tag(&EnchantmentTag::MINECRAFT_IN_ENCHANTING_TABLE)
-                && enchant.can_enchant(item.item)
+                && (enchant.is_primary_item(item.item) || item.item == &Item::BOOK)
             {
                 for l in (1..=enchant.max_level).rev() {
                     if enchant_level >= enchant.min_cost.calculate(l)
@@ -234,7 +238,7 @@ impl EnchantingTableScreenHandler {
 
             // Add more?
             let mut current_level = enchant_level;
-            while random.next_bounded_i32(50) <= (current_level + 1) / 2 {
+            while random.next_bounded_i32(50) <= current_level {
                 available.retain(|(e, _)| {
                     for (se, _) in &result {
                         if !e.are_compatible(se) {
@@ -259,6 +263,13 @@ impl EnchantingTableScreenHandler {
                 }
                 current_level /= 2;
             }
+        }
+
+        // Vanilla `EnchantmentMenu.getEnchantmentList`: books drop one random
+        // entry when the roll produced more than one.
+        if item.item == &Item::BOOK && result.len() > 1 {
+            let index = random.next_bounded_i32(result.len() as i32) as usize;
+            result.remove(index);
         }
 
         result
@@ -333,35 +344,29 @@ impl ScreenHandler for EnchantingTableScreenHandler {
             return false;
         }
 
-        let level_req = self.level_requirements[id as usize];
-        if player.experience_level() < level_req && !player.is_creative() {
-            return false;
-        }
-
-        let mut lapis_stack = self.inventory.get_stack(1);
         let lapis_cost = (id + 1) as u8;
-
-        if !player.is_creative()
-            && (lapis_stack.is_empty()
-                || !is_lapis(&lapis_stack)
-                || lapis_stack.item_count < lapis_cost)
+        let mut lapis_stack = self.inventory.get_stack(1);
+        if (lapis_stack.is_empty()
+            || !is_lapis(&lapis_stack)
+            || lapis_stack.item_count < lapis_cost)
+            && !player.is_creative()
         {
             return false;
         }
 
-        // Perform enchantment
+        let level_req = self.level_requirements[id as usize];
         let mut item_stack = self.inventory.get_stack(0);
-
-        if item_stack.is_empty() || item_stack.has_enchantments() {
+        if level_req <= 0
+            || item_stack.is_empty()
+            || ((player.experience_level() < lapis_cost as i32
+                || player.experience_level() < level_req)
+                && !player.is_creative())
+        {
             return false;
         }
 
         let mut random = self.create_enchantment_random(id as usize);
         let mut enchantments = Self::get_enchantment_list(&mut random, &item_stack, level_req);
-
-        if enchantments.is_empty() {
-            return false;
-        }
 
         if player.fire_enchant_item_event(&item_stack, id, level_req, &mut enchantments)
             || enchantments.is_empty()
@@ -369,10 +374,18 @@ impl ScreenHandler for EnchantingTableScreenHandler {
             return false;
         }
 
-        if !player.is_creative() {
-            player.add_experience_levels(-(id + 1));
-            lapis_stack.decrement(lapis_cost);
-            self.inventory.set_stack(1, lapis_stack);
+        // Vanilla `onEnchantmentPerformed` always charges the levels (clamped
+        // at zero) and rolls a new enchantment seed.
+        player.add_experience_levels(-(id + 1));
+        player.set_enchantment_seed(rand::random());
+        self.enchantment_seed = player.enchantment_seed();
+
+        // Vanilla `transmuteCopy`: enchanting a plain book turns it into an
+        // enchanted book that carries the enchantments as stored ones.
+        if item_stack.item == &Item::BOOK {
+            let mut enchanted_book = ItemStack::new(item_stack.item_count, &Item::ENCHANTED_BOOK);
+            enchanted_book.patch.clone_from(&item_stack.patch);
+            item_stack = enchanted_book;
         }
 
         for (enchant, level) in enchantments {
@@ -380,9 +393,10 @@ impl ScreenHandler for EnchantingTableScreenHandler {
         }
         self.inventory.set_stack(0, item_stack);
 
-        // Update seed
-        player.set_enchantment_seed(rand::random());
-        self.enchantment_seed = player.enchantment_seed();
+        if !player.is_creative() {
+            lapis_stack.decrement(lapis_cost);
+            self.inventory.set_stack(1, lapis_stack);
+        }
 
         self.update_enchantments(player);
         self.send_content_updates();

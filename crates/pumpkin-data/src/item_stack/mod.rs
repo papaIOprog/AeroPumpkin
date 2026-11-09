@@ -3,7 +3,8 @@ use crate::data_component::DataComponent::Enchantments;
 use crate::data_component_impl::{
     BlocksAttacksImpl, ConsumableImpl, CustomDataImpl, DamageImpl, DataComponentImpl,
     EnchantmentsImpl, IDSet, MaxDamageImpl, MaxStackSizeImpl, Rarity, RarityImpl,
-    SwingAnimationImpl, ToolImpl, UnbreakableImpl, UseCooldownImpl, get, get_mut, read_data,
+    StoredEnchantmentsImpl, SwingAnimationImpl, ToolImpl, UnbreakableImpl, UseCooldownImpl, get,
+    get_mut, read_data,
 };
 
 use crate::item::Item;
@@ -209,6 +210,22 @@ impl ItemStack {
     }
 
     pub fn add_enchantment(&mut self, enchantment: &'static Enchantment, level: u16) {
+        // Vanilla `ItemStack.enchant`: enchanted books store their
+        // enchantments in `stored_enchantments` instead.
+        if self.item == &Item::ENCHANTED_BOOK {
+            if let Some(stored) = self.get_data_component_mut::<StoredEnchantmentsImpl>() {
+                let mut new_vec = stored.enchantment.to_vec();
+                new_vec.push((enchantment, level as i32));
+                stored.enchantment = Cow::Owned(new_vec);
+            } else {
+                let stored = StoredEnchantmentsImpl {
+                    enchantment: Cow::Owned(vec![(enchantment, level as i32)]),
+                };
+                self.patch
+                    .push((DataComponent::StoredEnchantments, Some(Box::new(stored))));
+            }
+            return;
+        }
         if let Some(enchantments) = self.get_data_component_mut::<EnchantmentsImpl>() {
             let mut new_vec = enchantments.enchantment.to_vec();
             new_vec.push((enchantment, level as i32));
