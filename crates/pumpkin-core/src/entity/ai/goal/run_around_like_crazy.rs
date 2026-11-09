@@ -1,49 +1,60 @@
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use super::{Controls, Goal, to_goal_ticks};
 use crate::entity::EntityBase;
 use crate::entity::ai::pathfinder::NavigatorGoal;
 use crate::entity::ai::util::default_random_pos;
 use crate::entity::mob::Mob;
-use crate::entity::passive::horse::HorseEntity;
+use pumpkin_data::entity::EntityStatus;
 use pumpkin_util::math::vector3::Vector3;
+use uuid::Uuid;
 
-/// Vanilla `RunAroundLikeCrazyGoal`: an untamed horse with a rider gallops
-/// around, and every so often rolls its temper -- taming the horse on a win,
+/// The `AbstractHorse` pieces `RunAroundLikeCrazyGoal` drives: an untamed
+/// mount that gallops with a rider and rolls its temper until tamed.
+pub trait TemperamentalMount: Send + Sync {
+    fn is_tame(&self) -> bool;
+    fn set_tame(&self, tame: bool);
+    /// Vanilla `getMaxTemper`: 100 for the horse family, 30 for llamas.
+    fn max_temper(&self) -> i32;
+    fn temper(&self) -> i32;
+    fn set_temper(&self, temper: i32);
+    fn set_owner(&self, owner: Uuid);
+    /// Vanilla `makeMad`: rear up with an angry sound.
+    fn make_mad(&self);
+}
+
+/// Vanilla `RunAroundLikeCrazyGoal`: an untamed mount with a rider gallops
+/// around, and every so often rolls its temper -- taming the mount on a win,
 /// throwing the rider off on a loss.
-pub struct RunAroundLikeCrazyGoal {
-    horse: Arc<HorseEntity>,
+pub struct RunAroundLikeCrazyGoal<M: TemperamentalMount + EntityBase + 'static> {
+    mount: Arc<M>,
     goal_control: Controls,
     speed_modifier: f64,
     pos: Vector3<f64>,
 }
 
-impl RunAroundLikeCrazyGoal {
+impl<M: TemperamentalMount + EntityBase> RunAroundLikeCrazyGoal<M> {
     #[expect(
         clippy::missing_const_for_fn,
         reason = "Vector3::new is not const on this toolchain"
     )]
     #[must_use]
-    pub fn new(horse: Arc<HorseEntity>, speed_modifier: f64) -> Self {
+    pub fn new(mount: Arc<M>, speed_modifier: f64) -> Self {
         Self {
-            horse,
+            mount,
             goal_control: Controls::MOVE,
             speed_modifier,
             pos: Vector3::new(0.0, 0.0, 0.0),
         }
     }
 
-    /// Vanilla `AbstractHorse.getMaxTemper` (the Horse override returns the
-    /// base 100).
-    const MAX_TEMPER: i32 = 100;
     /// Vanilla `modifyTemper(5)` per failed attempt.
     const TEMPER_GAIN: i32 = 5;
 }
 
-impl Goal for RunAroundLikeCrazyGoal {
+impl<M: TemperamentalMount + EntityBase> Goal for RunAroundLikeCrazyGoal<M> {
     fn can_start(&mut self, mob: &dyn Mob) -> bool {
-        if self.horse.is_tame() || !mob.get_entity().has_passengers() {
+        if self.mount.is_tame() || !mob.get_entity().has_passengers() {
             return false;
         }
 
@@ -56,7 +67,7 @@ impl Goal for RunAroundLikeCrazyGoal {
     }
 
     fn should_continue(&mut self, mob: &dyn Mob) -> bool {
-        !self.horse.is_tame() && !mob.is_navigator_idle() && mob.get_entity().has_passengers()
+        !self.mount.is_tame() && !mob.is_navigator_idle() && mob.get_entity().has_passengers()
     }
 
     fn start(&mut self, mob: &dyn Mob) {
@@ -76,7 +87,7 @@ impl Goal for RunAroundLikeCrazyGoal {
         }
 
         let passengers = self
-            .horse
+            .mount
             .get_entity()
             .passengers
             .lock()
@@ -90,33 +101,30 @@ impl Goal for RunAroundLikeCrazyGoal {
         };
         drop(passengers);
 
-        let temper = self.horse.temper.load(Ordering::Relaxed);
-        let roll = rand::random::<u32>() % Self::MAX_TEMPER as u32;
-        if Self::MAX_TEMPER > 0 && roll < temper as u32 {
-            self.horse.owner.store(Some(player_uuid));
-            self.horse.set_tame(true);
-            let entity = self.horse.get_entity();
-            entity.world.load().send_entity_status(
-                entity,
-                pumpkin_data::entity::EntityStatus::TamingSucceeded,
-                None,
-            );
+        let max_temper = self.mount.max_temper();
+        let temper = self.mount.temper().max(0) as u32;
+        let roll = rand::random::<u32>() % max_temper.max(1) as u32;
+        if max_temper > 0 && roll < temper {
+            self.mount.set_owner(player_uuid);
+            self.mount.set_tame(true);
+            let entity = self.mount.get_entity();
+            entity
+                .world
+                .load()
+                .send_entity_status(entity, EntityStatus::TamingSucceeded, None);
             return;
         }
-        self.horse.temper.store(
-            (temper + Self::TEMPER_GAIN).min(Self::MAX_TEMPER),
-            Ordering::Relaxed,
-        );
+        self.mount
+            .set_temper((temper as i32 + Self::TEMPER_GAIN).min(max_temper));
 
-        self.horse.make_mad();
-        let horse: Arc<dyn EntityBase> = self.horse.clone();
-        self.horse.get_entity().eject_passengers(&horse);
-        let entity = self.horse.get_entity();
-        entity.world.load().send_entity_status(
-            entity,
-            pumpkin_data::entity::EntityStatus::TamingFailed,
-            None,
-        );
+        self.mount.make_mad();
+        let mount: Arc<dyn EntityBase> = self.mount.clone();
+        self.mount.get_entity().eject_passengers(&mount);
+        let entity = self.mount.get_entity();
+        entity
+            .world
+            .load()
+            .send_entity_status(entity, EntityStatus::TamingFailed, None);
     }
 
     fn controls(&self) -> Controls {

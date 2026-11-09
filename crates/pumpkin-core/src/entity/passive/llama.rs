@@ -21,7 +21,8 @@ use crate::entity::{
         active_target::ActiveTargetGoal, breed::BreedGoal, escape_danger::EscapeDangerGoal,
         follow_parent::FollowParentGoal, look_around::RandomLookAroundGoal,
         look_at_entity::LookAtEntityGoal, ranged_attack::RangedAttackGoal, revenge::RevengeGoal,
-        swim::SwimGoal, tempt::TemptGoal, wander_around::WanderAroundGoal,
+        run_around_like_crazy::RunAroundLikeCrazyGoal, swim::SwimGoal, tempt::TemptGoal,
+        wander_around::WanderAroundGoal,
     },
     mob::{Mob, MobEntity, RangedAttackMob},
     passive::animal::{Animal, get_carpet_color_from_item},
@@ -128,6 +129,10 @@ impl LlamaEntity {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
 
             goal_selector.add_goal(0, Box::new(SwimGoal::default()));
+            goal_selector.add_goal(
+                1,
+                Box::new(RunAroundLikeCrazyGoal::new(mob_arc.clone(), 1.2)),
+            );
             goal_selector.add_goal(1, EscapeDangerGoal::new(1.2));
             goal_selector.add_goal(2, BreedGoal::new(1.0));
             goal_selector.add_goal(
@@ -243,6 +248,42 @@ impl LlamaEntity {
 
         let spit_arc: Arc<dyn EntityBase> = Arc::new(spit);
         world.spawn_entity(spit_arc);
+    }
+}
+
+impl crate::entity::ai::goal::run_around_like_crazy::TemperamentalMount for LlamaEntity {
+    fn is_tame(&self) -> bool {
+        self.has_flag(FLAG_TAME)
+    }
+
+    fn set_tame(&self, tame: bool) {
+        self.set_flag(FLAG_TAME, tame);
+    }
+
+    fn max_temper(&self) -> i32 {
+        // Vanilla `Llama.getMaxTemper`.
+        30
+    }
+
+    fn temper(&self) -> i32 {
+        self.temper.load(Ordering::Relaxed)
+    }
+
+    fn set_temper(&self, temper: i32) {
+        self.temper.store(temper, Ordering::Relaxed);
+    }
+
+    fn set_owner(&self, owner: Uuid) {
+        self.owner.store(Some(owner));
+    }
+
+    fn make_mad(&self) {
+        let entity = self.get_entity();
+        entity.world.load().play_sound(
+            Sound::EntityLlamaAngry,
+            SoundCategory::Neutral,
+            &entity.pos.load(),
+        );
     }
 }
 
@@ -370,7 +411,8 @@ impl Mob for LlamaEntity {
         if !self.is_baby() && !self.is_food(item_stack) {
             let world = player.world();
             let ent = &self.mob_entity.living_entity.entity;
-            if let Some(vehicle) = world.get_entity_by_id(ent.entity_id)
+            if player.get_entity().can_ride()
+                && let Some(vehicle) = world.get_entity_by_id(ent.entity_id)
                 && let Some(passenger) = world.get_player_by_id(player.entity_id())
             {
                 ent.add_passenger(vehicle, passenger as Arc<dyn EntityBase>);

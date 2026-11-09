@@ -180,7 +180,8 @@ impl Mob for PigEntity {
 
         if self.is_saddled() && !self.is_food(item_stack) {
             let world = player.world();
-            if let Some(vehicle) = world.get_entity_by_id(self.get_entity().entity_id)
+            if player.get_entity().can_ride()
+                && let Some(vehicle) = world.get_entity_by_id(self.get_entity().entity_id)
                 && let Some(passenger) = world.get_player_by_id(player.entity_id())
             {
                 self.get_entity()

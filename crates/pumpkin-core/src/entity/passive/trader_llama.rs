@@ -373,7 +373,8 @@ impl Mob for TraderLlamaEntity {
         if !self.is_baby() && !self.is_food(item_stack) {
             let world = player.world();
             let ent = &self.mob_entity.living_entity.entity;
-            if let Some(vehicle) = world.get_entity_by_id(ent.entity_id)
+            if player.get_entity().can_ride()
+                && let Some(vehicle) = world.get_entity_by_id(ent.entity_id)
                 && let Some(passenger) = world.get_player_by_id(player.entity_id())
             {
                 ent.add_passenger(vehicle, passenger as Arc<dyn EntityBase>);

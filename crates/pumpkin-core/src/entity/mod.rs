@@ -3491,6 +3491,12 @@ impl Entity {
             .is_some()
     }
 
+    /// Vanilla `Entity.canRide`: a sneaking entity, or one still in the
+    /// boarding cooldown after dismounting, cannot start riding.
+    pub fn can_ride(&self) -> bool {
+        !self.is_sneaking() && self.riding_cooldown.load(Ordering::Relaxed) <= 0
+    }
+
     pub fn get_vehicle(&self) -> Option<Arc<dyn EntityBase>> {
         self.vehicle
             .lock()

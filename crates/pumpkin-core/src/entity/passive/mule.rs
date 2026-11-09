@@ -17,8 +17,9 @@ use crate::entity::{
     ageable::{AgeableData, AgeableMob},
     ai::goal::{
         escape_danger::EscapeDangerGoal, follow_parent::FollowParentGoal,
-        look_around::RandomLookAroundGoal, look_at_entity::LookAtEntityGoal, swim::SwimGoal,
-        tempt::TemptGoal, wander_around::WanderAroundGoal,
+        look_around::RandomLookAroundGoal, look_at_entity::LookAtEntityGoal,
+        run_around_like_crazy::RunAroundLikeCrazyGoal, swim::SwimGoal, tempt::TemptGoal,
+        wander_around::WanderAroundGoal,
     },
     mob::{Mob, MobEntity},
     passive::animal::Animal,
@@ -72,6 +73,10 @@ impl MuleEntity {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
 
             goal_selector.add_goal(0, Box::new(SwimGoal::default()));
+            goal_selector.add_goal(
+                1,
+                Box::new(RunAroundLikeCrazyGoal::new(mob_arc.clone(), 1.2)),
+            );
             goal_selector.add_goal(1, EscapeDangerGoal::new(1.2));
             goal_selector.add_goal(3, Box::new(TemptGoal::new(1.25, TEMPT_ITEMS, false)));
             goal_selector.add_goal(4, Box::new(FollowParentGoal::new(1.0)));
@@ -129,6 +134,42 @@ impl MuleEntity {
         self.has_chest.store(val, Ordering::Relaxed);
         let entity = self.get_entity();
         entity.set_synced_data(pumpkin_data::tracked_data::mule::CHEST, val);
+    }
+}
+
+impl crate::entity::ai::goal::run_around_like_crazy::TemperamentalMount for MuleEntity {
+    fn is_tame(&self) -> bool {
+        self.has_flag(FLAG_TAME)
+    }
+
+    fn set_tame(&self, tame: bool) {
+        self.set_flag(FLAG_TAME, tame);
+    }
+
+    fn max_temper(&self) -> i32 {
+        // Vanilla `AbstractHorse.getMaxTemper` base.
+        100
+    }
+
+    fn temper(&self) -> i32 {
+        self.temper.load(Ordering::Relaxed)
+    }
+
+    fn set_temper(&self, temper: i32) {
+        self.temper.store(temper, Ordering::Relaxed);
+    }
+
+    fn set_owner(&self, owner: Uuid) {
+        self.owner.store(Some(owner));
+    }
+
+    fn make_mad(&self) {
+        let entity = self.get_entity();
+        entity.world.load().play_sound(
+            pumpkin_data::sound::Sound::EntityMuleAngry,
+            pumpkin_data::sound::SoundCategory::Neutral,
+            &entity.pos.load(),
+        );
     }
 }
 
@@ -239,7 +280,8 @@ impl Mob for MuleEntity {
         if !self.is_baby() && !self.is_food(item_stack) {
             let world = player.world();
             let ent = &self.mob_entity.living_entity.entity;
-            if let Some(vehicle) = world.get_entity_by_id(ent.entity_id)
+            if player.get_entity().can_ride()
+                && let Some(vehicle) = world.get_entity_by_id(ent.entity_id)
                 && let Some(passenger) = world.get_player_by_id(player.entity_id())
             {
                 ent.add_passenger(vehicle, passenger as Arc<dyn EntityBase>);
