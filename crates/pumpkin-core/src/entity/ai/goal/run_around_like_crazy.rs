@@ -39,19 +39,6 @@ impl RunAroundLikeCrazyGoal {
     const MAX_TEMPER: i32 = 100;
     /// Vanilla `modifyTemper(5)` per failed attempt.
     const TEMPER_GAIN: i32 = 5;
-
-    /// Vanilla `makeMad`: rear up with an angry sound before throwing the
-    /// rider. The standing pose needs `aiStep` counters we do not keep, so
-    /// only the sound plays.
-    fn make_mad(&self) {
-        let entity = self.horse.get_entity();
-        let world = entity.world.load();
-        world.play_sound(
-            pumpkin_data::sound::Sound::EntityHorseAngry,
-            pumpkin_data::sound::SoundCategory::Neutral,
-            &entity.pos.load(),
-        );
-    }
 }
 
 impl Goal for RunAroundLikeCrazyGoal {
@@ -84,7 +71,7 @@ impl Goal for RunAroundLikeCrazyGoal {
 
     fn tick(&mut self, _mob: &dyn Mob) {
         // Vanilla: every ~50 ticks roll the temper once.
-        if rand::random::<i32>() % to_goal_ticks(50) != 0 {
+        if !rand::random::<u32>().is_multiple_of(to_goal_ticks(50).unsigned_abs()) {
             return;
         }
 
@@ -104,7 +91,8 @@ impl Goal for RunAroundLikeCrazyGoal {
         drop(passengers);
 
         let temper = self.horse.temper.load(Ordering::Relaxed);
-        if Self::MAX_TEMPER > 0 && rand::random::<i32>() % Self::MAX_TEMPER < temper {
+        let roll = rand::random::<u32>() % Self::MAX_TEMPER as u32;
+        if Self::MAX_TEMPER > 0 && roll < temper as u32 {
             self.horse.owner.store(Some(player_uuid));
             self.horse.set_tame(true);
             let entity = self.horse.get_entity();
@@ -120,7 +108,7 @@ impl Goal for RunAroundLikeCrazyGoal {
             Ordering::Relaxed,
         );
 
-        self.make_mad();
+        self.horse.make_mad();
         let horse: Arc<dyn EntityBase> = self.horse.clone();
         self.horse.get_entity().eject_passengers(&horse);
         let entity = self.horse.get_entity();

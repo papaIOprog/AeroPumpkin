@@ -44,7 +44,23 @@ impl JavaClient {
             }
             Action::LeaveBed => player.wake_up(),
 
-            Action::StartHorseJump | Action::StopHorseJump | Action::OpenVehicleInventory => {
+            // Vanilla: the client sends this when the inventory key is pressed
+            // while riding a mob with its own inventory screen.
+            Action::OpenVehicleInventory => {
+                let vehicle = player
+                    .get_entity()
+                    .vehicle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                if let Some(vehicle) = vehicle
+                    && let Some(mob) = vehicle.get_mob()
+                {
+                    mob.open_custom_inventory_screen(player);
+                }
+            }
+
+            Action::StartHorseJump | Action::StopHorseJump => {
                 debug!("todo");
             }
             Action::StartFlyingElytra => {
@@ -60,7 +76,10 @@ impl JavaClient {
                     }
                 }
             }
-            // 1.21.1 sends sneak state through the player command packet
+            // 1.21.1 sends sneak state through the player command packet when
+            // walking, and through the player input packet while riding. The
+            // dismount itself is done by the server in `Player::tick`,
+            // mirroring vanilla `Player.rideTick`.
             Action::StartSneaking | Action::StopSneaking => {
                 let sneak = matches!(command.action, Action::StartSneaking);
                 if sneak
@@ -77,29 +96,8 @@ impl JavaClient {
                         PlayerToggleSneakEvent::new(player.clone(), sneak);
                         'after: {
                             player.get_entity().set_sneaking(event.is_sneaking);
-                            if event.is_sneaking {
-                                let vehicle = player
-                                    .get_entity()
-                                    .vehicle
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .clone();
-                                if let Some(vehicle) = vehicle {
-                                    vehicle.get_entity().remove_passenger(player.entity_id());
-                                }
-                            }
                         }
                     }}
-                } else if sneak {
-                    let vehicle = player
-                        .get_entity()
-                        .vehicle
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clone();
-                    if let Some(vehicle) = vehicle {
-                        vehicle.get_entity().remove_passenger(player.entity_id());
-                    }
                 }
             }
         }

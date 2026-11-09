@@ -1005,6 +1005,10 @@ pub trait Mob: EntityBase + Send + Sync {
         None
     }
 
+    /// Vanilla `HasCustomInventoryScreen.openCustomInventoryScreen`, opened
+    /// by the player command packet while riding. Does nothing by default.
+    fn open_custom_inventory_screen(&self, _player: &Arc<crate::entity::player::Player>) {}
+
     /// How much this mob likes standing on `pos`, used to rank stroll candidates.
     fn get_walk_target_value(&self, pos: &BlockPos) -> f32 {
         self.as_animal()

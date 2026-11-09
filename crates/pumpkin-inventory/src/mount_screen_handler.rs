@@ -2,8 +2,10 @@ use std::any::Any;
 use std::sync::Arc;
 
 use crate::inventory::Inventory;
+use crate::inventory::SimpleInventory;
 use pumpkin_data::data_component_impl::EquipmentSlot;
 use pumpkin_data::item_stack::ItemStack;
+use pumpkin_data::screen::WindowType;
 
 use crate::player::player_inventory::PlayerInventory;
 use crate::screen_handler::{InventoryPlayer, ScreenHandler, ScreenHandlerBehaviour};
@@ -164,6 +166,63 @@ impl ScreenHandler for MountScreenHandler {
         }
 
         clicked
+    }
+}
+
+/// Vanilla `HorseInventoryMenu` for a horse (no chest rows): a saddle slot,
+/// a body armor slot and the player inventory.
+pub struct HorseScreenHandler {
+    pub mount_handler: MountScreenHandler,
+}
+
+impl HorseScreenHandler {
+    pub fn new(
+        sync_id: u8,
+        player_inventory: &Arc<PlayerInventory>,
+        saddle_inventory: Arc<dyn Inventory>,
+        armor_inventory: Arc<dyn Inventory>,
+    ) -> Self {
+        Self {
+            mount_handler: MountScreenHandler::new(
+                sync_id,
+                player_inventory,
+                // Horses carry no chest, so the mount inventory stays empty.
+                Arc::new(SimpleInventory::new(0)),
+                saddle_inventory,
+                armor_inventory,
+                0,
+            ),
+        }
+    }
+}
+
+impl ScreenHandler for HorseScreenHandler {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn get_behaviour(&self) -> &ScreenHandlerBehaviour {
+        self.mount_handler.get_behaviour()
+    }
+
+    fn get_behaviour_mut(&mut self) -> &mut ScreenHandlerBehaviour {
+        self.mount_handler.get_behaviour_mut()
+    }
+
+    fn window_type(&self) -> Option<WindowType> {
+        Some(WindowType::Horse)
+    }
+
+    fn on_closed(&mut self, player: &dyn InventoryPlayer) {
+        self.mount_handler.on_closed(player);
+    }
+
+    fn quick_move(&mut self, player: &dyn InventoryPlayer, slot_index: i32) -> ItemStack {
+        self.mount_handler.quick_move(player, slot_index)
     }
 }
 

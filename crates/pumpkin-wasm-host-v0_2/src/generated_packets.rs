@@ -1494,6 +1494,18 @@ pub fn deserialize_java_serverbound_packet(
                 },
             ))
         }
+        id if id == pumpkin_protocol::java::server::play::SSteerVehicle::to_id(version) => {
+            use pumpkin_protocol::ServerPacket;
+            let p = <pumpkin_protocol::java::server::play::SSteerVehicle as pumpkin_protocol::ServerPacket>::read(&mut payload, &version).ok()?;
+            Some(ServerboundPacket::SSteerVehicle(
+                crate::pumpkin::plugin::java_packets::SSteerVehicle {
+                    sideways: p.sideways.try_into().unwrap(),
+                    forward: p.forward.try_into().unwrap(),
+                    jump: p.jump.try_into().unwrap(),
+                    sneak: p.sneak.try_into().unwrap(),
+                },
+            ))
+        }
         id if id == pumpkin_protocol::java::server::play::STeleportToEntity::to_id(version) => {
             use pumpkin_protocol::ServerPacket;
             let p = <pumpkin_protocol::java::server::play::STeleportToEntity as pumpkin_protocol::ServerPacket>::read(&mut payload, &version).ok()?;

@@ -69,7 +69,8 @@ use pumpkin_protocol::java::server::play::{
     SPlayerAction, SPlayerCommand, SPlayerPosition, SPlayerPositionRotation, SPlayerRotation,
     SPlayerSession, SRecipeBookChangeSettings, SRecipeBookSeenRecipe, SSeenAdvancement,
     SSelectTrade, SSetCommandBlock, SSetCreativeSlot, SSetHeldItem, SSetJigsawBlock,
-    SSetPlayerGround, SSwingArm, STeleportToEntity, SUpdateSign, SUseItem, SUseItemOn, Status,
+    SSetPlayerGround, SSteerVehicle, SSwingArm, STeleportToEntity, SUpdateSign, SUseItem,
+    SUseItemOn, Status,
 };
 use pumpkin_util::math::vector3::Vector3;
 use pumpkin_util::math::{polynomial_rolling_hash, position::BlockPos, wrap_degrees};
@@ -282,6 +283,7 @@ pub mod set_held_item;
 pub mod set_jigsaw_block;
 pub mod set_structure_block;
 pub mod spectate_entity;
+pub mod steer_vehicle;
 pub mod swing_arm;
 pub mod tag_query;
 pub mod teleport_to_entity;

@@ -2637,6 +2637,22 @@ impl Player {
     pub fn tick<'a>(&'a self, server: &'a Server) {
         self.process_inbound_packets();
 
+        // Vanilla `Player.rideTick`: the server itself dismounts a sneaking
+        // rider. While riding, the client reports sneak only through the
+        // player input (steer vehicle) packet, never as a player command.
+        let entity = self.get_entity();
+        if entity.is_sneaking() && entity.has_vehicle() {
+            let vehicle = entity
+                .vehicle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(vehicle) = vehicle {
+                vehicle.get_entity().remove_passenger(entity.entity_id);
+            }
+            entity.set_sneaking(false);
+        }
+
         if self.is_spectator() {
             self.living_entity
                 .entity

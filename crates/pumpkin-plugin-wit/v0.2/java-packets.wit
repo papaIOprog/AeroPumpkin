@@ -371,6 +371,12 @@ interface java-packets {
   record s-spectate-entity {
     target: uuid,
   }
+  record s-steer-vehicle {
+    sideways: f32,
+    forward: f32,
+    jump: bool,
+    sneak: bool,
+  }
   record s-swing-arm {
     hand: s32,
   }
@@ -1457,6 +1463,7 @@ interface java-packets {
     s-set-jigsaw-block(s-set-jigsaw-block),
     s-set-structure-block(s-set-structure-block),
     s-spectate-entity(s-spectate-entity),
+    s-steer-vehicle(s-steer-vehicle),
     s-teleport-to-entity(s-teleport-to-entity),
     s-update-sign(s-update-sign),
     s-use-item(s-use-item),

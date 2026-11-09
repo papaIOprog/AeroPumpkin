@@ -20,8 +20,8 @@ use pumpkin_protocol::java::server::play::{
     SPlayerPositionRotation, SPlayerRotation, SPlayerSession, SRecipeBookChangeSettings,
     SRecipeBookSeenRecipe, SRenameItem, SSeenAdvancement, SSelectTrade, SSetBeacon,
     SSetCommandBlock, SSetCommandMinecart, SSetCreativeSlot, SSetHeldItem, SSetJigsawBlock,
-    SSetPlayerGround, SSetStructureBlock, SSpectateEntity, SSwingArm, STeleportToEntity,
-    SUpdateSign, SUseItem, SUseItemOn,
+    SSetPlayerGround, SSetStructureBlock, SSpectateEntity, SSteerVehicle, SSwingArm,
+    STeleportToEntity, SUpdateSign, SUseItem, SUseItemOn,
 };
 use pumpkin_protocol::packet::MultiVersionJavaPacket;
 use pumpkin_protocol::{
@@ -829,6 +829,13 @@ impl JavaClient {
             }
             id if id == SPaddleBoat::to_id(version) => {
                 self.handle_paddle_boat(player, &SPaddleBoat::read(&mut payload, &version)?);
+            }
+            id if id == SSteerVehicle::to_id(version) => {
+                self.handle_steer_vehicle(
+                    player,
+                    &SSteerVehicle::read(&mut payload, &version)?,
+                    server,
+                );
             }
             id if id == SPickItem::to_id(version) => {
                 self.handle_pick_item(player, &SPickItem::read(&mut payload, &version)?);
