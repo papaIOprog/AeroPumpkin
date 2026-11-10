@@ -30,7 +30,7 @@ impl EndIsland {
         }
     }
 
-    pub fn sample_2d(sampler: &SimplexNoiseSampler, x: i32, z: i32) -> f32 {
+    fn sample_2d(sampler: &SimplexNoiseSampler, x: i32, z: i32) -> f32 {
         let i = x / 2;
         let j = z / 2;
         let k = x % 2;

@@ -505,6 +505,22 @@ pub fn get_filtered_spawning_categories(
     ret
 }
 
+// TEMP END_SPAWN_PROBE: capped diagnostics for end spawning (remove after fix).
+pub static END_SPAWN_PROBE_COUNT: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+fn end_spawn_probe(world: &World, what: &str) -> bool {
+    use std::sync::atomic::Ordering;
+    if world.dimension != pumpkin_data::dimension::Dimension::THE_END {
+        return false;
+    }
+    if END_SPAWN_PROBE_COUNT.fetch_add(1, Ordering::Relaxed) > 40 {
+        return true;
+    }
+    tracing::warn!("END_SPAWN_PROBE {what}");
+    true
+}
+
 pub fn spawn_for_chunk(
     world: &Arc<World>,
     chunk_pos: Vector2<i32>,
@@ -514,6 +530,12 @@ pub fn spawn_for_chunk(
     is_thundering: bool,
 ) -> Vec<Arc<dyn EntityBase>> {
     let mut entities = Vec::new();
+    if end_spawn_probe(world, "spawn_for_chunk") {
+        tracing::warn!(
+            "END_SPAWN_PROBE categories={:?}",
+            spawn_list.iter().map(|c| c.id).collect::<Vec<_>>()
+        );
+    }
     for category in spawn_list {
         if spawn_state.can_spawn_for_category_local(world, category, chunk_pos) {
             let random_pos = get_random_pos_within(world.min_y, &chunk_pos, chunk);
@@ -730,7 +752,17 @@ pub fn spawn_category_for_position(
     let y_start = pos.0.y;
     let state = world.get_block_state(&pos);
     if state.is_solid_block() || state.is_full_cube() {
+        if end_spawn_probe(world, "solid abort at spawn pos") {
+            tracing::warn!("END_SPAWN_PROBE pos={:?} y={y_start}", pos.0);
+        }
         return batch_buffer;
+    }
+    if end_spawn_probe(world, "category attempt starts") {
+        tracing::warn!(
+            "END_SPAWN_PROBE pos={:?} y={y_start} category={}",
+            pos.0,
+            category.id
+        );
     }
 
     let mut cluster_size = 0;

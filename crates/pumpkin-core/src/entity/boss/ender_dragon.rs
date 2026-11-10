@@ -296,6 +296,14 @@ impl EnderDragonEntity {
         old_phase.end(self);
 
         *phase_lock = phase_type;
+        // TEMP DRAGON_PROBE: phase transitions (remove after diagnosis).
+        let probe_pos = self.get_entity().pos.load();
+        tracing::warn!(
+            "DRAGON_PROBE transition -> {phase_type:?} at ({:.0}, {:.0}, {:.0})",
+            probe_pos.x,
+            probe_pos.y,
+            probe_pos.z
+        );
 
         let new_phase = self.phase_manager.get_phase(phase_type);
         new_phase.begin(self);
