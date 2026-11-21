@@ -140,7 +140,10 @@ impl GenerationSchedule {
         ));
 
         let cpus = thread::available_parallelism().map_or(1, std::num::NonZero::get);
-        let gen_threads = (cpus / 2).clamp(2, 16);
+        // Leave one core for the scheduler thread, tokio and the io workers;
+        // chunk generation is pure CPU work and the pool is the bottleneck
+        // whenever the world is being pregenerated or freshly explored.
+        let gen_threads = (cpus - 1).clamp(2, 31);
         let generation_pool = Arc::new(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(gen_threads)
