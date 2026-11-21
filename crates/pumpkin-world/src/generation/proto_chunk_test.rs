@@ -177,8 +177,15 @@ mod test {
             unreachable!()
         };
 
-        let resumed = ProtoChunk::from_chunk_data(&chunk_data, &world_gen);
-        assert_eq!(resumed.stage, StagedChunkEnum::StructureReferences);
+        // from_chunk_data no longer rebuilds the structure stages inline (that
+        // expanded jigsaws on the io workers and stalled the pipeline); it resets
+        // the chunk to Biomes and the scheduler's stage tasks redo the rest.
+        let mut resumed = ProtoChunk::from_chunk_data(&chunk_data, &world_gen);
+        assert_eq!(resumed.stage, StagedChunkEnum::Biomes);
+        assert!(!resumed.has_structure(StructureKeys::Monument));
+
+        resumed.set_structure_starts(generator);
+        resumed.set_structure_references(generator);
         assert!(resumed.has_structure(StructureKeys::Monument));
     }
 
@@ -256,7 +263,10 @@ mod test {
         assert_eq!(chunk_data.status, pumpkin_data::chunk::ChunkStatus::Terrain);
 
         let mut resumed = ProtoChunk::from_chunk_data(&chunk_data, &world_gen);
-        assert_eq!(resumed.stage, StagedChunkEnum::Noise);
+        // Structure stages are transient, so a chunk saved between StructureStart
+        // and Features resumes at Biomes; the scheduler's stage tasks rebuild the
+        // rest on the generation pool instead of the io workers.
+        assert_eq!(resumed.stage, StagedChunkEnum::Biomes);
 
         let mut height_mismatches = 0;
         for z in 0..16i32 {
@@ -274,6 +284,11 @@ mod test {
         );
 
         let surface_biomes = surface_biomes(&world_gen, cx, cz);
+        // The resume path resets the chunk to Biomes, so continuing means
+        // re-running the structure and noise stages (deterministic).
+        resumed.set_structure_starts(generator);
+        resumed.set_structure_references(generator);
+        resumed.step_to_noise(generator);
         resumed.step_to_surface(generator, &surface_biomes);
 
         let mut fresh = ProtoChunk::new(cx, cz, &world_gen);

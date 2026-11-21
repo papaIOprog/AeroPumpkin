@@ -365,20 +365,22 @@ impl ProtoChunk {
         }
 
         let saved_stage = StagedChunkEnum::from(chunk_data.status);
-        proto_chunk.stage = saved_stage;
-        if let super::generator::WorldGenerator::Noise(generator) = generator
-            && (StagedChunkEnum::StructureStart..StagedChunkEnum::Features).contains(&saved_stage)
+        // Structure starts and references are transient proto-chunk data, so a chunk
+        // resumed before the features stage must rebuild them or structures crossing
+        // the unload boundary would be truncated. The rebuild expands jigsaws, which
+        // can take seconds per chunk, so it must not run here: this loads on the io
+        // workers, and expanding structures inline starves every other chunk load (the
+        // whole generation pipeline stalls behind the io channel). Reset the stage
+        // instead and let the scheduler's stage tasks redo the structure stages on the
+        // generation pool. Chunks saved past the noise stage re-run their later stages
+        // too; generation is deterministic, so that is wasted work, not wrong output.
+        proto_chunk.stage = if (StagedChunkEnum::StructureStart..StagedChunkEnum::Features)
+            .contains(&saved_stage)
         {
-            // Structure starts and references are currently transient proto-chunk data.
-            // Rebuild them when resuming a partially generated chunk so structures that
-            // cross chunk boundaries are not truncated at the unload boundary.
-            proto_chunk.stage = StagedChunkEnum::Biomes;
-            proto_chunk.set_structure_starts(generator);
-            if saved_stage >= StagedChunkEnum::StructureReferences {
-                proto_chunk.set_structure_references(generator);
-            }
-            proto_chunk.stage = saved_stage;
-        }
+            StagedChunkEnum::Biomes
+        } else {
+            saved_stage
+        };
         proto_chunk
     }
 
