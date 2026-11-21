@@ -61,13 +61,22 @@ impl<'a> NoiseHeightSampler<'a> {
             ),
             FluidLevel::new(-54, &Block::LAVA),
         );
-        let volume = DensityVolume::with_block_step(
+        // Vanilla's `NoiseBasedChunkGenerator.iterateNoiseColumn` samples the
+        // column at the vertical cell step and interpolates between cells, not
+        // once per block: structure height estimates are cheap by design, and
+        // the jigsaw placement code asks for thousands of them.
+        let cell = i32::from(shape.vertical_cell_block_count());
+        let cell_count = shape.height as i32 / cell + 1;
+        let volume = DensityVolume::new(
             1,
-            shape.height as usize,
+            cell_count as usize,
             1,
             x,
             i32::from(shape.min_y),
             z,
+            1,
+            cell,
+            1,
         );
         let mut noise = ChunkNoiseGenerator::new(
             &self.generator.base_router.noise,
@@ -83,23 +92,35 @@ impl<'a> NoiseHeightSampler<'a> {
         );
 
         let densities = noise.sample_density();
-        let mut blocks = Vec::with_capacity(volume.size_y);
-        for y in 0..volume.size_y {
-            let block_y = volume.block_y(y);
-            let index = volume.index_unchecked(0, y, 0);
+        let sample = |block_y: i32| -> f32 {
+            let offset = block_y - i32::from(shape.min_y);
+            let exact = offset / cell;
+            let frac = offset % cell;
+            if frac == 0 || exact + 1 >= cell_count {
+                densities.density[exact as usize]
+            } else {
+                let a = densities.density[exact as usize];
+                let b = densities.density[(exact + 1) as usize];
+                a + (b - a) * (f64::from(frac) / f64::from(cell)) as f32
+            }
+        };
+
+        let min_y = i32::from(shape.min_y);
+        let height = shape.height as i32;
+        let mut blocks = Vec::with_capacity(height as usize);
+        for offset in 0..height {
             let state = noise
                 .sample_block_state(
                     &self.generator.random_config.ore_random_deriver,
-                    &Vector3::new(x, block_y, z),
-                    densities.density[index],
-                    densities.vein_sample(index).as_ref(),
+                    &Vector3::new(x, min_y + offset, z),
+                    sample(min_y + offset),
+                    None,
                     &mut self.preliminary,
                 )
                 .unwrap_or(self.generator.default_block);
             blocks.push(state);
         }
-        self.columns
-            .insert((x, z), (i32::from(shape.min_y), blocks));
+        self.columns.insert((x, z), (min_y, blocks));
     }
 
     fn sample_column(&mut self, x: i32, z: i32, ocean_floor: bool) -> i32 {

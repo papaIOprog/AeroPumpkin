@@ -1560,15 +1560,14 @@ impl ProtoChunk {
                             },
                         );
 
-                        if let Some(start_data) = start_data {
-                            if start_data
+                        if let Some(start_data) = start_data
+                            && start_data
                                 .get_bounding_box()
                                 .intersects_raw_xz(start_x, start_z, end_x, end_z)
-                            {
-                                references.push((entry.structure, start_data.collector.clone()));
-                            }
-                            break;
+                        {
+                            references.push((entry.structure, start_data.collector.clone()));
                         }
+                        break;
                     }
                 }
             }
