@@ -12,6 +12,7 @@ mod ban;
 mod banip;
 mod banlist;
 mod bossbar;
+mod chunky;
 mod clear;
 mod clone;
 mod damage;
@@ -110,6 +111,7 @@ pub fn default_dispatcher(
     execute::register(&mut dispatcher, registry);
     fillbiome::register(&mut dispatcher, registry);
     forceload::register(&mut dispatcher, registry);
+    chunky::register(&mut dispatcher, registry);
     ride::register(&mut dispatcher, registry);
     reload::register(&mut dispatcher, registry);
     help::register(&mut dispatcher, registry);

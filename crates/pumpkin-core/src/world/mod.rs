@@ -28,6 +28,7 @@ pub mod generation_cache;
 pub mod loot;
 pub mod map;
 pub mod portal;
+pub mod pregen;
 pub mod raid;
 pub mod random_sequences;
 pub mod stopwatches;
