@@ -61,22 +61,13 @@ impl<'a> NoiseHeightSampler<'a> {
             ),
             FluidLevel::new(-54, &Block::LAVA),
         );
-        // Vanilla's `NoiseBasedChunkGenerator.iterateNoiseColumn` samples the
-        // column at the vertical cell step and interpolates between cells, not
-        // once per block: structure height estimates are cheap by design, and
-        // the jigsaw placement code asks for thousands of them.
-        let cell = i32::from(shape.vertical_cell_block_count());
-        let cell_count = shape.height as i32 / cell + 1;
-        let volume = DensityVolume::new(
+        let volume = DensityVolume::with_block_step(
             1,
-            cell_count as usize,
+            shape.height as usize,
             1,
             x,
             i32::from(shape.min_y),
             z,
-            1,
-            cell,
-            1,
         );
         let mut noise = ChunkNoiseGenerator::new(
             &self.generator.base_router.noise,
@@ -92,18 +83,6 @@ impl<'a> NoiseHeightSampler<'a> {
         );
 
         let densities = noise.sample_density();
-        let sample = |block_y: i32| -> f32 {
-            let offset = block_y - i32::from(shape.min_y);
-            let exact = offset / cell;
-            let frac = offset % cell;
-            if frac == 0 || exact + 1 >= cell_count {
-                densities.density[exact as usize]
-            } else {
-                let a = densities.density[exact as usize];
-                let b = densities.density[(exact + 1) as usize];
-                a + (b - a) * (f64::from(frac) / f64::from(cell)) as f32
-            }
-        };
 
         let min_y = i32::from(shape.min_y);
         let height = shape.height as i32;
@@ -113,7 +92,7 @@ impl<'a> NoiseHeightSampler<'a> {
                 .sample_block_state(
                     &self.generator.random_config.ore_random_deriver,
                     &Vector3::new(x, min_y + offset, z),
-                    sample(min_y + offset),
+                    densities.density[offset as usize],
                     None,
                     &mut self.preliminary,
                 )
