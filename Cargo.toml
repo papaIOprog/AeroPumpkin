@@ -18,6 +18,7 @@ members = [
     "crates/pumpkin-plugin-runtime",
     "crates/pumpkin-plugin-utils",
     "crates/pumpkin-protocol",
+    "crates/pumpkin-sublevel",
     "crates/pumpkin-util",
     "crates/pumpkin-wasm-host",
     "crates/pumpkin-wasm-host-common",
@@ -172,6 +173,9 @@ bytes = { version = "1.12", default-features = false, features = ["serde", "std"
 # Concurrency/Parallelism and Synchronization
 futures = { version = "0.3", default-features = false, features = ["std"] }
 rayon = { version = "1.12", default-features = false }
+# Sequential only: defaults exclude the `parallel` feature, so pumpkin-sublevel
+# never dispatches onto rayon pools.
+rapier3d = "0.26"
 crossbeam = { version = "0.8", default-features = false, features = ["std"] }
 
 uuid = { version = "1.27", default-features = false, features = ["serde", "v3", "v4", "std"] }
@@ -224,6 +228,7 @@ pumpkin-plugin-api = { path = "crates/pumpkin-plugin-api", default-features = fa
 pumpkin-plugin-runtime = { path = "crates/pumpkin-plugin-runtime", default-features = false }
 pumpkin-plugin-utils = { path = "crates/pumpkin-plugin-utils", default-features = false }
 pumpkin-protocol = { path = "crates/pumpkin-protocol", default-features = false }
+pumpkin-sublevel = { path = "crates/pumpkin-sublevel", default-features = false }
 pumpkin-util = { path = "crates/pumpkin-util", default-features = false }
 pumpkin-wasm-host = { path = "crates/pumpkin-wasm-host", default-features = false }
 pumpkin-wasm-host-common = { path = "crates/pumpkin-wasm-host-common", default-features = false }

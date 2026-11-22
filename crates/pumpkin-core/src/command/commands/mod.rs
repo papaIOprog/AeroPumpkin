@@ -73,6 +73,7 @@ mod spectate;
 mod spreadplayers;
 mod stop;
 mod stopsound;
+mod sublevel;
 mod summon;
 mod swing;
 mod tag;
@@ -169,6 +170,7 @@ pub fn default_dispatcher(
     enchant::register(&mut dispatcher, registry);
     effect::register(&mut dispatcher, registry);
     summon::register(&mut dispatcher, registry);
+    sublevel::register(&mut dispatcher, registry);
     swing::register(&mut dispatcher, registry);
     damage::register(&mut dispatcher, registry);
     rotate::register(&mut dispatcher, registry);
