@@ -1566,8 +1566,11 @@ impl ProtoChunk {
                                 .intersects_raw_xz(start_x, start_z, end_x, end_z)
                         {
                             references.push((entry.structure, start_data.collector.clone()));
+                            // Only the first intersecting structure of a set
+                            // generates, mirroring vanilla's
+                            // `getStructureGeneratingAt`.
+                            break;
                         }
-                        break;
                     }
                 }
             }
