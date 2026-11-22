@@ -138,6 +138,17 @@ impl TrackedEntity {
     /// Vanilla `ServerEntity.sendChanges`. Non-player entities only.
     pub fn send_changes(&self, world: &World) {
         let entity = self.entity.get_entity();
+        if world.is_parked_in_sublevel(entity) {
+            // Sable clients read one extra boolean on the position packets of
+            // entities that live in a sub-level.
+            crate::world::sublevel::with_parked_entity(|| self.send_changes_inner(world));
+        } else {
+            self.send_changes_inner(world);
+        }
+    }
+
+    fn send_changes_inner(&self, world: &World) {
+        let entity = self.entity.get_entity();
         self.send_bedrock_move(entity, world);
         let tick = self.tick_count.fetch_add(1, Relaxed);
         let needs_sync = entity.velocity_dirty.swap(false, Ordering::SeqCst);
@@ -395,11 +406,11 @@ impl TrackedEntity {
         })
     }
 
-    pub fn update_player(&self, player: &Arc<Player>, _world: &World) {
-        self.update_player_in_range(player, self.get_effective_range());
+    pub fn update_player(&self, player: &Arc<Player>, world: &World) {
+        self.update_player_in_range(player, self.get_effective_range(), world);
     }
 
-    fn update_player_in_range(&self, player: &Arc<Player>, effective_range: u32) {
+    fn update_player_in_range(&self, player: &Arc<Player>, effective_range: u32, world: &World) {
         if player.get_entity().entity_id == self.entity_id {
             return;
         }
@@ -421,9 +432,39 @@ impl TrackedEntity {
             .load()
             .is_within_distance(entity_chunk.x, entity_chunk.y);
 
+        if !self.broadcast_to_player(player) {
+            self.remove_player(player);
+            return;
+        }
+
+        // Entities parked in a sub-level's plot are shown to the players
+        // tracking that sub-level regardless of distance: the client relocates
+        // them by the sub-level's pose, and the sub-level streams their chunk.
+        if world.player_tracks_sublevel_chunk(player.gameprofile.id, entity_chunk) {
+            crate::world::sublevel::with_parked_entity(|| {
+                self.pair(player);
+                // The add-entity packet alone does not tell a Sable client the
+                // entity belongs to the sub-level; a position packet flagged as
+                // plot coordinates does.
+                let entity = self.entity.get_entity();
+                self.send_to_tracking_players(
+                    &CTeleportEntity::new(
+                        VarInt(self.entity_id),
+                        entity.pos.load(),
+                        Vector3::new(0.0, 0.0, 0.0),
+                        entity.yaw.load(),
+                        entity.pitch.load(),
+                        &[],
+                        entity.on_ground.load(Relaxed),
+                    ),
+                    world,
+                );
+            });
+            return;
+        }
+
         // Vanilla `isChunkTracked`: never spawn before the chunk packet.
         let is_visible = dist_sq <= range_sq
-            && self.broadcast_to_player(player)
             && in_view
             && player
                 .chunk_sender
@@ -432,21 +473,26 @@ impl TrackedEntity {
                 .is_chunk_ready(&entity_chunk);
 
         if is_visible {
-            if self.seen_by.insert(player.gameprofile.id) {
-                if matches!(player.client.as_ref(), ClientPlatform::Bedrock(_)) {
-                    self.bedrock_watchers.fetch_add(1, Relaxed);
-                }
-                self.add_pairing(player);
-            }
+            self.pair(player);
         } else {
             self.remove_player(player);
         }
     }
 
-    pub fn update_players(&self, players: &[Arc<Player>], _world: &World) {
+    /// Starts sending the entity to `player` if that is not already happening.
+    fn pair(&self, player: &Arc<Player>) {
+        if self.seen_by.insert(player.gameprofile.id) {
+            if matches!(player.client.as_ref(), ClientPlatform::Bedrock(_)) {
+                self.bedrock_watchers.fetch_add(1, Relaxed);
+            }
+            self.add_pairing(player);
+        }
+    }
+
+    pub fn update_players(&self, players: &[Arc<Player>], world: &World) {
         let effective_range = self.get_effective_range();
         for player in players {
-            self.update_player_in_range(player, effective_range);
+            self.update_player_in_range(player, effective_range, world);
         }
     }
 

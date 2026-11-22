@@ -34,7 +34,7 @@ use tokio::{
     },
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     entity::player::ChatMode,
@@ -47,6 +47,7 @@ use crate::{
 };
 
 use super::JavaClient;
+use super::neoforge::{self, NeoforgeChannels};
 
 const BRAND_CHANNEL_PREFIX: &str = "minecraft:brand";
 
@@ -72,6 +73,8 @@ pub struct PendingConnection {
     pub gameprofile: Option<GameProfile>,
     pub config: Option<PlayerConfig>,
     pub brand: Option<String>,
+    /// The channels a `NeoForge` client announced during network negotiation.
+    pub neoforge_channels: Option<Arc<NeoforgeChannels>>,
     pub packet_limiter: PacketRateLimiter,
     pub verify_token: Option<[u8; 4]>,
     pub vine_challenge: Option<[u8; 16]>,
@@ -101,6 +104,7 @@ impl PendingConnection {
             gameprofile: None,
             config: None,
             brand: None,
+            neoforge_channels: None,
             packet_limiter,
             verify_token: None,
             vine_challenge: None,
@@ -580,6 +584,34 @@ impl PendingConnection {
     }
 
     pub async fn handle_plugin_message(&mut self, plugin_message: SPluginMessage<'_>) {
+        if neoforge::is_query_answer(plugin_message.channel) {
+            match NeoforgeChannels::parse_query(plugin_message.data) {
+                Ok(channels) => {
+                    info!(
+                        "{} is a NeoForge client with {} network channel(s)",
+                        self.gameprofile.as_ref().map_or_else(
+                            || self.address.to_string(),
+                            |profile| profile.name.clone()
+                        ),
+                        channels.channels.len()
+                    );
+                    match channels.encode_setup() {
+                        Ok(setup) => {
+                            let payload = neoforge::setup_payload(&setup);
+                            self.send_packet_now(&payload).await;
+                            self.neoforge_channels = Some(Arc::new(channels));
+                        }
+                        Err(error) => {
+                            warn!("Could not answer NeoForge channel list: {error}");
+                        }
+                    }
+                }
+                Err(error) => {
+                    warn!("Ignoring malformed NeoForge channel list: {error}");
+                }
+            }
+            return;
+        }
         debug!("Handling plugin message");
         if plugin_message.channel.starts_with(BRAND_CHANNEL_PREFIX) {
             debug!("Got a client brand");

@@ -1,5 +1,7 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use crate::net::java::neoforge;
+use pumpkin_protocol::java::client::config::CPluginMessage;
 
 impl PendingConnection {
     pub async fn handle_login_acknowledged(
@@ -8,6 +10,30 @@ impl PendingConnection {
     ) -> Option<PacketHandlerResult> {
         debug!("Handling login acknowledgement");
         self.connection_state.store(ConnectionState::Config);
+
+        // NeoForge network negotiation comes first: a NeoForge client that sees
+        // the brand payload before the channel query concludes the server is
+        // vanilla and disconnects if any of its mods is mandatory.
+        let unregister = neoforge::encode_channel_list(&[
+            neoforge::REGISTER_CHANNEL,
+            neoforge::UNREGISTER_CHANNEL,
+        ]);
+        self.send_packet_now(&CPluginMessage::new(
+            neoforge::UNREGISTER_CHANNEL,
+            &unregister,
+        ))
+        .await;
+        let register = neoforge::encode_channel_list(&[
+            neoforge::REGISTER_CHANNEL,
+            neoforge::UNREGISTER_CHANNEL,
+            "neoforge:register",
+            "neoforge:network",
+        ]);
+        self.send_packet_now(&CPluginMessage::new(neoforge::REGISTER_CHANNEL, &register))
+            .await;
+        let query = neoforge::query_payload();
+        self.send_packet_now(&query).await;
+
         self.send_packet_now(&server.get_branding()).await;
 
         if server.advanced_config.server_links.enabled {

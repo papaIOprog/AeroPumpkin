@@ -281,7 +281,7 @@ pub struct World {
     pub raids: std::sync::Mutex<raid::Raids>,
     /// Native sub-levels: rigid bodies carrying blocks and entities.
     /// Simulated sequentially on the tick thread, never on rayon.
-    pub sublevels: std::sync::Mutex<pumpkin_sublevel::SubLevelSystem>,
+    pub sublevels: std::sync::Mutex<sublevel::SubLevelManager>,
     /// End Dragon fight manager (only present in `THE_END` dimension).
     pub dragon_fight: Option<std::sync::Mutex<dragon_fight::DragonFight>>,
     pub spawn_state: ArcSwap<SpawnState>,
@@ -420,7 +420,7 @@ impl World {
             portal_poi: std::sync::Mutex::new(portal_poi),
             villager_poi: std::sync::Mutex::new(villager_poi::VillagerPoiStorage::default()),
             raids: std::sync::Mutex::new(raid::Raids::default()),
-            sublevels: std::sync::Mutex::new(pumpkin_sublevel::SubLevelSystem::new()),
+            sublevels: std::sync::Mutex::new(sublevel::SubLevelManager::new()),
             dragon_fight,
             spawn_state: ArcSwap::new(Arc::new(SpawnState::empty())),
             active_chunks: RwLock::new(FxHashSet::default()),

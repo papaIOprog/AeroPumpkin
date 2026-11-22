@@ -1,4 +1,7 @@
-use pumpkin_protocol::java::client::play::{CChunkBatchEnd, CChunkBatchStart, CPlayDisconnect};
+use pumpkin_protocol::java::client::play::{
+    CChunkBatchEnd, CChunkBatchStart, CPlayDisconnect, CTeleportEntity, CUpdateEntityPos,
+    CUpdateEntityPosRot,
+};
 use pumpkin_world::level::SyncChunk;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
@@ -52,6 +55,7 @@ use tracing::{debug, error, warn};
 pub mod chunk_data;
 pub mod handshake;
 pub mod login;
+pub mod neoforge;
 mod outgoing;
 pub mod pending;
 pub mod play;
@@ -92,6 +96,8 @@ pub struct JavaClient {
     pub address: SocketAddr,
     /// The client's brand or modpack information. Lock-free `ArcSwap`.
     pub brand: ArcSwap<Option<String>>,
+    /// Channels a `NeoForge` client announced during network negotiation.
+    pub neoforge_channels: ArcSwap<Option<Arc<neoforge::NeoforgeChannels>>>,
     /// Associated player reference. Lock-free `ArcSwap`.
     pub player: ArcSwap<Option<Arc<Player>>>,
     /// A collection of tasks associated with this client. The tasks await completion when removing the client.
@@ -159,6 +165,7 @@ impl JavaClient {
             network_writer: std::sync::Mutex::new(Some(pending.network_writer)),
             network_reader: std::sync::Mutex::new(Some(pending.network_reader)),
             brand: ArcSwap::from_pointee(pending.brand),
+            neoforge_channels: ArcSwap::from_pointee(pending.neoforge_channels),
             player: ArcSwap::from_pointee(None),
             wait_for_keep_alive: AtomicBool::new(false),
             received_movement_this_tick: AtomicBool::new(false),
@@ -402,6 +409,7 @@ impl JavaClient {
             return None;
         }
         let packet_data = self.translate_outgoing(packet_data)?;
+        let packet_data = self.sable_entity_packet_tail(packet_data);
 
         // Reserve first, release again if it does not fit.
         let packet_len = packet_data.len();
@@ -421,6 +429,33 @@ impl JavaClient {
         }
 
         Some((packet_data, packet_len))
+    }
+
+    /// Sable appends one boolean to three vanilla entity position packets,
+    /// saying whether the coordinates are plot coordinates of a sub-level. Its
+    /// clients refuse the vanilla layout, so they get the extra byte; everyone
+    /// else is left alone.
+    fn sable_entity_packet_tail(&self, packet_data: Bytes) -> Bytes {
+        if !self.has_mod_channel(crate::world::sublevel::sable::DETECT_CHANNEL) {
+            return packet_data;
+        }
+        let Ok(id) = VarInt::decode(&mut &packet_data[..]) else {
+            return packet_data;
+        };
+        let version = self.version.load();
+        let modified = [
+            CTeleportEntity::to_id(version),
+            CUpdateEntityPos::to_id(version),
+            CUpdateEntityPosRot::to_id(version),
+        ]
+        .contains(&id.0);
+        if !modified {
+            return packet_data;
+        }
+        let mut tailed = Vec::with_capacity(packet_data.len() + 1);
+        tailed.extend_from_slice(&packet_data);
+        tailed.push(u8::from(crate::world::sublevel::sending_parked_entity()));
+        Bytes::from(tailed)
     }
 
     /// `PacketSentEvent` for clients the multiversion plugin admitted below
@@ -632,6 +667,14 @@ impl JavaClient {
 
     pub fn serialize_packet<P: ClientPacket>(&self, packet: &P) -> Result<Bytes, WritingError> {
         Self::serialize_packet_for_version(packet, CURRENT_MC_VERSION)
+    }
+
+    /// Whether a `NeoForge` client announced a PLAY channel during negotiation,
+    /// e.g. one of Sable's sub-level channels.
+    #[must_use]
+    pub fn has_mod_channel(&self, channel: &str) -> bool {
+        let channels = self.neoforge_channels.load();
+        Option::as_ref(&*channels).is_some_and(|list| list.has_play_channel(channel))
     }
 
     pub fn try_send_packet<P: ClientPacket>(&self, packet: &P) {
