@@ -1,6 +1,6 @@
 use pumpkin_protocol::java::client::play::{
     CChunkBatchEnd, CChunkBatchStart, CPlayDisconnect, CTeleportEntity, CUpdateEntityPos,
-    CUpdateEntityPosRot,
+    CUpdateEntityPosRot, CUpdateMobEffect,
 };
 use pumpkin_world::level::SyncChunk;
 use std::net::SocketAddr;
@@ -409,7 +409,7 @@ impl JavaClient {
             return None;
         }
         let packet_data = self.translate_outgoing(packet_data)?;
-        let packet_data = self.sable_entity_packet_tail(packet_data);
+        let packet_data = self.neoforge_packet_tail(packet_data);
 
         // Reserve first, release again if it does not fit.
         let packet_len = packet_data.len();
@@ -431,30 +431,44 @@ impl JavaClient {
         Some((packet_data, packet_len))
     }
 
-    /// Sable appends one boolean to three vanilla entity position packets,
-    /// saying whether the coordinates are plot coordinates of a sub-level. Its
-    /// clients refuse the vanilla layout, so they get the extra byte; everyone
-    /// else is left alone.
-    fn sable_entity_packet_tail(&self, packet_data: Bytes) -> Bytes {
-        if !self.has_mod_channel(crate::world::sublevel::sable::DETECT_CHANNEL) {
-            return packet_data;
-        }
+    /// Whether the client completed `NeoForge` network negotiation, which
+    /// switches a few vanilla codecs to modded layouts on its side.
+    #[must_use]
+    pub fn is_neoforge(&self) -> bool {
+        self.neoforge_channels.load().is_some()
+    }
+
+    /// Modded clients read a few vanilla packets with extra trailing fields.
+    /// `Sable` appends one boolean to three entity position packets, saying
+    /// whether the coordinates are plot coordinates of a sub-level; `NeoForge`
+    /// itself appends an optional cure list to every mob effect. Clients that
+    /// expect them get the extra bytes, everyone else is left alone.
+    fn neoforge_packet_tail(&self, packet_data: Bytes) -> Bytes {
         let Ok(id) = VarInt::decode(&mut &packet_data[..]) else {
             return packet_data;
         };
         let version = self.version.load();
-        let modified = [
-            CTeleportEntity::to_id(version),
-            CUpdateEntityPos::to_id(version),
-            CUpdateEntityPosRot::to_id(version),
-        ]
-        .contains(&id.0);
-        if !modified {
+        let tail = if self.has_mod_channel(crate::world::sublevel::sable::DETECT_CHANNEL)
+            && [
+                CTeleportEntity::to_id(version),
+                CUpdateEntityPos::to_id(version),
+                CUpdateEntityPosRot::to_id(version),
+            ]
+            .contains(&id.0)
+        {
+            Some(u8::from(crate::world::sublevel::sending_parked_entity()))
+        } else if self.is_neoforge() && id.0 == CUpdateMobEffect::to_id(version) {
+            // No custom effect cures.
+            Some(0)
+        } else {
+            None
+        };
+        let Some(tail) = tail else {
             return packet_data;
-        }
+        };
         let mut tailed = Vec::with_capacity(packet_data.len() + 1);
         tailed.extend_from_slice(&packet_data);
-        tailed.push(u8::from(crate::world::sublevel::sending_parked_entity()));
+        tailed.push(tail);
         Bytes::from(tailed)
     }
 

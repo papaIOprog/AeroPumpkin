@@ -91,7 +91,10 @@ impl NeoforgeChannels {
                 .filter(|(entry, _, _)| *entry == protocol)
                 .collect();
             out.write_var_int(&VarInt(i32::try_from(members.len()).unwrap_or(i32::MAX)))?;
+            // Each map entry is keyed by the channel and then carries a
+            // NetworkChannel, which repeats the id before its version.
             for (_, id, version) in members {
+                out.write_string(id)?;
                 out.write_string(id)?;
                 out.write_string(version)?;
             }
@@ -187,28 +190,32 @@ mod tests {
         );
     }
 
+    /// `writeUtf` for short ASCII: a one-byte `VarInt` length, then the bytes.
+    fn utf8(text: &str) -> Vec<u8> {
+        let mut bytes = vec![u8::try_from(text.len()).unwrap()];
+        bytes.extend_from_slice(text.as_bytes());
+        bytes
+    }
+
     #[test]
-    fn setup_echoes_every_channel_grouped_by_protocol() {
+    fn setup_matches_neoforges_modded_network_payload_layout() {
         let channels = NeoforgeChannels::parse_query(&sample_query()).unwrap();
         let setup = channels.encode_setup().unwrap();
 
-        let mut buf: &[u8] = &setup;
-        assert_eq!(read_var_int(&mut buf).unwrap(), 2);
-        assert_eq!(read_var_int(&mut buf).unwrap(), 1);
-        assert_eq!(read_var_int(&mut buf).unwrap(), 1);
-        assert_eq!(
-            buf.get_str_bounded_borrowed(32767).unwrap(),
-            "sable:snapshot_packet"
-        );
-        assert_eq!(buf.get_str_bounded_borrowed(32767).unwrap(), "1");
-        assert_eq!(read_var_int(&mut buf).unwrap(), 4);
-        assert_eq!(read_var_int(&mut buf).unwrap(), 1);
-        assert_eq!(
-            buf.get_str_bounded_borrowed(32767).unwrap(),
-            "example:config"
-        );
-        assert_eq!(buf.get_str_bounded_borrowed(32767).unwrap(), "2");
-        assert!(buf.is_empty());
+        // Two protocol groups; each channel is a map entry keyed by its id,
+        // followed by a NetworkChannel that repeats the id and adds a version.
+        let mut expected = vec![2];
+        expected.push(1); // PLAY
+        expected.push(1);
+        expected.extend(utf8("sable:snapshot_packet"));
+        expected.extend(utf8("sable:snapshot_packet"));
+        expected.extend(utf8("1"));
+        expected.push(4); // CONFIGURATION
+        expected.push(1);
+        expected.extend(utf8("example:config"));
+        expected.extend(utf8("example:config"));
+        expected.extend(utf8("2"));
+        assert_eq!(setup, expected);
     }
 
     #[test]
