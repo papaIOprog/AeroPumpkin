@@ -64,21 +64,12 @@ impl ClientPacket for CUpdateMobEffect {
             write.write_var_int(&self.duration)?;
         }
 
-        if *version >= JavaMinecraftVersion::V_1_20_5 {
-            // MobEffectInstance.Details: three booleans, then an optional
-            // hidden effect.
-            write.write_bool(self.flags & 0x01 != 0)?;
-            write.write_bool(self.flags & 0x02 != 0)?;
-            write.write_bool(self.flags & 0x04 != 0)?;
-            write.write_bool(false)?;
-        } else {
-            if *version > JavaMinecraftVersion::V_1_7_6 {
-                write.write_i8(self.flags)?;
-            }
+        if *version > JavaMinecraftVersion::V_1_7_6 {
+            write.write_i8(self.flags)?;
+        }
 
-            if *version >= JavaMinecraftVersion::V_1_19 {
-                write.write_bool(false)?;
-            }
+        if *version >= JavaMinecraftVersion::V_1_19 && *version < JavaMinecraftVersion::V_1_20_5 {
+            write.write_bool(false)?;
         }
 
         Ok(())
@@ -89,15 +80,15 @@ impl ClientPacket for CUpdateMobEffect {
 mod tests {
     use super::*;
 
-    /// Vanilla 1.21.1 writes the effect details as amplifier, duration, three
-    /// booleans and an optional hidden effect.
+    /// The 1.21.1 packet carries a packed flags byte; the optional
+    /// MobEffectInstance.Details tail belongs to NBT, not this packet.
     #[test]
-    fn details_layout_for_1_21_1() {
+    fn packed_flags_layout_for_1_21_1() {
         let packet = CUpdateMobEffect::new(VarInt(1), VarInt(1), VarInt(0), VarInt(100), 0b011);
         let mut bytes = Vec::new();
         packet
             .write_packet_data(&mut bytes, &JavaMinecraftVersion::V_1_21)
             .unwrap();
-        assert_eq!(bytes, [1, 1, 0, 100, 1, 1, 0, 0]);
+        assert_eq!(bytes, [1, 1, 0, 100, 0b011]);
     }
 }
