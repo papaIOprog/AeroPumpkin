@@ -149,6 +149,71 @@ impl CommandExecutor for RiderExecutor {
     }
 }
 
+struct AssembleExecutor;
+
+impl CommandExecutor for AssembleExecutor {
+    fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
+        let x1 = IntegerArgumentType::get(context, "x1")?;
+        let y1 = IntegerArgumentType::get(context, "y1")?;
+        let z1 = IntegerArgumentType::get(context, "z1")?;
+        let x2 = IntegerArgumentType::get(context, "x2")?;
+        let y2 = IntegerArgumentType::get(context, "y2")?;
+        let z2 = IntegerArgumentType::get(context, "z2")?;
+        let Some(world) = world_of(context) else {
+            context
+                .source
+                .send_error(TextComponent::text("No worlds are loaded"));
+            return Ok(0);
+        };
+
+        match world.assemble_sublevel(Vector3::new(x1, y1, z1), Vector3::new(x2, y2, z2)) {
+            Ok(id) => {
+                context.source.send_feedback(
+                    green(format!(
+                        "Assembling sub-level {id} from ({x1}, {y1}, {z1})..({x2}, {y2}, {z2}); its plot chunks are generating"
+                    )),
+                    true,
+                );
+                Ok(1)
+            }
+            Err(error) => {
+                context.source.send_error(TextComponent::text(error));
+                Ok(0)
+            }
+        }
+    }
+}
+
+struct DisassembleExecutor;
+
+impl CommandExecutor for DisassembleExecutor {
+    fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
+        let id = u32::try_from(IntegerArgumentType::get(context, "id")?).unwrap_or(0);
+        let Some(world) = world_of(context) else {
+            context
+                .source
+                .send_error(TextComponent::text("No worlds are loaded"));
+            return Ok(0);
+        };
+
+        match world.disassemble_sublevel(id) {
+            Ok(id) => {
+                context.source.send_feedback(
+                    green(format!(
+                        "Sub-level {id} is melting back into the world where it stands"
+                    )),
+                    true,
+                );
+                Ok(1)
+            }
+            Err(error) => {
+                context.source.send_error(TextComponent::text(error));
+                Ok(0)
+            }
+        }
+    }
+}
+
 struct RemoveExecutor;
 
 impl CommandExecutor for RemoveExecutor {
@@ -230,6 +295,8 @@ pub fn register(dispatcher: &mut CommandDispatcher, registry: &PermissionRegistr
     ));
 
     let id_argument = || argument("id", IntegerArgumentType::new(1, 100_000));
+    let coordinate =
+        |name: &'static str| argument(name, IntegerArgumentType::new(-30_000_000, 30_000_000));
 
     let builder = command("sublevel", DESCRIPTION)
         .requires(PERMISSION)
@@ -241,6 +308,18 @@ pub fn register(dispatcher: &mut CommandDispatcher, registry: &PermissionRegistr
                         .executes(SpawnExecutor { has_width: true }),
                 ),
         )
+        .then(literal("assemble").then(
+            coordinate("x1").then(
+                coordinate("y1").then(
+                    coordinate("z1").then(
+                        coordinate("x2").then(
+                            coordinate("y2").then(coordinate("z2").executes(AssembleExecutor)),
+                        ),
+                    ),
+                ),
+            ),
+        ))
+        .then(literal("disassemble").then(id_argument().executes(DisassembleExecutor)))
         .then(literal("impulse").then(id_argument().then(
             argument("x", IntegerArgumentType::new(-100, 100)).then(
                 argument("y", IntegerArgumentType::new(-100, 100)).then(

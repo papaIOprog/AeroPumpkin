@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::{BufMut, Bytes};
+use pumpkin_nbt::compound::NbtCompound;
 use pumpkin_protocol::codec::var_int::VarInt;
 use pumpkin_protocol::java::client::play::{CBundleDelimiter, CCustomPayload};
 use pumpkin_protocol::ser::NetworkWriteExt;
@@ -31,6 +32,8 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::World;
+use super::block_entity_from_nbt;
+use crate::block::entities::BlockEntity;
 use crate::entity::EntityBase;
 use crate::entity::player::Player;
 use crate::net::java::JavaClient;
@@ -49,6 +52,10 @@ pub const PLOT_LOG_SIZE: i32 = 7;
 pub const PLOTYARD_ORIGIN: i32 = 10_000;
 /// Sub-levels are networked to players within this many blocks, Sable's default.
 pub const TRACKING_RANGE: f64 = 320.0;
+/// Assembled regions stay narrow enough to sit around one plot centre and
+/// small enough to copy in one pass.
+const MAX_ASSEMBLE_SPAN: i32 = 128;
+const MAX_ASSEMBLE_VOLUME: i64 = 65_536;
 /// The pose origin sits at this y in plot space: (min + max build height) / 2.
 pub const PLOT_ORIGIN_Y: i32 = 128;
 /// How long a plot chunk may take to generate before the sub-level stays
@@ -72,12 +79,14 @@ struct SubLevel {
     uuid: Uuid,
     /// Index within the plotyard, in plots.
     plot: Vector2<i32>,
-    /// The parked chunk holding the content.
+    /// The parked chunk at the plot centre; riders spawn on it.
     chunk: Vector2<i32>,
+    /// Every parked chunk holding content, for the full sync.
+    chunks: Vec<Vector2<i32>>,
     /// Plot-local block bounds of the content, inclusive.
     bounds: [i32; 6],
     half_extents: [f32; 3],
-    /// Set once the parked chunk holds the content and can be sent.
+    /// Set once the parked chunks hold the content and can be sent.
     ready: bool,
     last_pose: sable::Pose,
     networked_pose: sable::Pose,
@@ -187,6 +196,7 @@ impl SubLevelManager {
             uuid: Uuid::new_v4(),
             plot,
             chunk: center,
+            chunks: vec![center],
             bounds: [-half_x, -height, -half_x, half_x - 1, -1, half_x - 1],
             half_extents,
             ready: false,
@@ -196,6 +206,48 @@ impl SubLevelManager {
             tracking: FxHashSet::default(),
         });
         (id, center)
+    }
+
+    /// Allocates a plot for content copied out of a world region.
+    /// `bounds` are the region's block extents relative to the plot centre,
+    /// the anchor the caller's pose sits on, so the copy renders exactly
+    /// where the region was. Returns the new id; the parked chunks are
+    /// filled by [`World::assemble_sublevel`].
+    pub fn assemble(&mut self, pose: Vector3<f64>, bounds: [i32; 6]) -> u32 {
+        let plot = self.first_free_plot();
+        let corner = Vector2::new(
+            (PLOTYARD_ORIGIN + plot.x) << PLOT_LOG_SIZE,
+            (PLOTYARD_ORIGIN + plot.y) << PLOT_LOG_SIZE,
+        );
+        let center = Vector2::new(
+            corner.x + (1 << (PLOT_LOG_SIZE - 1)),
+            corner.y + (1 << (PLOT_LOG_SIZE - 1)),
+        );
+
+        let half_extents = [
+            (bounds[3] - bounds[0] + 1) as f32 / 2.0,
+            (bounds[4] - bounds[1] + 1) as f32 / 2.0,
+            (bounds[5] - bounds[2] + 1) as f32 / 2.0,
+        ];
+        let pose_f32 = pose.to_f32_lossy();
+        let id = self
+            .physics
+            .spawn([pose_f32.x, pose_f32.y, pose_f32.z], half_extents);
+        self.levels.push(SubLevel {
+            id,
+            uuid: Uuid::new_v4(),
+            plot,
+            chunk: center,
+            chunks: content_chunks(plot_center_block(center), &bounds),
+            bounds,
+            half_extents,
+            ready: false,
+            last_pose: sable::Pose::default(),
+            networked_pose: sable::Pose::default(),
+            stop_sent: false,
+            tracking: FxHashSet::default(),
+        });
+        id
     }
 
     fn first_free_plot(&self) -> Vector2<i32> {
@@ -245,14 +297,41 @@ impl SubLevelManager {
             .map(|level| level.chunk)
     }
 
+    /// Every parked chunk of sub-level `id` that holds content.
+    #[must_use]
+    pub fn chunks_of(&self, id: u32) -> Option<Vec<Vector2<i32>>> {
+        self.levels
+            .iter()
+            .find(|level| level.id == id)
+            .map(|level| level.chunks.clone())
+    }
+
     /// The plot-local block bounds of sub-level `id`.
-    #[cfg(test)]
     #[must_use]
     pub fn bounds_of(&self, id: u32) -> Option<[i32; 6]> {
         self.levels
             .iter()
             .find(|level| level.id == id)
             .map(|level| level.bounds)
+    }
+
+    /// The body pose of sub-level `id`, for mapping content back to the world.
+    #[must_use]
+    pub fn pose_of(&self, id: u32) -> Option<sable::Pose> {
+        let level = self.levels.iter().find(|level| level.id == id)?;
+        self.physics
+            .snapshots()
+            .into_iter()
+            .find(|body| body.id == level.id)
+            .map(|body| sable::Pose {
+                position: [
+                    f64::from(body.position[0]),
+                    f64::from(body.position[1]),
+                    f64::from(body.position[2]),
+                ],
+                orientation: body.rotation,
+                rotation_point: [0.0; 3],
+            })
     }
 
     /// Whether `chunk` lies inside the plotyard, where sub-levels park their
@@ -544,6 +623,26 @@ fn find_player(players: &[Arc<Player>], uuid: Uuid) -> Option<&Arc<Player>> {
     players.iter().find(|player| player.gameprofile.id == uuid)
 }
 
+/// The plot block the pose maps to: the centre chunk's middle block at the
+/// plot origin height. Sable renders every content block relative to it.
+const fn plot_center_block(center_chunk: Vector2<i32>) -> Vector3<i32> {
+    Vector3::new(
+        center_chunk.x * 16 + 8,
+        PLOT_ORIGIN_Y,
+        center_chunk.y * 16 + 8,
+    )
+}
+
+/// Every chunk the content of a sub-level with these bounds occupies, as in
+/// Sable's full sync: one chunk packet per parked chunk.
+fn content_chunks(center: Vector3<i32>, bounds: &[i32; 6]) -> Vec<Vector2<i32>> {
+    let x_chunks = (center.x + bounds[0]).div_euclid(16)..=(center.x + bounds[3]).div_euclid(16);
+    let z_chunks = (center.z + bounds[2]).div_euclid(16)..=(center.z + bounds[5]).div_euclid(16);
+    x_chunks
+        .flat_map(|x| z_chunks.clone().map(move |z| Vector2::new(x, z)))
+        .collect()
+}
+
 fn is_sable_client(player: &Player) -> bool {
     player
         .client
@@ -594,7 +693,8 @@ fn send_payload(player: &Player, channel: &str, data: &[u8]) {
     java.try_enqueue_packet(encode_payload(player, channel, data));
 }
 
-/// Sable's full sync: start tracking, the content chunk, finalize, in a bundle.
+/// Sable's full sync: start tracking, one chunk packet per content chunk,
+/// finalize, in a bundle.
 fn send_full_sync(
     world: &World,
     player: &Player,
@@ -602,49 +702,47 @@ fn send_full_sync(
     body: &BodySnapshot,
     tick: i32,
 ) {
-    let Some(chunk) = world.level.read_chunk_sync(&level.chunk, Arc::clone) else {
-        debug!("sublevel: plot chunk of {} is not readable yet", level.id);
-        return;
-    };
     let version = player.client.java_version();
-    let mut chunk_buf = Vec::with_capacity(32 * 1024);
-    let chunk_packet = chunk_buf
-        .write_var_int(&VarInt(CChunkData::to_id(version)))
-        .and_then(|()| CChunkData(&chunk).write_packet_data(&mut chunk_buf, &version))
-        .map(|()| Bytes::from(chunk_buf));
-    let chunk_packet = match chunk_packet {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            warn!(
-                "sublevel: could not encode the plot chunk of {}: {error}",
-                level.id
-            );
-            return;
-        }
-    };
-    send_bundle(
+    let mut members = Vec::with_capacity(level.chunks.len() + 2);
+    members.push(encode_payload(
         player,
-        &[
-            encode_payload(
-                player,
-                sable::START_TRACKING,
-                &encode(sable::encode_start_tracking(
-                    level.plot_long(),
-                    level.uuid,
-                    &level.last_pose,
-                    &pose_from_body(body),
-                    level.bounds,
-                    tick,
-                )),
-            ),
-            chunk_packet,
-            encode_payload(
-                player,
-                sable::FINALIZE,
-                &encode(sable::encode_plot_ref(level.plot_long())),
-            ),
-        ],
-    );
+        sable::START_TRACKING,
+        &encode(sable::encode_start_tracking(
+            level.plot_long(),
+            level.uuid,
+            &level.last_pose,
+            &pose_from_body(body),
+            level.bounds,
+            tick,
+        )),
+    ));
+    for chunk in &level.chunks {
+        let Some(chunk) = world.level.read_chunk_sync(chunk, Arc::clone) else {
+            debug!("sublevel: plot chunk of {} is not readable yet", level.id);
+            return;
+        };
+        let mut chunk_buf = Vec::with_capacity(32 * 1024);
+        let chunk_packet = chunk_buf
+            .write_var_int(&VarInt(CChunkData::to_id(version)))
+            .and_then(|()| CChunkData(&chunk).write_packet_data(&mut chunk_buf, &version))
+            .map(|()| Bytes::from(chunk_buf));
+        match chunk_packet {
+            Ok(bytes) => members.push(bytes),
+            Err(error) => {
+                warn!(
+                    "sublevel: could not encode the plot chunk of {}: {error}",
+                    level.id
+                );
+                return;
+            }
+        }
+    }
+    members.push(encode_payload(
+        player,
+        sable::FINALIZE,
+        &encode(sable::encode_plot_ref(level.plot_long())),
+    ));
+    send_bundle(player, &members);
 }
 
 fn pose_from_body(body: &BodySnapshot) -> sable::Pose {
@@ -723,19 +821,8 @@ impl World {
         let Some(chunk) = self.lock_sublevels().chunk_of(id) else {
             return;
         };
-        let level = &self.level;
-        ticket_plot_chunk(level, chunk);
-
-        let deadline = Instant::now() + PLOT_CHUNK_TIMEOUT;
-        while level.read_chunk_sync(&chunk, |_| ()).is_none() {
-            if Instant::now() >= deadline {
-                warn!(
-                    "sublevel {id}: plot chunk ({}, {}) did not generate",
-                    chunk.x, chunk.y
-                );
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
+        if !self.await_plot_chunks(&[chunk]).await {
+            return;
         }
 
         let platform_y = PLOT_ORIGIN_Y - 1;
@@ -801,6 +888,348 @@ impl World {
         Some(pos)
     }
 
+    /// Freezes a world region into a new sub-level: the blocks, block
+    /// entities and entities are copied into a fresh plot, the region is
+    /// cleared, and a physics body carries the copy from where the region
+    /// was. `min`/`max` are inclusive block corners. Returns the sub-level id.
+    pub fn assemble_sublevel(
+        self: &Arc<Self>,
+        min: Vector3<i32>,
+        max: Vector3<i32>,
+    ) -> Result<u32, String> {
+        let min = Vector3::new(min.x.min(max.x), min.y.min(max.y), min.z.min(max.z));
+        let max = Vector3::new(max.x.max(min.x), max.y.max(min.y), max.z.max(min.z));
+        let size = max - min + Vector3::new(1, 1, 1);
+        if size.x > MAX_ASSEMBLE_SPAN
+            || size.z > MAX_ASSEMBLE_SPAN
+            || i64::from(size.x) * i64::from(size.y) * i64::from(size.z) > MAX_ASSEMBLE_VOLUME
+        {
+            return Err(format!(
+                "region is {}x{}x{} blocks; assembly stays within \
+                 {MAX_ASSEMBLE_SPAN}x{MAX_ASSEMBLE_SPAN} wide and \
+                 {MAX_ASSEMBLE_VOLUME} blocks",
+                size.x, size.y, size.z
+            ));
+        }
+        if !self.is_in_build_limit(BlockPos(min)) || !self.is_in_build_limit(BlockPos(max)) {
+            return Err("region reaches outside the build limit".to_string());
+        }
+
+        // The anchor is the block the pose maps onto, so the copy renders
+        // exactly where the region was.
+        let anchor = min
+            + Vector3::new(
+                (max.x - min.x) / 2,
+                (max.y - min.y) / 2,
+                (max.z - min.z) / 2,
+            );
+        let bounds = [
+            min.x - anchor.x,
+            min.y - anchor.y,
+            min.z - anchor.z,
+            max.x - anchor.x,
+            max.y - anchor.y,
+            max.z - anchor.z,
+        ];
+        let pose = Vector3::new(
+            f64::from(anchor.x),
+            f64::from(anchor.y),
+            f64::from(anchor.z),
+        );
+        let id = self.lock_sublevels().assemble(pose, bounds);
+        let world = Arc::clone(self);
+        tokio::spawn(async move { world.copy_region_into_plot(id, min, max).await });
+        Ok(id)
+    }
+
+    /// Copies a region into a sub-level's parked chunks, parks its entities,
+    /// clears the original, then networks the sub-level.
+    async fn copy_region_into_plot(self: Arc<Self>, id: u32, min: Vector3<i32>, max: Vector3<i32>) {
+        let (chunks, anchor, center_chunk) = {
+            let manager = self.lock_sublevels();
+            let Some(chunks) = manager.chunks_of(id) else {
+                return;
+            };
+            let Some(bounds) = manager.bounds_of(id) else {
+                return;
+            };
+            let Some(center_chunk) = manager.chunk_of(id) else {
+                return;
+            };
+            let anchor = Vector3::new(min.x - bounds[0], min.y - bounds[1], min.z - bounds[2]);
+            (chunks, anchor, center_chunk)
+        };
+        if !self.await_plot_chunks(&chunks).await {
+            return;
+        }
+
+        // A plot chunk generates like any other chunk; empty it so the
+        // sub-level carries nothing but the region.
+        for chunk in &chunks {
+            self.clear_parked_chunk(*chunk);
+        }
+        let center = plot_center_block(center_chunk);
+        let copy_flags = BlockFlags::SKIP_BLOCK_ADDED_CALLBACK | BlockFlags::UPDATE_KNOWN_SHAPE;
+        for x in min.x..=max.x {
+            for y in min.y..=max.y {
+                for z in min.z..=max.z {
+                    let pos = BlockPos(Vector3::new(x, y, z));
+                    let state = self.get_block_state_id(&pos);
+                    if state == Block::AIR.default_state.id {
+                        continue;
+                    }
+                    let parked = center + pos.0 - anchor;
+                    self.set_block_state(&BlockPos(parked), state, copy_flags);
+                    if let Some(block_entity) = self.get_block_entity(&pos) {
+                        self.restore_block_entity_at(&block_entity, BlockPos(parked));
+                    }
+                }
+            }
+        }
+
+        self.park_entities_in_region(min, max, anchor, center);
+        let clear_flags = BlockFlags::NOTIFY_ALL
+            | BlockFlags::SKIP_DROPS
+            | BlockFlags::FORCE_STATE
+            | BlockFlags::SKIP_BLOCK_ENTITY_REPLACED_CALLBACK;
+        for x in min.x..=max.x {
+            for y in min.y..=max.y {
+                for z in min.z..=max.z {
+                    let pos = BlockPos(Vector3::new(x, y, z));
+                    if self.get_block_state_id(&pos) != Block::AIR.default_state.id {
+                        self.set_block_state(&pos, Block::AIR.default_state.id, clear_flags);
+                    }
+                }
+            }
+        }
+
+        self.lock_sublevels().mark_ready(id);
+        info!(
+            "sublevel {id} assembled from region ({}, {}, {})..({}, {}, {})",
+            min.x, min.y, min.z, max.x, max.y, max.z
+        );
+    }
+
+    /// Restores a block entity at a new position: the copied NBT keeps its
+    /// contents, only the coordinates change.
+    fn restore_block_entity_at(&self, block_entity: &Arc<dyn BlockEntity>, position: BlockPos) {
+        let mut nbt = NbtCompound::new();
+        block_entity.write_internal(&mut nbt);
+        nbt.put_int("x", position.0.x);
+        nbt.put_int("y", position.0.y);
+        nbt.put_int("z", position.0.z);
+        if let Some(restored) = block_entity_from_nbt(&nbt) {
+            self.add_block_entity(restored);
+            self.add_block_entity_nbt(position, &nbt);
+        }
+    }
+
+    /// Moves every entity standing in the region to its parked position.
+    /// Players stay: their position is client authoritative.
+    fn park_entities_in_region(
+        &self,
+        min: Vector3<i32>,
+        max: Vector3<i32>,
+        anchor: Vector3<i32>,
+        center: Vector3<i32>,
+    ) {
+        let center_f64 = Vector3::new(
+            f64::from(center.x),
+            f64::from(center.y),
+            f64::from(center.z),
+        );
+        let anchor_f64 = Vector3::new(
+            f64::from(anchor.x),
+            f64::from(anchor.y),
+            f64::from(anchor.z),
+        );
+        for entity in self.entities.load().iter() {
+            let entity = entity.get_entity();
+            if entity.entity_type == &EntityType::PLAYER {
+                continue;
+            }
+            let pos = entity.pos.load();
+            let block = pos.floor_to_i32();
+            if block.x < min.x
+                || block.x > max.x
+                || block.y < min.y
+                || block.y > max.y
+                || block.z < min.z
+                || block.z > max.z
+            {
+                continue;
+            }
+            entity.set_pos(center_f64 + pos - anchor_f64);
+        }
+    }
+
+    /// Tickets every content chunk and waits for it to generate.
+    async fn await_plot_chunks(&self, chunks: &[Vector2<i32>]) -> bool {
+        for chunk in chunks {
+            ticket_plot_chunk(&self.level, *chunk);
+        }
+        let deadline = Instant::now() + PLOT_CHUNK_TIMEOUT;
+        for chunk in chunks {
+            while self.level.read_chunk_sync(chunk, |_| ()).is_none() {
+                if Instant::now() >= deadline {
+                    warn!(
+                        "sublevel: plot chunk ({}, {}) did not generate",
+                        chunk.x, chunk.y
+                    );
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+        true
+    }
+
+    /// Writes air over an entire freshly generated plot chunk.
+    fn clear_parked_chunk(self: &Arc<Self>, chunk: Vector2<i32>) {
+        let flags = BlockFlags::SKIP_BLOCK_ADDED_CALLBACK | BlockFlags::UPDATE_KNOWN_SHAPE;
+        for x in 0..16 {
+            for y in self.get_bottom_y()..=self.get_top_y() {
+                for z in 0..16 {
+                    let pos = BlockPos(Vector3::new(chunk.x * 16 + x, y, chunk.y * 16 + z));
+                    if self.get_block_state_id(&pos) != Block::AIR.default_state.id {
+                        self.set_block_state(&pos, Block::AIR.default_state.id, flags);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Melt a sub-level back into the world at its current position: the
+    /// parked blocks, block entities and entities return as real ones and
+    /// the sub-level is removed. Only an unrotated sub-level can return.
+    pub fn disassemble_sublevel(self: &Arc<Self>, id: u32) -> Result<u32, String> {
+        let manager = self.lock_sublevels();
+        let Some(bounds) = manager.bounds_of(id) else {
+            return Err(format!("No sub-level {id}"));
+        };
+        let Some(pose) = manager.pose_of(id) else {
+            return Err(format!("No sub-level {id}"));
+        };
+        let Some(chunks) = manager.chunks_of(id) else {
+            return Err(format!("No sub-level {id}"));
+        };
+        drop(manager);
+        // Blocks cannot be written back rotated; wait for the sub-level to
+        // come level again.
+        let [qx, qy, qz, qw] = pose.orientation;
+        if qx.abs() > 0.001 || qy.abs() > 0.001 || qz.abs() > 0.001 || (qw - 1.0).abs() > 0.001 {
+            return Err("sub-level is rotated; bring it level first".to_string());
+        }
+        let origin = Vector3::new(
+            pose.position[0].floor() as i32,
+            pose.position[1].floor() as i32,
+            pose.position[2].floor() as i32,
+        );
+        let min = origin + Vector3::new(bounds[0], bounds[1], bounds[2]);
+        let max = origin + Vector3::new(bounds[3], bounds[4], bounds[5]);
+        if !self.is_in_build_limit(BlockPos(min)) || !self.is_in_build_limit(BlockPos(max)) {
+            return Err("sub-level has drifted outside the build limit".to_string());
+        }
+
+        let world = Arc::clone(self);
+        tokio::spawn(async move { world.copy_plot_into_region(id, chunks, min, max).await });
+        Ok(id)
+    }
+
+    /// The second half of [`World::disassemble_sublevel`], after the checks.
+    async fn copy_plot_into_region(
+        self: Arc<Self>,
+        id: u32,
+        chunks: Vec<Vector2<i32>>,
+        min: Vector3<i32>,
+        max: Vector3<i32>,
+    ) {
+        if !self.await_plot_chunks(&chunks).await {
+            return;
+        }
+        let (bounds, center, pose_vec) = {
+            let manager = self.lock_sublevels();
+            let Some(bounds) = manager.bounds_of(id) else {
+                return;
+            };
+            let Some(center_chunk) = manager.chunk_of(id) else {
+                return;
+            };
+            let Some(pose) = manager.pose_of(id) else {
+                return;
+            };
+            let pose_vec = Vector3::new(pose.position[0], pose.position[1], pose.position[2]);
+            (bounds, plot_center_block(center_chunk), pose_vec)
+        };
+
+        let flags = BlockFlags::NOTIFY_ALL | BlockFlags::SKIP_DROPS;
+        for bx in bounds[0]..=bounds[3] {
+            for by in bounds[1]..=bounds[4] {
+                for bz in bounds[2]..=bounds[5] {
+                    let parked = BlockPos(center + Vector3::new(bx, by, bz));
+                    let state = self.get_block_state_id(&parked);
+                    if state == Block::AIR.default_state.id {
+                        continue;
+                    }
+                    let world_pos = BlockPos(Vector3::new(
+                        pose_vec.x.floor() as i32 + bx,
+                        pose_vec.y.floor() as i32 + by,
+                        pose_vec.z.floor() as i32 + bz,
+                    ));
+                    self.set_block_state(&world_pos, state, flags);
+                    if let Some(block_entity) = self.get_block_entity(&parked) {
+                        self.restore_block_entity_at(&block_entity, world_pos);
+                    }
+                }
+            }
+        }
+
+        // Entities keep fractional positions; move them by the same offset
+        // the blocks took.
+        let center_f64 = Vector3::new(
+            f64::from(center.x),
+            f64::from(center.y),
+            f64::from(center.z),
+        );
+        let parked_min = center + Vector3::new(bounds[0], bounds[1], bounds[2]);
+        let parked_max = center + Vector3::new(bounds[3], bounds[4], bounds[5]);
+        for entity in self.entities.load().iter() {
+            let entity = entity.get_entity();
+            let pos = entity.pos.load();
+            let block = pos.floor_to_i32();
+            if block.x < parked_min.x
+                || block.x > parked_max.x
+                || block.y < parked_min.y
+                || block.y > parked_max.y
+                || block.z < parked_min.z
+                || block.z > parked_max.z
+            {
+                continue;
+            }
+            entity.set_pos(pose_vec + pos - center_f64);
+        }
+
+        // Leave the plot empty for whoever reuses it.
+        for bx in bounds[0]..=bounds[3] {
+            for by in bounds[1]..=bounds[4] {
+                for bz in bounds[2]..=bounds[5] {
+                    let parked = BlockPos(center + Vector3::new(bx, by, bz));
+                    self.set_block_state(
+                        &parked,
+                        Block::AIR.default_state.id,
+                        BlockFlags::SKIP_BLOCK_ADDED_CALLBACK | BlockFlags::UPDATE_KNOWN_SHAPE,
+                    );
+                }
+            }
+        }
+        if self.remove_sublevel(id) {
+            info!(
+                "sublevel {id} disassembled into region ({}, {}, {})..({}, {}, {})",
+                min.x, min.y, min.z, max.x, max.y, max.z
+            );
+        }
+    }
+
     /// Whether `player` tracks the sub-level whose plot contains `chunk`.
     pub fn player_tracks_sublevel_chunk(&self, player: Uuid, chunk: Vector2<i32>) -> bool {
         self.lock_sublevels().player_tracks_chunk(player, chunk)
@@ -850,6 +1279,72 @@ mod tests {
             corner
         )));
         assert!(!SubLevelManager::is_plot_chunk(Vector2::new(0, 0)));
+    }
+
+    #[test]
+    fn assembled_content_covers_its_bounds_with_chunks() {
+        let center = Vector3::new(20481032, PLOT_ORIGIN_Y, 20481032);
+        // A 16x16x1 platform around the plot centre sits in one chunk.
+        assert_eq!(
+            content_chunks(center, &[-8, -1, -8, 7, -1, 7]),
+            vec![Vector2::new(1280064, 1280064)]
+        );
+        // A 33-block-wide region spans three chunks per axis, centred on the
+        // plot's middle chunk.
+        let chunks = content_chunks(center, &[-16, -1, -16, 16, -1, 16]);
+        assert_eq!(chunks.len(), 9);
+        // Bounds crossing a chunk border by one block cover both chunks.
+        let straddling = content_chunks(center, &[7, 0, 7, 8, 0, 8]);
+        assert!(straddling.contains(&Vector2::new(1280064, 1280064)));
+        assert!(straddling.contains(&Vector2::new(1280065, 1280065)));
+        assert!(chunks.contains(&Vector2::new(1280063, 1280063)));
+        assert!(chunks.contains(&Vector2::new(1280065, 1280065)));
+    }
+
+    #[test]
+    fn assembled_regions_render_where_they_stood() {
+        // assemble(): the anchor maps onto the plot centre, so a world block
+        // and its parked copy render at the same place.
+        let min = Vector3::new(-40, 70, -30);
+        let max = Vector3::new(-9, 75, -25);
+        let anchor = min
+            + Vector3::new(
+                (max.x - min.x) / 2,
+                (max.y - min.y) / 2,
+                (max.z - min.z) / 2,
+            );
+        let mut manager = SubLevelManager::new();
+        let pose = Vector3::new(
+            f64::from(anchor.x),
+            f64::from(anchor.y),
+            f64::from(anchor.z),
+        );
+        let id = manager.assemble(
+            pose,
+            [
+                min.x - anchor.x,
+                min.y - anchor.y,
+                min.z - anchor.z,
+                max.x - anchor.x,
+                max.y - anchor.y,
+                max.z - anchor.z,
+            ],
+        );
+
+        let bounds = manager.bounds_of(id).expect("assembled sub-level exists");
+        let center_chunk = manager.chunk_of(id).expect("plot centre exists");
+        let center = plot_center_block(center_chunk);
+        // Round trip every corner: world -> parked -> rendered == world.
+        for corner in [min, max, anchor] {
+            let parked = center + corner - anchor;
+            let rendered = Vector3::new(
+                pose.x + f64::from(parked.x - center.x),
+                pose.y + f64::from(parked.y - center.y),
+                pose.z + f64::from(parked.z - center.z),
+            );
+            assert_eq!(rendered, corner.to_f64());
+        }
+        assert_eq!(bounds, [-15, -2, -2, 16, 3, 3]);
     }
 
     #[test]
