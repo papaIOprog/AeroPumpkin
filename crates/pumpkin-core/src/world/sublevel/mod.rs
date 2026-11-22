@@ -187,17 +187,24 @@ impl SubLevelManager {
         let id = self
             .physics
             .spawn([pose_f32.x, pose_f32.y, pose_f32.z], half_extents);
-        // Block indices of the content in plot space: the box spans
-        // `[-half, +half)` on x and z, and its top face is the plot origin.
-        let half_x = half_extents[0].ceil() as i32;
-        let height = (2.0 * half_extents[1]).ceil() as i32;
+        // The platform always fills its chunk's middle 16x16 with its top
+        // face at the plot origin. Bounds are absolute parked-world block
+        // coordinates, tight to the content and inclusive, as in Sable: the
+        // client sizes its render sections and collision box from them.
         self.levels.push(SubLevel {
             id,
             uuid: Uuid::new_v4(),
             plot,
             chunk: center,
             chunks: vec![center],
-            bounds: [-half_x, -height, -half_x, half_x - 1, -1, half_x - 1],
+            bounds: [
+                center.x * 16,
+                PLOT_ORIGIN_Y - 1,
+                center.y * 16,
+                center.x * 16 + 15,
+                PLOT_ORIGIN_Y - 1,
+                center.y * 16 + 15,
+            ],
             half_extents,
             ready: false,
             last_pose: sable::Pose::default(),
@@ -209,10 +216,11 @@ impl SubLevelManager {
     }
 
     /// Allocates a plot for content copied out of a world region.
-    /// `bounds` are the region's block extents relative to the plot centre,
-    /// the anchor the caller's pose sits on, so the copy renders exactly
-    /// where the region was. Returns the new id; the parked chunks are
-    /// filled by [`World::assemble_sublevel`].
+    /// `bounds` are the region's block extents relative to the plot centre
+    /// block, the anchor the caller's pose sits on, so the copy renders
+    /// exactly where the region was. Returns the new id; the parked chunks
+    /// are filled by [`World::assemble_sublevel`], which tightens the bounds
+    /// to the copied content before the sub-level is networked.
     pub fn assemble(&mut self, pose: Vector3<f64>, bounds: [i32; 6]) -> u32 {
         let plot = self.first_free_plot();
         let corner = Vector2::new(
@@ -224,6 +232,7 @@ impl SubLevelManager {
             corner.y + (1 << (PLOT_LOG_SIZE - 1)),
         );
 
+        let parked = parked_bounds(plot_center_block(center), &bounds);
         let half_extents = [
             (bounds[3] - bounds[0] + 1) as f32 / 2.0,
             (bounds[4] - bounds[1] + 1) as f32 / 2.0,
@@ -238,8 +247,8 @@ impl SubLevelManager {
             uuid: Uuid::new_v4(),
             plot,
             chunk: center,
-            chunks: content_chunks(plot_center_block(center), &bounds),
-            bounds,
+            chunks: content_chunks(&parked),
+            bounds: parked,
             half_extents,
             ready: false,
             last_pose: sable::Pose::default(),
@@ -248,6 +257,17 @@ impl SubLevelManager {
             tracking: FxHashSet::default(),
         });
         id
+    }
+
+    /// Shrinks sub-level `id`'s bounds to the blocks actually parked in its
+    /// plot and re-derives its content chunks, as Sable's per-chunk tight
+    /// boxes do. Called once the copy finished, before the sub-level is
+    /// networked.
+    pub fn tighten_bounds(&mut self, id: u32, bounds: [i32; 6]) {
+        if let Some(level) = self.levels.iter_mut().find(|level| level.id == id) {
+            level.chunks = content_chunks(&bounds);
+            level.bounds = bounds;
+        }
     }
 
     fn first_free_plot(&self) -> Vector2<i32> {
@@ -633,11 +653,24 @@ const fn plot_center_block(center_chunk: Vector2<i32>) -> Vector3<i32> {
     )
 }
 
-/// Every chunk the content of a sub-level with these bounds occupies, as in
+/// The absolute parked-world bounds of content whose extents relative to the
+/// plot centre block are `bounds`.
+const fn parked_bounds(center: Vector3<i32>, bounds: &[i32; 6]) -> [i32; 6] {
+    [
+        center.x + bounds[0],
+        center.y + bounds[1],
+        center.z + bounds[2],
+        center.x + bounds[3],
+        center.y + bounds[4],
+        center.z + bounds[5],
+    ]
+}
+
+/// Every chunk the content with these absolute parked bounds occupies, as in
 /// Sable's full sync: one chunk packet per parked chunk.
-fn content_chunks(center: Vector3<i32>, bounds: &[i32; 6]) -> Vec<Vector2<i32>> {
-    let x_chunks = (center.x + bounds[0]).div_euclid(16)..=(center.x + bounds[3]).div_euclid(16);
-    let z_chunks = (center.z + bounds[2]).div_euclid(16)..=(center.z + bounds[5]).div_euclid(16);
+fn content_chunks(bounds: &[i32; 6]) -> Vec<Vector2<i32>> {
+    let x_chunks = bounds[0].div_euclid(16)..=bounds[3].div_euclid(16);
+    let z_chunks = bounds[2].div_euclid(16)..=bounds[5].div_euclid(16);
     x_chunks
         .flat_map(|x| z_chunks.clone().map(move |z| Vector2::new(x, z)))
         .collect()
@@ -956,7 +989,14 @@ impl World {
             let Some(center_chunk) = manager.chunk_of(id) else {
                 return;
             };
-            let anchor = Vector3::new(min.x - bounds[0], min.y - bounds[1], min.z - bounds[2]);
+            // The bounds are absolute parked coordinates; undo their offset
+            // from the plot centre to get the region's world anchor back.
+            let center = plot_center_block(center_chunk);
+            let anchor = Vector3::new(
+                min.x + center.x - bounds[0],
+                min.y + center.y - bounds[1],
+                min.z + center.z - bounds[2],
+            );
             (chunks, anchor, center_chunk)
         };
         if !self.await_plot_chunks(&chunks).await {
@@ -970,6 +1010,7 @@ impl World {
         }
         let center = plot_center_block(center_chunk);
         let copy_flags = BlockFlags::SKIP_BLOCK_ADDED_CALLBACK | BlockFlags::UPDATE_KNOWN_SHAPE;
+        let mut tight: Option<[i32; 6]> = None;
         for x in min.x..=max.x {
             for y in min.y..=max.y {
                 for z in min.z..=max.z {
@@ -979,7 +1020,24 @@ impl World {
                         continue;
                     }
                     let parked = center + pos.0 - anchor;
+                    if !self.is_in_build_limit(BlockPos(parked)) {
+                        warn!("sublevel: parked copy of ({}, {}, {}) landed outside the build limit; region skipped", pos.0.x, pos.0.y, pos.0.z);
+                        return;
+                    }
                     self.set_block_state(&BlockPos(parked), state, copy_flags);
+                    tight = Some(tight.map_or(
+                        [parked.x, parked.y, parked.z, parked.x, parked.y, parked.z],
+                        |boxed| {
+                            [
+                                boxed[0].min(parked.x),
+                                boxed[1].min(parked.y),
+                                boxed[2].min(parked.z),
+                                boxed[3].max(parked.x),
+                                boxed[4].max(parked.y),
+                                boxed[5].max(parked.z),
+                            ]
+                        },
+                    ));
                     if let Some(block_entity) = self.get_block_entity(&pos) {
                         self.restore_block_entity_at(&block_entity, BlockPos(parked));
                     }
@@ -1003,7 +1061,14 @@ impl World {
             }
         }
 
-        self.lock_sublevels().mark_ready(id);
+        // Sable's bounds are tight to the content; empty margins of the
+        // region must not widen the client's render or collision box.
+        let mut manager = self.lock_sublevels();
+        if let Some(tight) = tight {
+            manager.tighten_bounds(id, tight);
+        }
+        manager.mark_ready(id);
+        drop(manager);
         info!(
             "sublevel {id} assembled from region ({}, {}, {})..({}, {}, {})",
             min.x, min.y, min.z, max.x, max.y, max.z
@@ -1113,6 +1178,9 @@ impl World {
         let Some(chunks) = manager.chunks_of(id) else {
             return Err(format!("No sub-level {id}"));
         };
+        let Some(center_chunk) = manager.chunk_of(id) else {
+            return Err(format!("No sub-level {id}"));
+        };
         drop(manager);
         // Blocks cannot be written back rotated; wait for the sub-level to
         // come level again.
@@ -1120,10 +1188,14 @@ impl World {
         if qx.abs() > 0.001 || qy.abs() > 0.001 || qz.abs() > 0.001 || (qw - 1.0).abs() > 0.001 {
             return Err("sub-level is rotated; bring it level first".to_string());
         }
+        // Rendered position = pose + (parked - plot centre block), so the
+        // world target of the bounds is the pose moved by their offset from
+        // the plot centre.
+        let center = plot_center_block(center_chunk);
         let origin = Vector3::new(
-            pose.position[0].floor() as i32,
-            pose.position[1].floor() as i32,
-            pose.position[2].floor() as i32,
+            pose.position[0].floor() as i32 - center.x,
+            pose.position[1].floor() as i32 - center.y,
+            pose.position[2].floor() as i32 - center.z,
         );
         let min = origin + Vector3::new(bounds[0], bounds[1], bounds[2]);
         let max = origin + Vector3::new(bounds[3], bounds[4], bounds[5]);
@@ -1162,20 +1234,23 @@ impl World {
             (bounds, plot_center_block(center_chunk), pose_vec)
         };
 
+        // The bounds are absolute parked coordinates; the world target is
+        // the pose moved by their offset from the plot centre block.
+        let origin = Vector3::new(
+            pose_vec.x.floor() as i32 - center.x,
+            pose_vec.y.floor() as i32 - center.y,
+            pose_vec.z.floor() as i32 - center.z,
+        );
         let flags = BlockFlags::NOTIFY_ALL | BlockFlags::SKIP_DROPS;
         for bx in bounds[0]..=bounds[3] {
             for by in bounds[1]..=bounds[4] {
                 for bz in bounds[2]..=bounds[5] {
-                    let parked = BlockPos(center + Vector3::new(bx, by, bz));
+                    let parked = BlockPos(Vector3::new(bx, by, bz));
                     let state = self.get_block_state_id(&parked);
                     if state == Block::AIR.default_state.id {
                         continue;
                     }
-                    let world_pos = BlockPos(Vector3::new(
-                        pose_vec.x.floor() as i32 + bx,
-                        pose_vec.y.floor() as i32 + by,
-                        pose_vec.z.floor() as i32 + bz,
-                    ));
+                    let world_pos = BlockPos(origin + parked.0);
                     self.set_block_state(&world_pos, state, flags);
                     if let Some(block_entity) = self.get_block_entity(&parked) {
                         self.restore_block_entity_at(&block_entity, world_pos);
@@ -1191,8 +1266,8 @@ impl World {
             f64::from(center.y),
             f64::from(center.z),
         );
-        let parked_min = center + Vector3::new(bounds[0], bounds[1], bounds[2]);
-        let parked_max = center + Vector3::new(bounds[3], bounds[4], bounds[5]);
+        let parked_min = Vector3::new(bounds[0], bounds[1], bounds[2]);
+        let parked_max = Vector3::new(bounds[3], bounds[4], bounds[5]);
         for entity in self.entities.load().iter() {
             let entity = entity.get_entity();
             let pos = entity.pos.load();
@@ -1213,7 +1288,7 @@ impl World {
         for bx in bounds[0]..=bounds[3] {
             for by in bounds[1]..=bounds[4] {
                 for bz in bounds[2]..=bounds[5] {
-                    let parked = BlockPos(center + Vector3::new(bx, by, bz));
+                    let parked = BlockPos(Vector3::new(bx, by, bz));
                     self.set_block_state(
                         &parked,
                         Block::AIR.default_state.id,
@@ -1258,8 +1333,21 @@ mod tests {
         assert_eq!(first_chunk, Vector2::new(corner + 64, corner + 64));
         // The second allocation takes the next plot over.
         assert_eq!(second_chunk, Vector2::new(corner + 128 + 64, corner + 64));
-        // A one-block platform spans block y -1 only.
-        assert_eq!(manager.bounds_of(second), Some([-8, -1, -8, 7, -1, 7]));
+        // The platform fills its chunk's middle 16x16, one layer below the
+        // plot origin, in absolute parked coordinates.
+        let base_x = (corner + 128 + 64) * 16;
+        let base_z = (corner + 64) * 16;
+        assert_eq!(
+            manager.bounds_of(second),
+            Some([
+                base_x,
+                PLOT_ORIGIN_Y - 1,
+                base_z,
+                base_x + 15,
+                PLOT_ORIGIN_Y - 1,
+                base_z + 15,
+            ])
+        );
 
         assert!(manager.remove(first));
         let (third, _) = manager.spawn(Vector3::new(0.0, 64.0, 0.0), [8.0, 0.5, 8.0]);
@@ -1283,22 +1371,39 @@ mod tests {
 
     #[test]
     fn assembled_content_covers_its_bounds_with_chunks() {
-        let center = Vector3::new(20481032, PLOT_ORIGIN_Y, 20481032);
+        let center = 1280064 * 16 + 8;
         // A 16x16x1 platform around the plot centre sits in one chunk.
         assert_eq!(
-            content_chunks(center, &[-8, -1, -8, 7, -1, 7]),
+            content_chunks(&[
+                center - 8,
+                PLOT_ORIGIN_Y - 1,
+                center - 8,
+                center + 7,
+                PLOT_ORIGIN_Y - 1,
+                center + 7
+            ]),
             vec![Vector2::new(1280064, 1280064)]
         );
         // A 33-block-wide region spans three chunks per axis, centred on the
         // plot's middle chunk.
-        let chunks = content_chunks(center, &[-16, -1, -16, 16, -1, 16]);
+        let chunks = content_chunks(&[center - 16, 0, center - 16, center + 16, 0, center + 16]);
         assert_eq!(chunks.len(), 9);
         // Bounds crossing a chunk border by one block cover both chunks.
-        let straddling = content_chunks(center, &[7, 0, 7, 8, 0, 8]);
+        let straddling = content_chunks(&[center + 7, 0, center + 7, center + 8, 0, center + 8]);
         assert!(straddling.contains(&Vector2::new(1280064, 1280064)));
         assert!(straddling.contains(&Vector2::new(1280065, 1280065)));
         assert!(chunks.contains(&Vector2::new(1280063, 1280063)));
         assert!(chunks.contains(&Vector2::new(1280065, 1280065)));
+    }
+
+    #[test]
+    fn bounds_travel_between_frames() {
+        let center = Vector3::new(20481032, PLOT_ORIGIN_Y, 20481032);
+        // Region-relative extents become absolute parked bounds.
+        assert_eq!(
+            parked_bounds(center, &[-2, -2, -2, 2, 3, 2]),
+            [20481030, 126, 20481030, 20481034, 131, 20481034]
+        );
     }
 
     #[test]
@@ -1334,6 +1439,18 @@ mod tests {
         let bounds = manager.bounds_of(id).expect("assembled sub-level exists");
         let center_chunk = manager.chunk_of(id).expect("plot centre exists");
         let center = plot_center_block(center_chunk);
+        // The bounds are the region's parked copy, in absolute coordinates.
+        assert_eq!(
+            bounds,
+            [
+                center.x - 15,
+                center.y - 2,
+                center.z - 2,
+                center.x + 16,
+                center.y + 3,
+                center.z + 3,
+            ]
+        );
         // Round trip every corner: world -> parked -> rendered == world.
         for corner in [min, max, anchor] {
             let parked = center + corner - anchor;
@@ -1344,7 +1461,6 @@ mod tests {
             );
             assert_eq!(rendered, corner.to_f64());
         }
-        assert_eq!(bounds, [-15, -2, -2, 16, 3, 3]);
     }
 
     #[test]
