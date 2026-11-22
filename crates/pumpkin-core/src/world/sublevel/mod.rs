@@ -569,7 +569,8 @@ fn encode_payload(player: &Player, channel: &str, data: &[u8]) -> Bytes {
         .unwrap_or_default()
 }
 
-/// A vanilla bundle: the delimiter packet before and after its members.
+/// A vanilla bundle: a delimiter packet before and after its members. Every
+/// packet keeps its own frame; the bundle only promises order.
 fn send_bundle(player: &Player, members: &[Bytes]) {
     let Some(java) = player.client.java() else {
         return;
@@ -579,14 +580,11 @@ fn send_bundle(player: &Player, members: &[Bytes]) {
     else {
         return;
     };
-    let mut bundle =
-        Vec::with_capacity(delimiter.len() * 2 + members.iter().map(Bytes::len).sum::<usize>());
-    bundle.put_slice(&delimiter);
+    java.try_enqueue_packet(delimiter.clone());
     for member in members {
-        bundle.put_slice(member);
+        java.try_enqueue_packet(member.clone());
     }
-    bundle.put_slice(&delimiter);
-    java.try_enqueue_packet(Bytes::from(bundle));
+    java.try_enqueue_packet(delimiter);
 }
 
 fn send_payload(player: &Player, channel: &str, data: &[u8]) {
