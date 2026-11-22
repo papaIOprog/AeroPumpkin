@@ -112,18 +112,38 @@ impl NeoforgeChannels {
     }
 }
 
-/// Encodes a vanilla `minecraft:register` / `minecraft:unregister` payload.
+/// Encodes a vanilla `minecraft:register` / `minecraft:unregister` payload:
+/// null-terminated identifiers, no count.
 #[must_use]
 pub fn encode_channel_list(identifiers: &[&str]) -> Vec<u8> {
     let mut out = Vec::new();
-    let _ = out.write_var_int(&VarInt(
-        i32::try_from(identifiers.len()).unwrap_or(i32::MAX),
-    ));
     for identifier in identifiers {
-        // Identifiers are static ASCII; writing one cannot fail.
-        let _ = out.write_string(identifier);
+        out.extend_from_slice(identifier.as_bytes());
+        out.push(0);
     }
     out
+}
+
+/// Server-type config files a modded client expects the server to send.
+/// A client only loads a mod's server config once that file arrives; an
+/// empty file is corrected to the mod's defaults.
+pub const SERVER_CONFIG_FILES: &[&str] = &["neoforge-server.toml", "sable-server.toml"];
+const CONFIG_FILE_CHANNEL: &str = "neoforge:config_file";
+
+/// Encodes `ConfigFilePayload`: the file name, then a length-prefixed body.
+#[must_use]
+pub fn encode_config_file(file_name: &str, contents: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let _ = out.write_string(file_name);
+    let _ = out.write_var_int(&VarInt(i32::try_from(contents.len()).unwrap_or(i32::MAX)));
+    out.extend_from_slice(contents);
+    out
+}
+
+/// The custom payload carrying one server config file.
+#[must_use]
+pub const fn config_file_payload(data: &[u8]) -> CPluginMessage<'_> {
+    CPluginMessage::new(CONFIG_FILE_CHANNEL, data)
 }
 
 /// The custom payload that asks the client for its channels: an empty
@@ -228,18 +248,22 @@ mod tests {
     }
 
     #[test]
-    fn channel_lists_are_varint_prefixed_identifiers() {
-        let list = encode_channel_list(&["minecraft:register", "neoforge:register"]);
-        let mut buf: &[u8] = &list;
-        assert_eq!(read_var_int(&mut buf).unwrap(), 2);
+    fn channel_lists_are_null_terminated_identifiers() {
+        assert_eq!(
+            encode_channel_list(&["minecraft:register", "neoforge:register"]),
+            b"minecraft:register\0neoforge:register\0"
+        );
+    }
+
+    #[test]
+    fn config_file_layout() {
+        let empty = encode_config_file("sable-server.toml", &[]);
+        let mut buf: &[u8] = &empty;
         assert_eq!(
             buf.get_str_bounded_borrowed(32767).unwrap(),
-            "minecraft:register"
+            "sable-server.toml"
         );
-        assert_eq!(
-            buf.get_str_bounded_borrowed(32767).unwrap(),
-            "neoforge:register"
-        );
+        assert_eq!(read_var_int(&mut buf).unwrap(), 0);
         assert!(buf.is_empty());
     }
 }
