@@ -357,6 +357,32 @@ impl SubLevelManager {
             .map(|body| pose_from_body(&body, &level.pivot))
     }
 
+    /// Converts a position reported in a sub-level's parked coordinates to
+    /// its world position. Sable clients standing on a sub-level send
+    /// positions in that sub-level's local frame; without this the server
+    /// would place the player millions of blocks away.
+    #[must_use]
+    pub fn parked_to_world(&self, position: Vector3<f64>) -> Option<Vector3<f64>> {
+        let chunk = Vector2::new(
+            (position.x.floor() as i32).div_euclid(16),
+            (position.z.floor() as i32).div_euclid(16),
+        );
+        if !Self::is_plot_chunk(chunk) {
+            return None;
+        }
+        let plot = Vector2::new(
+            (chunk.x >> PLOT_LOG_SIZE) - PLOTYARD_ORIGIN,
+            (chunk.y >> PLOT_LOG_SIZE) - PLOTYARD_ORIGIN,
+        );
+        let level = self.levels.iter().find(|level| level.plot == plot)?;
+        let pivot = level.pivot;
+        Some(Vector3::new(
+            level.last_pose.position[0] + position.x - pivot.x,
+            level.last_pose.position[1] + position.y - pivot.y,
+            level.last_pose.position[2] + position.z - pivot.z,
+        ))
+    }
+
     /// Whether `chunk` lies inside the plotyard, where sub-levels park their
     /// content.
     #[must_use]
@@ -1329,6 +1355,15 @@ impl World {
     /// Whether `player` tracks the sub-level whose plot contains `chunk`.
     pub fn player_tracks_sublevel_chunk(&self, player: Uuid, chunk: Vector2<i32>) -> bool {
         self.lock_sublevels().player_tracks_chunk(player, chunk)
+    }
+
+    /// Converts a player-reported position in sub-level-local (parked)
+    /// coordinates to its world position, if it lies in the plotyard.
+    #[must_use]
+    pub fn to_world_position(&self, position: Vector3<f64>) -> Vector3<f64> {
+        self.lock_sublevels()
+            .parked_to_world(position)
+            .unwrap_or(position)
     }
 
     /// Whether the entity stands in the plotyard, i.e. inside some
