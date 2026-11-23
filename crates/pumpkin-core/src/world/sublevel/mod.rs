@@ -677,6 +677,15 @@ fn ticket_plot_chunk(level: &pumpkin_world::level::Level, chunk: Vector2<i32>) {
     loading.send_change();
 }
 
+/// Every chunk the world region `min..max` spans.
+fn region_chunks(min: Vector3<i32>, max: Vector3<i32>) -> Vec<Vector2<i32>> {
+    let x_chunks = min.x.div_euclid(16)..=max.x.div_euclid(16);
+    let z_chunks = min.z.div_euclid(16)..=max.z.div_euclid(16);
+    x_chunks
+        .flat_map(|x| z_chunks.clone().map(move |z| Vector2::new(x, z)))
+        .collect()
+}
+
 fn find_player(players: &[Arc<Player>], uuid: Uuid) -> Option<&Arc<Player>> {
     players.iter().find(|player| player.gameprofile.id == uuid)
 }
@@ -1044,7 +1053,12 @@ impl World {
             );
             (chunks, anchor, center_chunk)
         };
-        if !self.await_plot_chunks(&chunks).await {
+        // The source region's chunks must stay loaded too, or the copy reads
+        // air out of chunks the server unloaded. They are only held, never
+        // cleared: only the plot chunks carry parked content.
+        let mut held = chunks.clone();
+        held.extend(region_chunks(min, max));
+        if !self.await_plot_chunks(&held).await {
             return;
         }
 
@@ -1198,7 +1212,16 @@ impl World {
 
     /// Writes air over an entire freshly generated plot chunk.
     fn clear_parked_chunk(self: &Arc<Self>, chunk: Vector2<i32>) {
-        let flags = BlockFlags::SKIP_BLOCK_ADDED_CALLBACK | BlockFlags::UPDATE_KNOWN_SHAPE;
+        if !SubLevelManager::is_plot_chunk(chunk) {
+            warn!("sublevel: refusing to clear {chunk:?}, it is outside the plotyard");
+            return;
+        }
+        // A generated plot chunk can contain naturally placed chests; their
+        // contents must not scatter into the plot on the way out.
+        let flags = BlockFlags::SKIP_BLOCK_ADDED_CALLBACK
+            | BlockFlags::UPDATE_KNOWN_SHAPE
+            | BlockFlags::SKIP_DROPS
+            | BlockFlags::SKIP_BLOCK_ENTITY_REPLACED_CALLBACK;
         for x in 0..16 {
             for y in self.get_bottom_y()..=self.get_top_y() {
                 for z in 0..16 {
@@ -1235,17 +1258,28 @@ impl World {
         if qx.abs() > 0.001 || qy.abs() > 0.001 || qz.abs() > 0.001 || (qw - 1.0).abs() > 0.001 {
             return Err("sub-level is rotated; bring it level first".to_string());
         }
-        // Rendered position = pose + (parked - plot centre block), so the
-        // world target of the bounds is the pose moved by their offset from
-        // the plot centre.
-        let center = plot_center_block(center_chunk);
+        // Rendered position = pose + (parked - rotation point), so the world
+        // target of the bounds is the pose moved by their offset from the
+        // pivot - the same mapping the client renders with.
         let origin = Vector3::new(
-            pose.position[0].floor() as i32 - center.x,
-            pose.position[1].floor() as i32 - center.y,
-            pose.position[2].floor() as i32 - center.z,
+            pose.position[0] - pose.rotation_point[0],
+            pose.position[1] - pose.rotation_point[1],
+            pose.position[2] - pose.rotation_point[2],
         );
-        let min = origin + Vector3::new(bounds[0], bounds[1], bounds[2]);
-        let max = origin + Vector3::new(bounds[3], bounds[4], bounds[5]);
+        let min = (origin
+            + Vector3::new(
+                f64::from(bounds[0]),
+                f64::from(bounds[1]),
+                f64::from(bounds[2]),
+            ))
+        .floor_to_i32();
+        let max = (origin
+            + Vector3::new(
+                f64::from(bounds[3]),
+                f64::from(bounds[4]),
+                f64::from(bounds[5]),
+            ))
+        .floor_to_i32();
         if !self.is_in_build_limit(BlockPos(min)) || !self.is_in_build_limit(BlockPos(max)) {
             return Err("sub-level has drifted outside the build limit".to_string());
         }
@@ -1263,31 +1297,34 @@ impl World {
         min: Vector3<i32>,
         max: Vector3<i32>,
     ) {
-        if !self.await_plot_chunks(&chunks).await {
+        // Hold the target world chunks as well: without a player nearby the
+        // server unloads them, and the write-back would land nowhere.
+        let mut held = chunks.clone();
+        held.extend(region_chunks(min, max));
+        if !self.await_plot_chunks(&held).await {
             return;
         }
-        let (bounds, center, pose_vec) = {
+        let (bounds, pivot, pose_vec) = {
             let manager = self.lock_sublevels();
             let Some(bounds) = manager.bounds_of(id) else {
-                return;
-            };
-            let Some(center_chunk) = manager.chunk_of(id) else {
                 return;
             };
             let Some(pose) = manager.pose_of(id) else {
                 return;
             };
             let pose_vec = Vector3::new(pose.position[0], pose.position[1], pose.position[2]);
-            (bounds, plot_center_block(center_chunk), pose_vec)
+            let pivot = Vector3::new(
+                pose.rotation_point[0],
+                pose.rotation_point[1],
+                pose.rotation_point[2],
+            );
+            (bounds, pivot, pose_vec)
         };
 
-        // The bounds are absolute parked coordinates; the world target is
-        // the pose moved by their offset from the plot centre block.
-        let origin = Vector3::new(
-            pose_vec.x.floor() as i32 - center.x,
-            pose_vec.y.floor() as i32 - center.y,
-            pose_vec.z.floor() as i32 - center.z,
-        );
+        // The bounds are absolute parked coordinates; the world target is the
+        // pose moved by their offset from the pivot - the mapping the client
+        // renders with.
+        let origin = pose_vec - pivot;
         let flags = BlockFlags::NOTIFY_ALL | BlockFlags::SKIP_DROPS;
         for bx in bounds[0]..=bounds[3] {
             for by in bounds[1]..=bounds[4] {
@@ -1297,7 +1334,11 @@ impl World {
                     if state == Block::AIR.default_state.id {
                         continue;
                     }
-                    let world_pos = BlockPos(origin + parked.0);
+                    let world_pos = BlockPos(Vector3::new(
+                        (origin.x + f64::from(parked.0.x)).floor() as i32,
+                        (origin.y + f64::from(parked.0.y)).floor() as i32,
+                        (origin.z + f64::from(parked.0.z)).floor() as i32,
+                    ));
                     self.set_block_state(&world_pos, state, flags);
                     if let Some(block_entity) = self.get_block_entity(&parked) {
                         self.restore_block_entity_at(&block_entity, world_pos);
@@ -1308,11 +1349,6 @@ impl World {
 
         // Entities keep fractional positions; move them by the same offset
         // the blocks took.
-        let center_f64 = Vector3::new(
-            f64::from(center.x),
-            f64::from(center.y),
-            f64::from(center.z),
-        );
         let parked_min = Vector3::new(bounds[0], bounds[1], bounds[2]);
         let parked_max = Vector3::new(bounds[3], bounds[4], bounds[5]);
         for entity in self.entities.load().iter() {
@@ -1328,7 +1364,7 @@ impl World {
             {
                 continue;
             }
-            entity.set_pos(pose_vec + pos - center_f64);
+            entity.set_pos(pose_vec + pos - pivot);
         }
 
         // Leave the plot empty for whoever reuses it.
@@ -1339,7 +1375,10 @@ impl World {
                     self.set_block_state(
                         &parked,
                         Block::AIR.default_state.id,
-                        BlockFlags::SKIP_BLOCK_ADDED_CALLBACK | BlockFlags::UPDATE_KNOWN_SHAPE,
+                        BlockFlags::SKIP_BLOCK_ADDED_CALLBACK
+                            | BlockFlags::UPDATE_KNOWN_SHAPE
+                            | BlockFlags::SKIP_DROPS
+                            | BlockFlags::SKIP_BLOCK_ENTITY_REPLACED_CALLBACK,
                     );
                 }
             }

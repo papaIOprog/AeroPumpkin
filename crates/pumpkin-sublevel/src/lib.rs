@@ -104,8 +104,12 @@ impl SubLevelSystem {
             .build();
         let body_handle = self.bodies.insert(body);
 
+        // Sub-level bodies never touch each other: two assembled regions
+        // may be spawned overlapping, and contact resolution would shove
+        // both off the exact spot their blocks came from.
         let collider = ColliderBuilder::cuboid(half_extents[0], half_extents[1], half_extents[2])
             .density(ROCK_DENSITY)
+            .collision_groups(InteractionGroups::new(Group::GROUP_1, Group::GROUP_2))
             .build();
         self.colliders
             .insert_with_parent(collider, body_handle, &mut self.bodies);
@@ -213,6 +217,24 @@ mod tests {
         assert_close(snapshots[0].position[1], 64.0);
         // Linear damping shaves a little off the first step.
         assert!(snapshots[0].linear_velocity[0] > 3.5);
+    }
+
+    #[test]
+    fn overlapping_bodies_do_not_shove_each_other() {
+        let mut system = SubLevelSystem::new();
+        // Two regions assembled from the same spot: without collision
+        // groups, contact resolution pushes both half a block apart.
+        let _first = system.spawn([-39.5, 150.5, -39.5], [0.5, 0.5, 0.5]);
+        let _second = system.spawn([-39.5, 150.5, -39.5], [0.5, 0.5, 0.5]);
+
+        for _ in 0..40 {
+            let snapshots = system.step();
+            for body in snapshots {
+                assert_close(body.position[0], -39.5);
+                assert_close(body.position[1], 150.5);
+                assert_close(body.position[2], -39.5);
+            }
+        }
     }
 
     #[test]
