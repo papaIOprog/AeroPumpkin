@@ -825,7 +825,7 @@ impl ChunkData {
             ChunkHeightmapType::MotionBlocking,
             ChunkHeightmapType::MotionBlockingNoLeaves,
         ] {
-            heightmap.update(hm_type, x, z, y, block_state, min_y, |y_at| {
+            heightmap.update(hm_type, x, y, z, block_state, min_y, |y_at| {
                 let id = self
                     .section
                     .get_block_absolute_y(relative_x, y_at, relative_z)
@@ -981,6 +981,30 @@ mod tests {
     use super::ChunkSections;
     use crate::chunk::palette::BlockPalette;
     use pumpkin_data::{Block, block_properties::has_random_ticks};
+
+    #[test]
+    fn heightmap_follows_single_block_sets_in_their_own_column() {
+        use crate::chunk::{ChunkData, ChunkHeightmapType};
+        let chunk = ChunkData::empty(0, 0);
+        let top = |x: i32, z: i32| {
+            chunk
+                .heightmap
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(ChunkHeightmapType::MotionBlocking, x, z, -64)
+        };
+        chunk.set_block_absolute_y(3, 64, 5, Block::STONE.default_state.id);
+        for y in 65..72 {
+            chunk.set_block_absolute_y(3, y, 5, Block::WHITE_WOOL.default_state.id);
+        }
+        assert_eq!(top(3, 5), 71);
+        // A tower in one column leaves its neighbours alone.
+        assert_eq!(top(3, 0), -65);
+        for y in (65..72).rev() {
+            chunk.set_block_absolute_y(3, y, 5, Block::AIR.default_state.id);
+        }
+        assert_eq!(top(3, 5), 64);
+    }
 
     #[test]
     fn random_tick_cache_initializes_from_palette_contents() {
