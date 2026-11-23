@@ -83,6 +83,8 @@ struct SubLevel {
     chunk: Vector2<i32>,
     /// Every parked chunk holding content, for the full sync.
     chunks: Vec<Vector2<i32>>,
+    /// The parked block the body sits on: the pose's rotation point.
+    pivot: Vector3<f64>,
     /// Plot-local block bounds of the content, inclusive.
     bounds: [i32; 6],
     half_extents: [f32; 3],
@@ -197,6 +199,7 @@ impl SubLevelManager {
             plot,
             chunk: center,
             chunks: vec![center],
+            pivot: plot_center_block(center).to_f64(),
             bounds: [
                 center.x * 16,
                 PLOT_ORIGIN_Y - 1,
@@ -221,7 +224,12 @@ impl SubLevelManager {
     /// exactly where the region was. Returns the new id; the parked chunks
     /// are filled by [`World::assemble_sublevel`], which tightens the bounds
     /// to the copied content before the sub-level is networked.
-    pub fn assemble(&mut self, pose: Vector3<f64>, bounds: [i32; 6]) -> u32 {
+    pub fn assemble(
+        &mut self,
+        pose: Vector3<f64>,
+        bounds: [i32; 6],
+        pivot_offset: Vector3<f64>,
+    ) -> u32 {
         let plot = self.first_free_plot();
         let corner = Vector2::new(
             (PLOTYARD_ORIGIN + plot.x) << PLOT_LOG_SIZE,
@@ -233,6 +241,8 @@ impl SubLevelManager {
         );
 
         let parked = parked_bounds(plot_center_block(center), &bounds);
+        // The pose rotates about the parked point the body sits on.
+        let pivot = plot_center_block(center).to_f64() + pivot_offset;
         let half_extents = [
             (bounds[3] - bounds[0] + 1) as f32 / 2.0,
             (bounds[4] - bounds[1] + 1) as f32 / 2.0,
@@ -248,6 +258,7 @@ impl SubLevelManager {
             plot,
             chunk: center,
             chunks: content_chunks(&parked),
+            pivot,
             bounds: parked,
             half_extents,
             ready: false,
@@ -343,15 +354,7 @@ impl SubLevelManager {
             .snapshots()
             .into_iter()
             .find(|body| body.id == level.id)
-            .map(|body| sable::Pose {
-                position: [
-                    f64::from(body.position[0]),
-                    f64::from(body.position[1]),
-                    f64::from(body.position[2]),
-                ],
-                orientation: body.rotation,
-                rotation_point: [0.0; 3],
-            })
+            .map(|body| pose_from_body(&body, &level.pivot))
     }
 
     /// Whether `chunk` lies inside the plotyard, where sub-levels park their
@@ -442,13 +445,22 @@ impl SubLevelManager {
     /// into range (with a full sync) and ends it for players that left.
     /// Sable clients only: they are the ones that understand the protocol.
     fn update_tracking(&mut self, world: &World, bodies: &[BodySnapshot], players: &[Arc<Player>]) {
+        // A reconnecting player keeps their uuid, but the new client has no
+        // sub-levels: forget them so they get a fresh full sync instead of
+        // snapshots for sub-levels they never tracked.
+        let online = |uuid: &Uuid| players.iter().any(|player| player.gameprofile.id == *uuid);
+        for level in &mut self.levels {
+            level.tracking.retain(online);
+        }
+        self.updating.retain(online);
+
         let mut syncs: Vec<(u32, Uuid)> = Vec::new();
         let mut untracks: Vec<(i64, Uuid)> = Vec::new();
         for body in bodies {
-            let pose = pose_from_body(body);
             let Some(level) = self.levels.iter_mut().find(|level| level.id == body.id) else {
                 continue;
             };
+            let pose = pose_from_body(body, &level.pivot);
             level.last_pose = pose;
             if !level.ready {
                 continue;
@@ -712,11 +724,12 @@ fn send_bundle(player: &Player, members: &[Bytes]) {
     else {
         return;
     };
-    java.try_enqueue_packet(delimiter.clone());
+    // The members go out as plain sequential packets: TCP keeps their
+    // order, and the bundle delimiters bought nothing but kick bugs.
+    let _ = delimiter;
     for member in members {
         java.try_enqueue_packet(member.clone());
     }
-    java.try_enqueue_packet(delimiter);
 }
 
 fn send_payload(player: &Player, channel: &str, data: &[u8]) {
@@ -744,7 +757,7 @@ fn send_full_sync(
             level.plot_long(),
             level.uuid,
             &level.last_pose,
-            &pose_from_body(body),
+            &pose_from_body(body, &level.pivot),
             level.bounds,
             tick,
         )),
@@ -778,7 +791,9 @@ fn send_full_sync(
     send_bundle(player, &members);
 }
 
-fn pose_from_body(body: &BodySnapshot) -> sable::Pose {
+/// The wire pose: the body sits on the sub-level's pivot, so the position
+/// is that pivot's world position, as in Sable's centre-of-mass poses.
+fn pose_from_body(body: &BodySnapshot, pivot: &Vector3<f64>) -> sable::Pose {
     sable::Pose {
         position: [
             f64::from(body.position[0]),
@@ -786,7 +801,7 @@ fn pose_from_body(body: &BodySnapshot) -> sable::Pose {
             f64::from(body.position[2]),
         ],
         orientation: body.rotation,
-        rotation_point: [0.0; 3],
+        rotation_point: [pivot.x, pivot.y, pivot.z],
     }
 }
 
@@ -882,10 +897,9 @@ impl World {
         if debug.is_empty() {
             return;
         }
+        // Sable clients get the wireframe too: it shows the physics body
+        // next to the rendered blocks, which makes alignment bugs obvious.
         for player in self.players.load().iter() {
-            if is_sable_client(player) {
-                continue;
-            }
             for data in &debug {
                 send_payload(player, DEBUG_CHANNEL, data);
             }
@@ -930,8 +944,10 @@ impl World {
         min: Vector3<i32>,
         max: Vector3<i32>,
     ) -> Result<u32, String> {
-        let min = Vector3::new(min.x.min(max.x), min.y.min(max.y), min.z.min(max.z));
-        let max = Vector3::new(max.x.max(min.x), max.y.max(min.y), max.z.max(min.z));
+        let (min, max) = (
+            Vector3::new(min.x.min(max.x), min.y.min(max.y), min.z.min(max.z)),
+            Vector3::new(min.x.max(max.x), min.y.max(max.y), min.z.max(max.z)),
+        );
         let size = max - min + Vector3::new(1, 1, 1);
         if size.x > MAX_ASSEMBLE_SPAN
             || size.z > MAX_ASSEMBLE_SPAN
@@ -964,12 +980,15 @@ impl World {
             max.y - anchor.y,
             max.z - anchor.z,
         ];
+        // The body sits at the region's centre; the anchor is the integer
+        // block under it, so the pivot gets whatever fraction is left over.
         let pose = Vector3::new(
-            f64::from(anchor.x),
-            f64::from(anchor.y),
-            f64::from(anchor.z),
+            f64::from(min.x) + f64::from(size.x) / 2.0,
+            f64::from(min.y) + f64::from(size.y) / 2.0,
+            f64::from(min.z) + f64::from(size.z) / 2.0,
         );
-        let id = self.lock_sublevels().assemble(pose, bounds);
+        let pivot_offset = pose - anchor.to_f64();
+        let id = self.lock_sublevels().assemble(pose, bounds, pivot_offset);
         let world = Arc::clone(self);
         tokio::spawn(async move { world.copy_region_into_plot(id, min, max).await });
         Ok(id)
@@ -1021,7 +1040,10 @@ impl World {
                     }
                     let parked = center + pos.0 - anchor;
                     if !self.is_in_build_limit(BlockPos(parked)) {
-                        warn!("sublevel: parked copy of ({}, {}, {}) landed outside the build limit; region skipped", pos.0.x, pos.0.y, pos.0.z);
+                        warn!(
+                            "sublevel: parked copy of ({}, {}, {}) landed outside the build limit; region skipped",
+                            pos.0.x, pos.0.y, pos.0.z
+                        );
                         return;
                     }
                     self.set_block_state(&BlockPos(parked), state, copy_flags);
@@ -1068,7 +1090,6 @@ impl World {
             manager.tighten_bounds(id, tight);
         }
         manager.mark_ready(id);
-        drop(manager);
         info!(
             "sublevel {id} assembled from region ({}, {}, {})..({}, {}, {})",
             min.x, min.y, min.z, max.x, max.y, max.z
@@ -1434,6 +1455,7 @@ mod tests {
                 max.y - anchor.y,
                 max.z - anchor.z,
             ],
+            pose - anchor.to_f64(),
         );
 
         let bounds = manager.bounds_of(id).expect("assembled sub-level exists");
