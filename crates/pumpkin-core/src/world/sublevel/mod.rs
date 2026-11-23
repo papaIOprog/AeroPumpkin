@@ -92,6 +92,10 @@ struct SubLevel {
     tracking: FxHashSet<Uuid>,
     /// Terrain chunks held loaded around the body for its surroundings.
     surroundings_chunks: Vec<Vector2<i32>>,
+    /// The world region being copied into the plot, inclusive corners,
+    /// while the copy runs: its blocks are still in the world but are this
+    /// sub-level's already, so nothing may sample them as ground.
+    source: Option<[[i32; 3]; 2]>,
 }
 
 impl SubLevel {
@@ -236,6 +240,7 @@ impl SubLevelManager {
             stop_sent: false,
             tracking: FxHashSet::default(),
             surroundings_chunks: Vec::new(),
+            source: None,
         });
         (id, center)
     }
@@ -251,6 +256,7 @@ impl SubLevelManager {
         pose: Vector3<f64>,
         bounds: [i32; 6],
         pivot_offset: Vector3<f64>,
+        source: [[i32; 3]; 2],
     ) -> u32 {
         let plot = self.first_free_plot();
         let corner = Vector2::new(
@@ -282,8 +288,26 @@ impl SubLevelManager {
             stop_sent: false,
             tracking: FxHashSet::default(),
             surroundings_chunks: Vec::new(),
+            source: Some(source),
         });
         id
+    }
+
+    /// Notes that sub-level `id`'s region is copied: its blocks are out of
+    /// the world, or staying in it for good.
+    pub fn end_assembly(&mut self, id: u32) {
+        if let Some(level) = self.levels.iter_mut().find(|level| level.id == id) {
+            level.source = None;
+        }
+    }
+
+    /// The world regions still being copied into plots, inclusive corners.
+    #[must_use]
+    pub fn assembling_regions(&self) -> Vec<[[i32; 3]; 2]> {
+        self.levels
+            .iter()
+            .filter_map(|level| level.source)
+            .collect()
     }
 
     /// Shrinks sub-level `id`'s bounds to the blocks actually parked in its
@@ -1132,7 +1156,12 @@ impl World {
             f64::from(min.z) + f64::from(size.z) / 2.0,
         );
         let pivot_offset = pose - anchor.to_f64();
-        let id = self.lock_sublevels().assemble(pose, bounds, pivot_offset);
+        let id = self.lock_sublevels().assemble(
+            pose,
+            bounds,
+            pivot_offset,
+            [[min.x, min.y, min.z], [max.x, max.y, max.z]],
+        );
         let world = Arc::clone(self);
         tokio::spawn(async move { world.copy_region_into_plot(id, min, max).await });
         Ok(id)
@@ -1171,6 +1200,7 @@ impl World {
         let mut held = chunks.clone();
         held.extend(region_chunks(min, max));
         if !self.await_plot_chunks(&held).await {
+            self.lock_sublevels().end_assembly(id);
             return;
         }
 
@@ -1187,11 +1217,13 @@ impl World {
                     "sublevel: parked copy of ({}, {}, {}) landed outside the build limit; region skipped",
                     outside.x, outside.y, outside.z
                 );
+                self.lock_sublevels().end_assembly(id);
                 return;
             }
         };
         self.park_entities_in_region(min, max, anchor, center);
         self.clear_region(min, max);
+        self.lock_sublevels().end_assembly(id);
 
         // Sable's bounds are tight to the content; empty margins of the
         // region must not widen the client's render or collision box.
@@ -1542,11 +1574,23 @@ impl World {
             return;
         }
 
+        // Blocks of a region still being assembled belong to the sub-level
+        // they are becoming, not to the world around anyone.
+        let assembling = self.lock_sublevels().assembling_regions();
+        let inside = |pos: &BlockPos| {
+            let block = [pos.0.x, pos.0.y, pos.0.z];
+            assembling.iter().any(|region| {
+                (0..3).all(|axis| block[axis] >= region[0][axis] && block[axis] <= region[1][axis])
+            })
+        };
         let mut voxels = Vec::new();
         for x in min.x..=max.x {
             for y in min.y..=max.y {
                 for z in min.z..=max.z {
                     let pos = BlockPos(Vector3::new(x, y, z));
+                    if inside(&pos) {
+                        continue;
+                    }
                     let (block, state) = self.get_block_and_state(&pos);
                     if state.is_air() {
                         continue;
@@ -1883,6 +1927,7 @@ mod tests {
                 max.z - anchor.z,
             ],
             pose - anchor.to_f64(),
+            [[min.x, min.y, min.z], [max.x, max.y, max.z]],
         );
 
         let bounds = manager.bounds_of(id).expect("assembled sub-level exists");

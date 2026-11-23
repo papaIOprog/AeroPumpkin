@@ -3,11 +3,13 @@
 //! Sable and Create: Aeronautics describe that with data files for their own
 //! blocks. Pumpkin has none of those blocks, so ordinary ones stand in for
 //! them: wool seals a balloon (airtight in Aeronautics too), a lit campfire
-//! heated by a redstone signal is a hot air burner, a piston powered by
-//! redstone is a propeller that pushes the way it faces (a sticky piston
-//! pushes the other way), a carpet is a sail and a chain is a symmetric
-//! sail. Masses, volumes, friction and fragility follow Sable's shipped
-//! definitions for vanilla blocks, so builds handle alike.
+//! fed a redstone signal is a hot air burner and a soul campfire a steam
+//! vent, a piston powered by redstone is a propeller that pushes the way it
+//! faces (a sticky piston pushes the other way), a carpet is a sail and a
+//! chain is a symmetric sail, and froglights are levitite. End stone keeps
+//! the floating material Sable gives it. Masses, volumes, friction and
+//! fragility follow Sable's shipped definitions for vanilla blocks, so
+//! builds handle alike.
 
 use pumpkin_data::block_properties::{
     Axis, CampfireLikeProperties, ChainLikeProperties, SlabProperties, SlabType,
@@ -15,7 +17,7 @@ use pumpkin_data::block_properties::{
 };
 use pumpkin_data::tag::{self, Taggable};
 use pumpkin_data::{Block, BlockDirection, BlockState, FacingExt};
-use pumpkin_sublevel::{Material, Voxel, VoxelKind, VoxelShape};
+use pumpkin_sublevel::{FloatingMaterial, Material, Voxel, VoxelKind, VoxelShape};
 use pumpkin_util::math::position::BlockPos;
 
 use crate::block::blocks::redstone::get_redstone_power;
@@ -29,9 +31,10 @@ const SUPER_HEAVY_MASS: f32 = 4.0;
 /// Sable makes bedrock absurdly heavy so it can never be lifted.
 const BEDROCK_MASS: f32 = 1000.0;
 
-/// Lifting gas a hot air burner feeds its balloon at full signal, in cubic
-/// metres, as in Aeronautics.
+/// Lifting gas a hot air burner, or a steam vent, feeds its balloon at full
+/// signal, in cubic metres, as in Aeronautics.
 const BURNER_OUTPUT: f32 = 500.0;
+const STEAM_VENT_OUTPUT: f32 = 5000.0;
 /// A propeller at full signal turns at Create's top speed.
 const FULL_SIGNAL_RPM: f32 = 256.0;
 /// Sable's lift scalars for a sail (Create's) and a symmetric sail.
@@ -109,6 +112,23 @@ const QUARTER_VOLUME: &[Block] = &[
     Block::REPEATER,
     Block::COMPARATOR,
     Block::OBSERVER,
+];
+
+/// Levitite, Aeronautics' lifting block: the froglights stand in for it.
+const LEVITITE: &[Block] = &[
+    Block::OCHRE_FROGLIGHT,
+    Block::VERDANT_FROGLIGHT,
+    Block::PEARLESCENT_FROGLIGHT,
+];
+
+/// Sable's `#sable:end_stones`, which carry its `end_stone` floating
+/// material; the slab at half strength.
+const END_STONE: &[Block] = &[
+    Block::END_STONE,
+    Block::END_STONE_BRICKS,
+    Block::END_STONE_BRICK_SLAB,
+    Block::END_STONE_BRICK_STAIRS,
+    Block::END_STONE_BRICK_WALL,
 ];
 
 /// Sable's `fragile` tag: these break when a sub-level hits something.
@@ -199,14 +219,24 @@ pub fn aerodynamic_kind(block: &Block, state: &BlockState, signal: u8) -> VoxelK
     }
     if block.has_tag(&tag::Block::MINECRAFT_CAMPFIRES) {
         // A burner heats in proportion to its signal; an unlit campfire
-        // is just a grill.
-        return if CampfireLikeProperties::from_state_id(state.id).lit {
-            VoxelKind::Heater {
-                output: BURNER_OUTPUT * f32::from(signal) / 15.0,
-            }
+        // is just a grill. A soul campfire's blue flame is a steam vent.
+        if !CampfireLikeProperties::from_state_id(state.id).lit {
+            return VoxelKind::Solid;
+        }
+        let output = if *block == Block::SOUL_CAMPFIRE {
+            STEAM_VENT_OUTPUT
         } else {
-            VoxelKind::Solid
+            BURNER_OUTPUT
         };
+        return VoxelKind::Heater {
+            output: output * f32::from(signal) / 15.0,
+        };
+    }
+    if LEVITITE.contains(block) {
+        return levitite();
+    }
+    if END_STONE.contains(block) {
+        return end_stone(block, state);
     }
     if *block == Block::PISTON || *block == Block::STICKY_PISTON {
         let facing = StickyPistonLikeProperties::from_state_id(state.id).facing;
@@ -243,6 +273,24 @@ pub fn aerodynamic_kind(block: &Block, state: &BlockState, signal: u8) -> VoxelK
         };
     }
     VoxelKind::Solid
+}
+
+/// A block of Aeronautics' `levitite` floating material.
+const fn levitite() -> VoxelKind {
+    VoxelKind::Floating {
+        material: FloatingMaterial::LEVITITE,
+        scale: 1.0,
+    }
+}
+
+/// A block of Sable's `end_stone` floating material: a slab at half.
+fn end_stone(block: &Block, state: &BlockState) -> VoxelKind {
+    let slab = *block == Block::END_STONE_BRICK_SLAB;
+    let double = slab && SlabProperties::from_state_id(state.id).r#type == SlabType::Double;
+    VoxelKind::Floating {
+        material: FloatingMaterial::END_STONE,
+        scale: if slab && !double { 0.5 } else { 1.0 },
+    }
 }
 
 /// The strongest redstone signal any neighbour feeds into `pos`, 0 to 15.
@@ -411,6 +459,58 @@ mod tests {
             thrust([0.0, 0.0, -1.0], -256.0)
         );
         assert_eq!(voxel(&Block::PISTON, Block::PISTON.default_state, 0).1, 1.0);
+    }
+
+    #[test]
+    fn floating_blocks_come_in_two_materials() {
+        assert_eq!(
+            voxel(
+                &Block::OCHRE_FROGLIGHT,
+                Block::OCHRE_FROGLIGHT.default_state,
+                0
+            )
+            .0,
+            VoxelKind::Floating {
+                material: FloatingMaterial::LEVITITE,
+                scale: 1.0
+            }
+        );
+        assert_eq!(
+            voxel(&Block::END_STONE, Block::END_STONE.default_state, 0).0,
+            VoxelKind::Floating {
+                material: FloatingMaterial::END_STONE,
+                scale: 1.0
+            }
+        );
+        // The end stone brick slab floats at half strength, unless double.
+        let single = Block::END_STONE_BRICK_SLAB.default_state;
+        assert_eq!(
+            voxel(&Block::END_STONE_BRICK_SLAB, single, 0).0,
+            VoxelKind::Floating {
+                material: FloatingMaterial::END_STONE,
+                scale: 0.5
+            }
+        );
+        let mut slab = SlabProperties::default(&Block::END_STONE_BRICK_SLAB);
+        slab.r#type = SlabType::Double;
+        let double = BlockState::from_id(slab.to_state_id(&Block::END_STONE_BRICK_SLAB));
+        assert_eq!(
+            voxel(&Block::END_STONE_BRICK_SLAB, double, 0).0,
+            VoxelKind::Floating {
+                material: FloatingMaterial::END_STONE,
+                scale: 1.0
+            }
+        );
+        // A soul campfire is a steam vent: ten times a burner's gas.
+        assert_eq!(
+            voxel(
+                &Block::SOUL_CAMPFIRE,
+                Block::SOUL_CAMPFIRE.default_state,
+                15
+            )
+            .0,
+            VoxelKind::Heater { output: 5000.0 }
+        );
     }
 
     #[test]

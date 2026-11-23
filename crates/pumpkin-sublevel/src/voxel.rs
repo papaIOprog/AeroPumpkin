@@ -87,6 +87,71 @@ pub enum VoxelKind {
         parallel_drag: f32,
         lift: f32,
     },
+    /// A block of a floating material, acting at `scale` of its strength:
+    /// the blocks lift the sub-level and drag the air as one cluster.
+    Floating {
+        material: FloatingMaterial,
+        scale: f32,
+    },
+}
+
+/// How a floating material acts on the sub-level it is part of. Sable's
+/// `FloatingBlockMaterial`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FloatingMaterial {
+    /// Block masses one unit of scale lifts.
+    pub lift: f32,
+    /// The lift never accelerates its own centre upwards: levitite alone
+    /// hovers, it cannot ascend.
+    pub prevent_self_lift: bool,
+    pub scale_with_pressure: bool,
+    pub scale_friction_with_gravity: bool,
+    /// Below this speed the slow frictions give way to the fast ones.
+    pub transition_speed: f32,
+    pub slow_vertical_friction: f32,
+    pub fast_vertical_friction: f32,
+    pub slow_horizontal_friction: f32,
+    pub fast_horizontal_friction: f32,
+}
+
+impl FloatingMaterial {
+    /// Aeronautics' `simple_drag`: drag that thins with the air, no lift.
+    /// Airtight blocks carry it at a third strength (`balloon_drag.json`).
+    pub const SIMPLE_DRAG: Self = Self {
+        lift: 0.0,
+        prevent_self_lift: false,
+        scale_with_pressure: true,
+        scale_friction_with_gravity: false,
+        transition_speed: 0.0,
+        slow_vertical_friction: 0.0,
+        fast_vertical_friction: 1.0,
+        slow_horizontal_friction: 0.0,
+        fast_horizontal_friction: 1.0,
+    };
+    /// Sable's `end_stone`: end stone and its bricks, stairs and walls.
+    pub const END_STONE: Self = Self {
+        lift: 2.0,
+        prevent_self_lift: true,
+        scale_with_pressure: false,
+        scale_friction_with_gravity: true,
+        transition_speed: 2.0,
+        slow_vertical_friction: 0.4,
+        fast_vertical_friction: 0.02,
+        slow_horizontal_friction: 0.3,
+        fast_horizontal_friction: 0.01,
+    };
+    /// Aeronautics' `levitite`.
+    pub const LEVITITE: Self = Self {
+        lift: 10.0,
+        prevent_self_lift: true,
+        scale_with_pressure: false,
+        scale_friction_with_gravity: true,
+        transition_speed: 3.0,
+        slow_vertical_friction: 2.0,
+        fast_vertical_friction: 0.1,
+        slow_horizontal_friction: 1.5,
+        fast_horizontal_friction: 0.05,
+    };
 }
 
 /// One block of a sub-level or of the world around it.

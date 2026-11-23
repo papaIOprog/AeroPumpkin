@@ -21,14 +21,15 @@
 mod aero;
 mod voxel;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
 
+use aero::PersistentForce;
 pub use aero::{
     Air, Analysed, Content, GRAVITY, THRUSTER_AIRFLOW, THRUSTER_THRUST, UNIVERSAL_DRAG,
 };
-pub use voxel::{Material, MaterialBox, Voxel, VoxelKind, VoxelShape};
+pub use voxel::{FloatingMaterial, Material, MaterialBox, Voxel, VoxelKind, VoxelShape};
 
 use rapier3d::prelude::*;
 
@@ -178,6 +179,8 @@ struct SubLevel {
     surroundings_pending: Option<SurroundingsRequest>,
     /// A world block within the surroundings changed since they were taken.
     refresh: bool,
+    /// Forces working on the body for the whole tick, figured out once.
+    persistent: Vec<PersistentForce>,
     throttle: f32,
     /// The body feels gravity and air.
     active: bool,
@@ -186,6 +189,8 @@ struct SubLevel {
 struct Surroundings {
     region: SurroundingsRequest,
     colliders: Vec<ColliderHandle>,
+    /// The world blocks holding liquid, which the body floats in.
+    liquids: HashSet<[i32; 3]>,
 }
 
 /// Records the contact manifolds between sub-levels and what they hit while
@@ -353,6 +358,7 @@ impl SubLevelSystem {
             surroundings: None,
             surroundings_pending: None,
             refresh: false,
+            persistent: Vec::new(),
             throttle: 1.0,
             active: false,
         });
@@ -394,7 +400,11 @@ impl SubLevelSystem {
         self.sublevels[index].active = false;
 
         let pivot_offset = content.pivot_offset;
-        let analysed = content.analyse();
+        let previous = self.sublevels[index].content.take();
+        let mut analysed = content.analyse();
+        if let Some(previous) = &previous {
+            analysed.inherit(previous);
+        }
         let body = self.sublevels[index].body;
         let mut colliders = Vec::with_capacity(analysed.boxes.len());
         for (index_of_box, boxed) in analysed.boxes.iter().enumerate() {
@@ -518,6 +528,11 @@ impl SubLevelSystem {
             request.min[1] as f32,
             request.min[2] as f32,
         ];
+        let liquids: HashSet<[i32; 3]> = voxels
+            .iter()
+            .filter(|voxel| voxel.liquid)
+            .map(|voxel| std::array::from_fn(|axis| request.min[axis] + voxel.position[axis]))
+            .collect();
         let mut colliders = Vec::new();
         for (index_of_box, boxed) in voxel::collision_boxes(voxels, origin)
             .into_iter()
@@ -547,6 +562,7 @@ impl SubLevelSystem {
         self.sublevels[index].surroundings = Some(Surroundings {
             region: request,
             colliders,
+            liquids,
         });
         self.activate(index);
         true
@@ -652,7 +668,24 @@ impl SubLevelSystem {
                 let Some(content) = sublevel.content.as_ref() else {
                     continue;
                 };
-                aero::apply_aero(body, content, sublevel.throttle, air, SUBSTEP_DT);
+                // The liquids' work follows the body as it moves: a thin
+                // raft held to one tick-old forces rocks itself apart.
+                sublevel.persistent.clear();
+                if let Some(liquids) = sublevel
+                    .surroundings
+                    .as_ref()
+                    .map(|surroundings| &surroundings.liquids)
+                {
+                    sublevel.persistent = content.buoyancy(body, liquids);
+                }
+                aero::apply_forces(
+                    body,
+                    content,
+                    &sublevel.persistent,
+                    sublevel.throttle,
+                    air,
+                    SUBSTEP_DT,
+                );
             }
             // What the bodies bring to the substep, for gauging the hits in it.
             self.impacts.before.clear();
@@ -1094,6 +1127,14 @@ mod tests {
     }
 
     /// Flat ground at `top`, filling whatever the request asks for.
+    /// Every cell of a request, in order.
+    fn request_region(request: &SurroundingsRequest) -> impl Iterator<Item = [i32; 3]> + use<'_> {
+        (request.min[0]..=request.max[0]).flat_map(move |x| {
+            (request.min[1]..=request.max[1])
+                .flat_map(move |y| (request.min[2]..=request.max[2]).map(move |z| [x, y, z]))
+        })
+    }
+
     fn flat_ground(request: SurroundingsRequest, top: i32) -> Vec<Voxel> {
         let mut voxels = Vec::new();
         for x in request.min[0]..=request.max[0] {
@@ -1291,7 +1332,9 @@ mod tests {
             },
             58,
         );
-        let body = settle(&mut system, id, 200);
+        // The wool shell drags the air, so it falls at under ten blocks a
+        // second: 150 blocks down takes a while.
+        let body = settle(&mut system, id, 400);
         assert_close(body.position[0], -16.0);
         assert_close(body.position[1], 61.5);
         assert_close(body.position[2], -271.0);
@@ -1364,7 +1407,9 @@ mod tests {
         let id = system.spawn([40.0, 66.5, 0.0]);
         land_on(&mut system, id, balloon(26.0), 64);
         let mut rising = false;
-        for _ in 0..400 {
+        // Airtight blocks drag the air, so the ship rises at a walking
+        // pace once the gas has had its nine seconds.
+        for _ in 0..800 {
             serve(&mut system, 64);
             let body = system.step().bodies[1];
             rising |= body.linear_velocity[1] > 0.05;
@@ -1661,6 +1706,168 @@ mod tests {
             .find(|body| body.id == cube_id)
             .ok_or("cube")?;
         assert_close(cube.position[1], 66.0);
+        Ok(())
+    }
+
+    fn floating_block(material: FloatingMaterial) -> Content {
+        Content {
+            pivot_offset: [0.5; 3],
+            voxels: vec![Voxel::cube([0, 0, 0], 1.0).with_kind(VoxelKind::Floating {
+                material,
+                scale: 1.0,
+            })],
+        }
+    }
+
+    /// Content dropped into open air, with nothing to land on.
+    fn airborne(system: &mut SubLevelSystem, content: Content, at: [f32; 3]) -> u32 {
+        let id = system.spawn(at);
+        assert!(system.set_content(id, content));
+        let requests = system.take_surroundings_requests();
+        assert_eq!(requests.len(), 1);
+        let (_, request) = requests[0];
+        assert!(system.set_surroundings(id, request, &[]));
+        id
+    }
+
+    #[test]
+    fn end_stone_and_levitite_hold_their_own_weight() {
+        // One block of either lifts more than it weighs, but never enough
+        // to rise: the lift gives way before its centre would accelerate
+        // upwards. Sable's drag nudge leaves them sinking a slow tenth of a
+        // block per second, which is Aeronautics' behaviour too.
+        for material in [FloatingMaterial::END_STONE, FloatingMaterial::LEVITITE] {
+            let mut system = SubLevelSystem::new(Air::default());
+            let id = airborne(&mut system, floating_block(material), [0.0, 100.0, 0.0]);
+            for _ in 0..200 {
+                system.step();
+            }
+            let body = system.snapshots()[0];
+            assert!(
+                body.position[1] < 100.0 && body.position[1] > 98.5,
+                "{material:?}: {:?}",
+                body.position
+            );
+            assert!(
+                (body.linear_velocity[1] + 0.13).abs() < 0.05,
+                "{material:?}: {:?}",
+                body.linear_velocity
+            );
+            system.remove(id);
+        }
+    }
+
+    #[test]
+    fn airtight_blocks_drag_the_air() -> Result<(), &'static str> {
+        // A wool shell falls far slower than its weight alone would take
+        // it: every airtight block drags. Stone of the same weight does not.
+        let shell = |kind| {
+            let mut voxels = Vec::new();
+            for x in -4i32..=4 {
+                for y in -3i32..=3 {
+                    for z in -4i32..=4 {
+                        if x.abs() == 4 || y.abs() == 3 || z.abs() == 4 {
+                            voxels.push(Voxel::cube([x, y, z], 0.25).with_kind(kind));
+                        }
+                    }
+                }
+            }
+            Content {
+                pivot_offset: [0.5; 3],
+                voxels,
+            }
+        };
+        let mut system = SubLevelSystem::new(Air::default());
+        // Within the air: the drag thins with the pressure, which is nil
+        // near the build limit.
+        let wool = airborne(&mut system, shell(VoxelKind::Envelope), [0.0, 100.0, 0.0]);
+        let stone = airborne(&mut system, shell(VoxelKind::Solid), [100.0, 100.0, 0.0]);
+        for _ in 0..300 {
+            system.step();
+        }
+        let bodies = system.snapshots();
+        let wool_body = bodies.iter().find(|body| body.id == wool).ok_or("wool")?;
+        let stone_body = bodies.iter().find(|body| body.id == stone).ok_or("stone")?;
+        assert!(
+            wool_body.linear_velocity[1] > -10.0,
+            "{:?}",
+            wool_body.linear_velocity
+        );
+        assert!(
+            stone_body.linear_velocity[1] < -40.0,
+            "{:?}",
+            stone_body.linear_velocity
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sub_levels_float_in_liquids_by_their_density() -> Result<(), &'static str> {
+        // Every block in a liquid is lifted by 10.5 per unit of volume
+        // against its mass and dragged towards rest: planks (half a mass
+        // per block) rise, stone (two) sinks, both slowly.
+        let cube = |mass| {
+            (0..2)
+                .flat_map(|x| {
+                    (0..2).flat_map(move |y| (0..2).map(move |z| Voxel::cube([x, y, z], mass)))
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut system = SubLevelSystem::new(Air::default());
+        let planks = system.spawn([0.0, 0.0, 0.0]);
+        assert!(system.set_content(
+            planks,
+            Content {
+                pivot_offset: [1.0; 3],
+                voxels: cube(0.5),
+            }
+        ));
+        let stone = system.spawn([100.0, 0.0, 0.0]);
+        assert!(system.set_content(
+            stone,
+            Content {
+                pivot_offset: [1.0; 3],
+                voxels: cube(2.0),
+            }
+        ));
+        let water = |request: &SurroundingsRequest| {
+            request_region(request)
+                .map(|cell| {
+                    Voxel::liquid([
+                        cell[0] - request.min[0],
+                        cell[1] - request.min[1],
+                        cell[2] - request.min[2],
+                    ])
+                })
+                .collect::<Vec<_>>()
+        };
+        serve_with(&mut system, water);
+        for _ in 0..100 {
+            serve_with(&mut system, water);
+            system.step();
+        }
+        let bodies = system.snapshots();
+        let planks = bodies
+            .iter()
+            .find(|body| body.id == planks)
+            .ok_or("planks")?;
+        let stone = bodies.iter().find(|body| body.id == stone).ok_or("stone")?;
+        assert!(
+            planks.linear_velocity[1] > 0.3,
+            "{:?}",
+            planks.linear_velocity
+        );
+        assert!(planks.position[1] > 0.5, "{:?}", planks.position);
+        assert!(
+            stone.linear_velocity[1] < -0.5,
+            "{:?}",
+            stone.linear_velocity
+        );
+        assert!(
+            stone.linear_velocity[1] > -10.0,
+            "{:?}",
+            stone.linear_velocity
+        );
         Ok(())
     }
 
