@@ -23,7 +23,9 @@ use pumpkin_protocol::codec::var_int::VarInt;
 use pumpkin_protocol::java::client::play::{CBundleDelimiter, CCustomPayload};
 use pumpkin_protocol::ser::NetworkWriteExt;
 use pumpkin_protocol::{ClientPacket, MultiVersionJavaPacket};
-use pumpkin_sublevel::{AeroInfo, Air, BodySnapshot, Content, Ground, GroundRequest, Voxel};
+use pumpkin_sublevel::{
+    AeroInfo, Air, BodySnapshot, Content, Impact, ImpactTarget, Step, SurroundingsRequest, Voxel,
+};
 use pumpkin_util::math::vector2::Vector2;
 use pumpkin_util::math::vector3::Vector3;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -35,12 +37,13 @@ use super::block_entity_from_nbt;
 use crate::block::entities::BlockEntity;
 use crate::entity::EntityBase;
 use crate::entity::player::Player;
+use crate::entity::tnt::TNTEntity;
 use crate::net::java::JavaClient;
 use crate::net::java::chunk_data::CChunkData;
+use pumpkin_data::Block;
 use pumpkin_data::entity::EntityType;
-use pumpkin_data::{Block, BlockState};
+use pumpkin_data::tag::{self, Taggable};
 use pumpkin_util::math::position::BlockPos;
-use pumpkin_world::chunk::ChunkHeightmapType;
 use pumpkin_world::chunk_system::ChunkLoading;
 use pumpkin_world::world::BlockFlags;
 
@@ -87,8 +90,8 @@ struct SubLevel {
     networked_pose: sable::Pose,
     stop_sent: bool,
     tracking: FxHashSet<Uuid>,
-    /// Terrain chunks held loaded for the ground under the body.
-    ground_chunks: Vec<Vector2<i32>>,
+    /// Terrain chunks held loaded around the body for its surroundings.
+    surroundings_chunks: Vec<Vector2<i32>>,
 }
 
 impl SubLevel {
@@ -139,8 +142,13 @@ struct Ticket {
 struct ParkedCopy {
     /// Parked bounds tight to the copied content, if it copied anything.
     bounds: Option<[i32; 6]>,
-    /// Every copied block, for the physics.
-    voxels: Vec<Voxel>,
+}
+
+/// Whether a block's aerodynamic role depends on the redstone reaching it.
+fn needs_signal(block: &Block) -> bool {
+    block.has_tag(&tag::Block::MINECRAFT_CAMPFIRES)
+        || *block == Block::PISTON
+        || *block == Block::STICKY_PISTON
 }
 
 pub struct SubLevelManager {
@@ -151,6 +159,8 @@ pub struct SubLevelManager {
     last_send: Option<Instant>,
     /// Players still receiving per-tick snapshot info.
     updating: FxHashSet<Uuid>,
+    /// Sub-levels whose parked blocks changed since their last scan.
+    dirty: FxHashSet<u32>,
 }
 
 impl Default for SubLevelManager {
@@ -176,6 +186,7 @@ impl SubLevelManager {
             tick: 0,
             last_send: None,
             updating: FxHashSet::default(),
+            dirty: FxHashSet::default(),
         }
     }
 
@@ -224,7 +235,7 @@ impl SubLevelManager {
             networked_pose: sable::Pose::default(),
             stop_sent: false,
             tracking: FxHashSet::default(),
-            ground_chunks: Vec::new(),
+            surroundings_chunks: Vec::new(),
         });
         (id, center)
     }
@@ -270,7 +281,7 @@ impl SubLevelManager {
             networked_pose: sable::Pose::default(),
             stop_sent: false,
             tracking: FxHashSet::default(),
-            ground_chunks: Vec::new(),
+            surroundings_chunks: Vec::new(),
         });
         id
     }
@@ -370,6 +381,38 @@ impl SubLevelManager {
             .map(|level| level.from_anchor)
     }
 
+    /// The parked block that was the region's anchor, the block the
+    /// content's grid coordinates count from.
+    #[must_use]
+    pub fn anchor_of(&self, id: u32) -> Option<Vector3<f64>> {
+        self.levels
+            .iter()
+            .find(|level| level.id == id)
+            .map(|level| level.pivot - level.from_anchor)
+    }
+
+    /// Schedules a rescan of every ready sub-level whose parked content
+    /// contains `pos`, after a block there was edited, and a new sample of
+    /// the world for every body whose surroundings contain it.
+    pub fn note_edit(&mut self, pos: &BlockPos) {
+        let [x, y, z] = [pos.0.x, pos.0.y, pos.0.z];
+        for level in &mut self.levels {
+            let [x0, y0, z0, x1, y1, z1] = level.bounds;
+            if level.ready && x >= x0 && x <= x1 && y >= y0 && y <= y1 && z >= z0 && z <= z1 {
+                self.dirty.insert(level.id);
+            }
+        }
+        self.physics.note_edit([x, y, z]);
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.levels.is_empty()
+    }
+
+    pub fn take_dirty(&mut self) -> Vec<u32> {
+        self.dirty.drain().collect()
+    }
+
     /// The body pose of sub-level `id`, for mapping content back to the world.
     #[must_use]
     pub fn pose_of(&self, id: u32) -> Option<sable::Pose> {
@@ -412,22 +455,27 @@ impl SubLevelManager {
     }
 
     /// Hands sub-level `id` its content once its blocks are parked; the
-    /// body then takes their mass and shape and waits for ground.
+    /// body then takes their mass and shape and waits for its surroundings.
     pub fn set_content(&mut self, id: u32, content: Content) -> bool {
         self.physics.set_content(id, content)
     }
 
-    /// Delivers sampled ground for sub-level `id`'s pending request.
-    pub fn set_ground(&mut self, id: u32, ground: Ground) -> bool {
-        self.physics.set_ground(id, ground)
+    /// Delivers the sampled world for sub-level `id`'s pending request.
+    pub fn set_surroundings(
+        &mut self,
+        id: u32,
+        request: SurroundingsRequest,
+        voxels: &[Voxel],
+    ) -> bool {
+        self.physics.set_surroundings(id, request, voxels)
     }
 
-    /// Notes that sub-level `id`'s pending ground request came to nothing.
-    pub fn cancel_ground(&mut self, id: u32) {
-        self.physics.cancel_ground(id);
+    /// Notes that sub-level `id`'s pending request came to nothing.
+    pub fn cancel_surroundings(&mut self, id: u32) {
+        self.physics.cancel_surroundings(id);
     }
 
-    /// How hard sub-level `id`'s thrusters push, from 0 to 1.
+    /// Scales how hard sub-level `id`'s propellers push, from 0 to 1.
     pub fn set_throttle(&mut self, id: u32, throttle: f32) -> bool {
         self.physics.set_throttle(id, throttle)
     }
@@ -438,27 +486,38 @@ impl SubLevelManager {
         self.physics.aero_info(id)
     }
 
-    /// The terrain chunks held loaded for sub-level `id`'s ground.
+    /// The terrain chunks held loaded around sub-level `id`.
     #[must_use]
-    pub fn ground_chunks_of(&self, id: u32) -> Option<Vec<Vector2<i32>>> {
+    pub fn surroundings_chunks_of(&self, id: u32) -> Option<Vec<Vector2<i32>>> {
         self.levels
             .iter()
             .find(|level| level.id == id)
-            .map(|level| level.ground_chunks.clone())
+            .map(|level| level.surroundings_chunks.clone())
     }
 
-    pub fn set_ground_chunks(&mut self, id: u32, chunks: Vec<Vector2<i32>>) {
+    pub fn set_surroundings_chunks(&mut self, id: u32, chunks: Vec<Vector2<i32>>) {
         if let Some(level) = self.levels.iter_mut().find(|level| level.id == id) {
-            level.ground_chunks = chunks;
+            level.surroundings_chunks = chunks;
         }
     }
 
     /// Forgets sub-level `id`, dropping its terrain chunks with it.
-    pub fn forget_ground_chunks(&mut self, id: u32) -> Option<Vec<Vector2<i32>>> {
+    pub fn forget_surroundings_chunks(&mut self, id: u32) -> Option<Vec<Vector2<i32>>> {
         self.levels
             .iter_mut()
             .find(|level| level.id == id)
-            .map(|level| std::mem::take(&mut level.ground_chunks))
+            .map(|level| std::mem::take(&mut level.surroundings_chunks))
+    }
+
+    /// The parked position of a block of sub-level `id`'s content, given in
+    /// grid coordinates counted from its anchor block.
+    #[must_use]
+    pub fn parked_block(&self, id: u32, block: [i32; 3]) -> Option<BlockPos> {
+        let level = self.levels.iter().find(|level| level.id == id)?;
+        let anchor = (level.pivot - level.from_anchor).floor_to_i32();
+        Some(BlockPos(
+            anchor + Vector3::new(block[0], block[1], block[2]),
+        ))
     }
 
     /// Whether `chunk` lies inside the plotyard, where sub-levels park their
@@ -507,22 +566,23 @@ impl SubLevelManager {
             .collect()
     }
 
-    /// Steps the simulation and syncs every client. Runs from the world tick,
-    /// before the entity tracker. Terrain that has gone missing under a body
-    /// is sampled by [`World::load_sublevel_ground`].
-    pub fn tick(&mut self, world: &Arc<World>) {
-        let requests = self.physics.take_ground_requests();
-        for (id, request) in requests {
-            let world = Arc::clone(world);
-            tokio::spawn(async move { world.load_sublevel_ground(id, request).await });
-        }
-        let bodies = self.physics.step();
+    /// Steps the simulation, returning the world the bodies now need
+    /// around them and what the step produced. Runs from the world tick;
+    /// the lock is free afterwards so the host can act on both.
+    pub fn step_physics(&mut self) -> (Vec<(u32, SurroundingsRequest)>, Step) {
+        let requests = self.physics.take_surroundings_requests();
+        (requests, self.physics.step())
+    }
+
+    /// Syncs every client to the bodies after a step. Runs from the world
+    /// tick, before the entity tracker.
+    pub fn sync(&mut self, world: &Arc<World>, bodies: &[BodySnapshot]) {
         self.tick = self.tick.wrapping_add(1);
         let ms_since_last = self.note_send_time();
 
         let players: Vec<Arc<Player>> = world.players.load().to_vec();
-        self.update_tracking(world, &bodies, &players);
-        self.send_movement(&bodies, &players, ms_since_last);
+        self.update_tracking(world, bodies, &players);
+        self.send_movement(bodies, &players, ms_since_last);
     }
 
     fn note_send_time(&mut self) -> i32 {
@@ -687,7 +747,7 @@ impl SubLevelManager {
                 );
             }
         }
-        if let Some(chunks) = self.forget_ground_chunks(id) {
+        if let Some(chunks) = self.forget_surroundings_chunks(id) {
             for chunk in chunks {
                 unticket_chunk(&world.level, chunk);
             }
@@ -947,11 +1007,12 @@ impl World {
                 let z = pivot.z as i32 - half + dz;
                 let pos = BlockPos(Vector3::new(x, slab_y, z));
                 self.set_block_state(&pos, stone, flags);
-                voxels.push(Voxel {
-                    position: [x - pivot.x as i32, -1, z - pivot.z as i32],
-                    kind: aero::voxel_kind(&Block::STONE, Block::STONE.default_state),
-                    mass: aero::block_mass(&Block::STONE, Block::STONE.default_state),
-                });
+                voxels.push(aero::block_voxel(
+                    [x - pivot.x as i32, -1, z - pivot.z as i32],
+                    &Block::STONE,
+                    Block::STONE.default_state,
+                    0,
+                ));
             }
         }
         let mut manager = self.lock_sublevels();
@@ -969,9 +1030,34 @@ impl World {
         );
     }
 
-    /// Steps sub-levels and syncs every client.
+    /// Steps sub-levels and syncs every client: sub-levels whose blocks were
+    /// edited are read again, world that has gone missing around a body is
+    /// sampled by [`World::load_sublevel_surroundings`], and what the bodies
+    /// hit is dealt with by [`World::handle_impacts`].
     pub fn tick_sublevels(self: &Arc<Self>) {
-        self.lock_sublevels().tick(self);
+        let (dirty, requests, step) = {
+            let mut manager = self.lock_sublevels();
+            self.has_sublevels
+                .store(!manager.is_empty(), std::sync::atomic::Ordering::Relaxed);
+            let (requests, step) = manager.step_physics();
+            (manager.take_dirty(), requests, step)
+        };
+        for id in dirty {
+            self.rescan_sublevel(id);
+        }
+        for (id, request) in requests {
+            let world = Arc::clone(self);
+            tokio::spawn(async move { world.load_sublevel_surroundings(id, request).await });
+        }
+        self.handle_impacts(&step.impacts);
+        self.lock_sublevels().sync(self, &step.bodies);
+    }
+
+    /// Called for every block set inside the plotyard, and for every block
+    /// set anywhere while sub-levels exist: their bodies collide with the
+    /// world, so it has to follow its edits.
+    pub(crate) fn note_sublevel_edit(&self, pos: &BlockPos) {
+        self.lock_sublevels().note_edit(pos);
     }
 
     /// Removes a sub-level, telling every client that tracked it.
@@ -1094,9 +1180,7 @@ impl World {
             self.clear_parked_chunk(*chunk);
         }
         let center = plot_center_block(center_chunk);
-        let ParkedCopy { bounds, voxels } = match self
-            .copy_blocks_into_plot(min, max, anchor, center)
-        {
+        let ParkedCopy { bounds } = match self.copy_blocks_into_plot(min, max, anchor, center) {
             Ok(copied) => copied,
             Err(outside) => {
                 warn!(
@@ -1115,22 +1199,155 @@ impl World {
         if let Some(bounds) = bounds {
             manager.tighten_bounds(id, bounds);
         }
-        manager.set_content(
-            id,
-            Content {
-                pivot_offset: [
-                    from_anchor.x as f32,
-                    from_anchor.y as f32,
-                    from_anchor.z as f32,
-                ],
-                voxels,
-            },
-        );
-        manager.mark_ready(id);
+        let pivot_offset = [
+            from_anchor.x as f32,
+            from_anchor.y as f32,
+            from_anchor.z as f32,
+        ];
+        drop(manager);
+        // The content is read back from the plot, where redstone signals
+        // are the ones the burners and propellers will actually see. Its
+        // grid counts from the parked anchor, the plot centre block.
+        if let Some(voxels) = self.content_from_plot(id, center) {
+            let mut manager = self.lock_sublevels();
+            manager.set_content(
+                id,
+                Content {
+                    pivot_offset,
+                    voxels,
+                },
+            );
+            manager.mark_ready(id);
+        }
         info!(
             "sublevel {id} assembled from region ({}, {}, {})..({}, {}, {})",
             min.x, min.y, min.z, max.x, max.y, max.z
         );
+    }
+
+    /// The blocks parked in sub-level `id`'s plot as voxels, counted from
+    /// `anchor`, the parked block the content's grid counts from (see
+    /// [`SubLevelManager::anchor_of`]). `None` if nothing is parked there.
+    fn content_from_plot(&self, id: u32, anchor: Vector3<i32>) -> Option<Vec<Voxel>> {
+        let bounds = self.lock_sublevels().bounds_of(id)?;
+        let mut voxels = Vec::new();
+        for x in bounds[0]..=bounds[3] {
+            for y in bounds[1]..=bounds[4] {
+                for z in bounds[2]..=bounds[5] {
+                    let pos = BlockPos(Vector3::new(x, y, z));
+                    let (block, state) = self.get_block_and_state(&pos);
+                    if state.is_air() {
+                        continue;
+                    }
+                    let signal = if needs_signal(block) {
+                        aero::signal_at(self, pos)
+                    } else {
+                        0
+                    };
+                    voxels.push(aero::block_voxel(
+                        [x - anchor.x, y - anchor.y, z - anchor.z],
+                        block,
+                        state,
+                        signal,
+                    ));
+                }
+            }
+        }
+        Some(voxels)
+    }
+
+    /// Reads sub-level `id`'s parked blocks again and hands them to the
+    /// physics, after a block of the sub-level was edited or broke off.
+    fn rescan_sublevel(self: &Arc<Self>, id: u32) {
+        let Some(anchor) = self
+            .lock_sublevels()
+            .anchor_of(id)
+            .map(|anchor| anchor.floor_to_i32())
+        else {
+            return;
+        };
+        let Some(voxels) = self.content_from_plot(id, anchor) else {
+            return;
+        };
+        let mut manager = self.lock_sublevels();
+        if voxels.is_empty() {
+            drop(manager);
+            self.remove_sublevel(id);
+            return;
+        }
+        let pivot_offset = manager.from_anchor_of(id).map_or([0.0; 3], |offset| {
+            [offset.x as f32, offset.y as f32, offset.z as f32]
+        });
+        manager.set_content(
+            id,
+            Content {
+                pivot_offset,
+                voxels,
+            },
+        );
+    }
+
+    /// Deals with what the sub-levels hit this tick: fragile blocks break,
+    /// TNT primes, and the sub-levels that lost blocks are read again.
+    fn handle_impacts(self: &Arc<Self>, impacts: &[Impact]) {
+        let mut rescans: FxHashSet<u32> = FxHashSet::default();
+        for impact in impacts {
+            // The sub-level's own block that hit, in its plot. Its lookup is
+            // a statement of its own: changing a parked block locks the
+            // manager again.
+            let own = self
+                .lock_sublevels()
+                .parked_block(impact.sublevel, impact.block);
+            if own.is_some_and(|pos| self.hit_block(&pos, impact.speed)) {
+                rescans.insert(impact.sublevel);
+            }
+            match impact.target {
+                ImpactTarget::World([x, y, z]) => {
+                    let pos = BlockPos(Vector3::new(x, y, z));
+                    self.hit_block(&pos, impact.speed);
+                }
+                ImpactTarget::SubLevel { id, block } => {
+                    let Some(pos) = self.lock_sublevels().parked_block(id, block) else {
+                        continue;
+                    };
+                    if self.hit_block(&pos, impact.speed) {
+                        rescans.insert(id);
+                    }
+                }
+            }
+        }
+        for id in rescans {
+            self.rescan_sublevel(id);
+        }
+    }
+
+    /// Lets a block take the consequences of being hit at `speed`: fragile
+    /// blocks break, TNT primes. Returns whether the block changed.
+    fn hit_block(self: &Arc<Self>, pos: &BlockPos, speed: f32) -> bool {
+        /// Sable's `FragileBlockCallback` threshold, in blocks per second.
+        const FRAGILE_SPEED: f32 = 4.0;
+        /// Sable's `ExplosiveBlockCallback` threshold.
+        const TNT_SPEED: f32 = 5.0;
+
+        let (block, state) = self.get_block_and_state(pos);
+        if *block == Block::TNT && speed >= TNT_SPEED {
+            self.set_block_state(
+                pos,
+                Block::AIR.default_state.id,
+                BlockFlags::NOTIFY_ALL | BlockFlags::SKIP_DROPS,
+            );
+            self.spawn_entity(TNTEntity::primed(self, pos, 4));
+            return true;
+        }
+        if speed >= FRAGILE_SPEED
+            && aero::collision_shape(state).is_solid()
+            && aero::block_voxel([0; 3], block, state, 0).material.fragile
+        {
+            // Sable destroys the block with its drops.
+            self.set_block_state(pos, Block::AIR.default_state.id, BlockFlags::NOTIFY_ALL);
+            return true;
+        }
+        false
     }
 
     /// Copies a world region's blocks and block entities into the plot
@@ -1146,7 +1363,6 @@ impl World {
     ) -> Result<ParkedCopy, Vector3<i32>> {
         let flags = BlockFlags::SKIP_BLOCK_ADDED_CALLBACK | BlockFlags::UPDATE_KNOWN_SHAPE;
         let mut tight: Option<[i32; 6]> = None;
-        let mut voxels: Vec<Voxel> = Vec::new();
         for x in min.x..=max.x {
             for y in min.y..=max.y {
                 for z in min.z..=max.z {
@@ -1159,14 +1375,6 @@ impl World {
                     if !self.is_in_build_limit(BlockPos(parked)) {
                         return Err(pos.0);
                     }
-                    let block_state = BlockState::from_id(state);
-                    let block = Block::from_state_id(state);
-                    let relative = pos.0 - anchor;
-                    voxels.push(Voxel {
-                        position: [relative.x, relative.y, relative.z],
-                        kind: aero::voxel_kind(block, block_state),
-                        mass: aero::block_mass(block, block_state),
-                    });
                     self.set_block_state(&BlockPos(parked), state, flags);
                     tight = Some(tight.map_or(
                         [parked.x, parked.y, parked.z, parked.x, parked.y, parked.z],
@@ -1187,10 +1395,7 @@ impl World {
                 }
             }
         }
-        Ok(ParkedCopy {
-            bounds: tight,
-            voxels,
-        })
+        Ok(ParkedCopy { bounds: tight })
     }
 
     /// Empties a world region of the blocks an assembly copied out of it,
@@ -1286,30 +1491,40 @@ impl World {
         true
     }
 
-    /// Samples the terrain under sub-level `id` for its physics: holds the
-    /// chunks of the requested area loaded, reads the height of every column
-    /// in it and hands the result to the body. The area's chunks replace
-    /// those held for the previous sample.
-    pub async fn load_sublevel_ground(self: Arc<Self>, id: u32, request: GroundRequest) {
-        // No assembled content reaches further than half the widest region
-        // plus the physics' margin; anything beyond is garbage that must
-        // not turn into a chunk request.
-        if request.radius > MAX_ASSEMBLE_SPAN {
+    /// Samples the world around sub-level `id` for its physics: holds the
+    /// chunks of the requested region loaded, describes every block in it
+    /// and hands the result to the body. The region's chunks replace those
+    /// held for the previous sample.
+    pub async fn load_sublevel_surroundings(
+        self: Arc<Self>,
+        id: u32,
+        request: SurroundingsRequest,
+    ) {
+        let min = Vector3::new(request.min[0], request.min[1], request.min[2]);
+        let max = Vector3::new(request.max[0], request.max[1], request.max[2]);
+        // No assembled content reaches further than the widest region plus
+        // the physics' margin, and a body is never in the plotyard; anything
+        // else is garbage that must not turn into a chunk request.
+        let span = max - min;
+        if span.x > 4 * MAX_ASSEMBLE_SPAN
+            || span.y > 4 * MAX_ASSEMBLE_SPAN
+            || span.z > 4 * MAX_ASSEMBLE_SPAN
+            || SubLevelManager::is_plot_chunk(Vector2::new(
+                min.x.div_euclid(16),
+                min.z.div_euclid(16),
+            ))
+        {
             warn!(
-                "sublevel: refusing to sample ground {} blocks around sublevel {id}",
-                request.radius
+                "sublevel: refusing to sample a {}x{}x{} region around sublevel {id}",
+                span.x, span.y, span.z
             );
-            self.lock_sublevels().cancel_ground(id);
+            self.lock_sublevels().cancel_surroundings(id);
             return;
         }
-        let [cx, cz] = request.center;
-        let chunks = region_chunks(
-            Vector3::new(cx - request.radius, 0, cz - request.radius),
-            Vector3::new(cx + request.radius, 0, cz + request.radius),
-        );
+        let chunks = region_chunks(min, max);
         let previous = self
             .lock_sublevels()
-            .ground_chunks_of(id)
+            .surroundings_chunks_of(id)
             .unwrap_or_default();
         let held = chunks
             .iter()
@@ -1321,61 +1536,34 @@ impl World {
         }
         // Recorded before the wait, so a sub-level removed meanwhile still
         // lets go of them.
-        self.lock_sublevels().set_ground_chunks(id, chunks);
+        self.lock_sublevels().set_surroundings_chunks(id, chunks);
         if !self.await_plot_chunks(&held).await {
-            self.lock_sublevels().cancel_ground(id);
+            self.lock_sublevels().cancel_surroundings(id);
             return;
         }
 
-        let side = usize::try_from(request.radius * 2 + 1).unwrap_or(0);
-        let mut heights = Vec::with_capacity(side * side);
-        for dz in -request.radius..=request.radius {
-            for dx in -request.radius..=request.radius {
-                heights.push(self.column_top(cx + dx, cz + dz) as f32);
+        let mut voxels = Vec::new();
+        for x in min.x..=max.x {
+            for y in min.y..=max.y {
+                for z in min.z..=max.z {
+                    let pos = BlockPos(Vector3::new(x, y, z));
+                    let (block, state) = self.get_block_and_state(&pos);
+                    if state.is_air() {
+                        continue;
+                    }
+                    voxels.push(aero::block_voxel(
+                        [x - min.x, y - min.y, z - min.z],
+                        block,
+                        state,
+                        0,
+                    ));
+                }
             }
         }
         let mut manager = self.lock_sublevels();
-        if !manager.set_ground(
-            id,
-            Ground {
-                center: request.center,
-                radius: request.radius,
-                heights,
-            },
-        ) {
-            manager.cancel_ground(id);
+        if !manager.set_surroundings(id, request, &voxels) {
+            manager.cancel_surroundings(id);
         }
-    }
-
-    /// The top face of the highest terrain in block column (`x`, `z`): the
-    /// lowest a sub-level there can sink to. The chunk heightmap answers
-    /// fast; its answer is checked against the blocks, because worlds saved
-    /// before the heightmap was kept current still carry stale columns.
-    fn column_top(&self, x: i32, z: i32) -> i32 {
-        let min_y = self.get_bottom_y();
-        let blocks_motion = |y: i32| {
-            ChunkHeightmapType::MotionBlocking
-                .is_opaque(self.get_block_state(&BlockPos(Vector3::new(x, y, z))))
-        };
-        let mut top = self
-            .level
-            .loaded_chunks
-            .get(&Vector2::new(x >> 4, z >> 4))
-            .map_or(min_y, |chunk| {
-                chunk
-                    .heightmap
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .get(ChunkHeightmapType::MotionBlocking, x & 15, z & 15, min_y)
-                    + 1
-            });
-        while top > min_y && !blocks_motion(top - 1) {
-            top -= 1;
-        }
-        while top <= self.get_top_y() && blocks_motion(top) {
-            top += 1;
-        }
-        top
     }
 
     /// Writes air over an entire freshly generated plot chunk.

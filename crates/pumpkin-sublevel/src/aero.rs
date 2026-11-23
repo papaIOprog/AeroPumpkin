@@ -1,14 +1,16 @@
-//! Aerodynamics of an assembled sub-level: its mass, the lifting gas sealed
-//! inside it, the thrusters that push it and the surfaces that bite the air.
+//! Aerodynamics of an assembled sub-level: the lifting gas sealed inside
+//! it, the thrusters that push it and the surfaces that bite the air.
 //!
 //! The balloon and propeller behaviour follows Create: Aeronautics (MIT
 //! code). The air model, gravity and drag match the defaults Sable ships for
 //! the overworld, so builds handle the same on both.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use rapier3d::math::{Point, Real, Vector};
 use rapier3d::prelude::RigidBody;
+
+use crate::voxel::{MaterialBox, Voxel, VoxelKind, collision_boxes, solid_bounds};
 
 /// Downward acceleration on a sub-level, in blocks per second squared.
 pub const GRAVITY: f32 = 11.0;
@@ -23,15 +25,19 @@ pub const FILL_TIME: f32 = 9.0;
 const RESPONSIVENESS_BOOST: f32 = 5.0;
 /// "Far" means this fraction of the balloon's capacity.
 const RESPONSIVENESS_RANGE: f32 = 0.05;
-/// Rated push of one thruster block at full throttle.
-pub const THRUSTER_THRUST: f32 = 512.0;
-/// A thruster stops adding push once the sub-level moves this fast along it.
-pub const THRUSTER_AIRFLOW: f32 = 64.0;
-/// How hard a lift surface resists air moving along its normal, resists air
-/// moving in any direction, and lifts from air sliding across it.
-const SURFACE_PARALLEL_DRAG: f32 = 0.75;
+/// Aeronautics' small propellers: a push of 1 pN per rpm and an airflow of
+/// 0.1 m/s per rpm; the push fades out as the sub-level approaches the
+/// airflow speed.
+pub const THRUSTER_THRUST: f32 = 1.0;
+pub const THRUSTER_AIRFLOW: f32 = 0.1;
+/// How much of its target rpm a propeller gains per tick, as it spools up.
+const PROPELLER_SPOOL: f32 = 0.15;
+/// A propeller slower than this, in rpm, counts as standing still.
+const PROPELLER_IDLE: f32 = 0.03;
+/// How hard every lift surface resists air moving in any direction, whatever
+/// its own scalars. The minimum that keeps a surface from gaining speed
+/// from the air, as in Sable.
 const SURFACE_DRAG: f32 = 0.068_882;
-const SURFACE_LIFT: f32 = 0.475;
 /// Air thins by this fraction per block above sea level.
 const PRESSURE_FALLOFF: f32 = 0.004;
 /// Air pressure stops growing this far below sea level.
@@ -76,31 +82,6 @@ impl Air {
     }
 }
 
-/// What one block of a sub-level does to the physics besides its mass.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum VoxelKind {
-    /// Ordinary material.
-    Solid,
-    /// Seals lifting gas in; like [`Self::Solid`] otherwise.
-    Envelope,
-    /// Heats the balloon it sits in, filling it with up to `output` cubic
-    /// metres of lifting gas.
-    Heater { output: f32 },
-    /// Pushes the sub-level along `direction` when the sub-level is
-    /// throttled.
-    Thruster { direction: [f32; 3] },
-    /// A thin surface whose open face points along `normal`.
-    LiftSurface { normal: [f32; 3] },
-}
-
-/// One block of a sub-level, `position` blocks from the body's anchor block.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Voxel {
-    pub position: [i32; 3],
-    pub kind: VoxelKind,
-    pub mass: f32,
-}
-
 /// Everything a sub-level is made of.
 ///
 /// Positions are whole blocks counted from an anchor block; the body's pivot
@@ -143,22 +124,27 @@ impl Balloon {
     }
 }
 
+/// A propeller: spools towards its rpm and pushes along its direction.
 pub struct Thruster {
     pub centre: [f32; 3],
     pub direction: [f32; 3],
+    pub rpm: f32,
+    speed: f32,
 }
 
 pub struct LiftSurface {
     pub centre: [f32; 3],
     pub normal: [f32; 3],
+    parallel_drag: f32,
+    lift: f32,
 }
-
-/// A box of material in the body frame: centre, half extents and mass.
-pub type MaterialBox = ([f32; 3], [f32; 3], f32);
 
 /// A [`Content`] worked out for the physics.
 pub struct Analysed {
+    /// Boxes of material in the body frame, one collider each.
     pub boxes: Vec<MaterialBox>,
+    /// Grid bounds of the colliding blocks, inclusive.
+    pub bounds: Option<[[i32; 3]; 2]>,
     pub balloons: Vec<Balloon>,
     pub thrusters: Vec<Thruster>,
     pub surfaces: Vec<LiftSurface>,
@@ -169,15 +155,21 @@ impl Content {
     pub fn analyse(self) -> Analysed {
         let pivot_offset = self.pivot_offset;
         Analysed {
-            boxes: collision_boxes(&self.voxels, pivot_offset),
+            boxes: collision_boxes(
+                &self.voxels,
+                [-pivot_offset[0], -pivot_offset[1], -pivot_offset[2]],
+            ),
+            bounds: solid_bounds(&self.voxels),
             balloons: balloons(&self.voxels, pivot_offset),
             thrusters: self
                 .voxels
                 .iter()
                 .filter_map(|voxel| match voxel.kind {
-                    VoxelKind::Thruster { direction } => Some(Thruster {
+                    VoxelKind::Thruster { direction, rpm } => Some(Thruster {
                         centre: centre_of(voxel.position, pivot_offset),
                         direction,
+                        rpm,
+                        speed: 0.0,
                     }),
                     _ => None,
                 })
@@ -186,13 +178,35 @@ impl Content {
                 .voxels
                 .iter()
                 .filter_map(|voxel| match voxel.kind {
-                    VoxelKind::LiftSurface { normal } => Some(LiftSurface {
+                    VoxelKind::LiftSurface {
+                        normal,
+                        parallel_drag,
+                        lift,
+                    } => Some(LiftSurface {
                         centre: centre_of(voxel.position, pivot_offset),
                         normal,
+                        parallel_drag,
+                        lift,
                     }),
                     _ => None,
                 })
                 .collect(),
+        }
+    }
+}
+
+impl Analysed {
+    /// One game tick of the slow-changing state: the gas in the balloons
+    /// and the propellers spooling towards their rpm.
+    pub fn advance(&mut self, dt: f32) {
+        for balloon in &mut self.balloons {
+            balloon.advance(dt);
+        }
+        for thruster in &mut self.thrusters {
+            thruster.speed += (thruster.rpm - thruster.speed) * PROPELLER_SPOOL;
+            if thruster.speed.abs() < PROPELLER_IDLE && thruster.rpm == 0.0 {
+                thruster.speed = 0.0;
+            }
         }
     }
 }
@@ -204,81 +218,6 @@ fn centre_of(position: [i32; 3], pivot_offset: [f32; 3]) -> [f32; 3] {
         position[1] as f32 + 0.5 - pivot_offset[1],
         position[2] as f32 + 0.5 - pivot_offset[2],
     ]
-}
-
-/// A run of blocks still growing along x: (last column, first x, y range,
-/// mass so far).
-type Strip = ([i32; 2], i32, [i32; 2], f32);
-
-/// Turns finished strips into boxes in the body frame.
-fn emit_strips(strips: Vec<Strip>, pivot_offset: [f32; 3], boxes: &mut Vec<MaterialBox>) {
-    for ([z, last_x], first_x, [y0, y1], mass) in strips {
-        boxes.push((
-            [
-                (first_x + last_x + 1) as f32 / 2.0 - pivot_offset[0],
-                (y0 + y1 + 1) as f32 / 2.0 - pivot_offset[1],
-                z as f32 + 0.5 - pivot_offset[2],
-            ],
-            [
-                (last_x - first_x + 1) as f32 / 2.0,
-                (y1 - y0 + 1) as f32 / 2.0,
-                0.5,
-            ],
-            mass,
-        ));
-    }
-}
-
-/// Boxes covering every block: one per run of blocks stacked in a column,
-/// stretched along x while neighbouring columns stack the same way. Each
-/// box weighs exactly the blocks in it.
-fn collision_boxes(voxels: &[Voxel], pivot_offset: [f32; 3]) -> Vec<MaterialBox> {
-    let mut columns: BTreeMap<[i32; 2], Vec<(i32, f32)>> = BTreeMap::new();
-    for voxel in voxels {
-        let [x, y, z] = voxel.position;
-        columns.entry([z, x]).or_default().push((y, voxel.mass));
-    }
-
-    let mut boxes = Vec::new();
-    let mut strips: Vec<Strip> = Vec::new();
-    let mut previous: Option<[i32; 2]> = None;
-    for ([z, x], mut column) in columns {
-        if previous != Some([z, x - 1]) {
-            emit_strips(std::mem::take(&mut strips), pivot_offset, &mut boxes);
-        }
-        column.sort_unstable_by_key(|(y, _)| *y);
-        // Runs of consecutive blocks in this column: y range and mass.
-        let mut runs: Vec<([i32; 2], f32)> = Vec::new();
-        for (y, mass) in column {
-            match runs.last_mut() {
-                Some(run) if run.0[1] + 1 == y => {
-                    run.0[1] = y;
-                    run.1 += mass;
-                }
-                _ => runs.push(([y, y], mass)),
-            }
-        }
-        let mut reached = Vec::new();
-        for (column, first_x, range, mass) in std::mem::take(&mut strips) {
-            if let Some(index) = runs.iter().position(|(candidate, _)| *candidate == range) {
-                reached.push(([z, x], first_x, range, mass + runs[index].1));
-                runs.swap_remove(index);
-            } else {
-                emit_strips(
-                    vec![(column, first_x, range, mass)],
-                    pivot_offset,
-                    &mut boxes,
-                );
-            }
-        }
-        for (range, mass) in runs {
-            reached.push(([z, x], x, range, mass));
-        }
-        strips = reached;
-        previous = Some([z, x]);
-    }
-    emit_strips(strips, pivot_offset, &mut boxes);
-    boxes
 }
 
 /// A balloon in the making: the empty cells its gas fills and what heats it.
@@ -478,16 +417,17 @@ fn balloons(voxels: &[Voxel], pivot_offset: [f32; 3]) -> Vec<Balloon> {
         .collect()
 }
 
-/// One tick of lift, thrust and air resistance on a sub-level's body.
-pub fn apply_aero(body: &mut RigidBody, analysed: &mut Analysed, throttle: f32, air: Air, dt: f32) {
+/// One physics step of lift, thrust and air resistance on a sub-level's
+/// body, `dt` seconds long.
+pub fn apply_aero(body: &mut RigidBody, analysed: &Analysed, throttle: f32, air: Air, dt: f32) {
     let pressure = air.pressure(body.translation().y);
     let mut lift = 0.0;
-    for balloon in &mut analysed.balloons {
-        balloon.advance(dt);
+    for balloon in &analysed.balloons {
         lift += balloon.lift(pressure);
     }
+    let thrusting = throttle != 0.0 && analysed.thrusters.iter().any(|t| t.speed != 0.0);
     // A resting sub-level with nothing to gain from the air stays asleep.
-    if body.is_sleeping() && lift <= body.mass() && throttle == 0.0 {
+    if body.is_sleeping() && lift <= body.mass() && !thrusting {
         return;
     }
 
@@ -505,20 +445,24 @@ pub fn apply_aero(body: &mut RigidBody, analysed: &mut Analysed, throttle: f32, 
         }
     }
     for thruster in &analysed.thrusters {
-        if throttle == 0.0 {
-            break;
+        if throttle == 0.0 || thruster.speed == 0.0 {
+            continue;
         }
         let point = position.transform_point(&point_of(thruster.centre));
-        let direction = rotation.transform_vector(&vector_of(thruster.direction));
+        let facing = rotation.transform_vector(&vector_of(thruster.direction));
+        // A negative rpm is a reversed propeller: it pushes the other way.
+        let along = facing * thruster.speed.signum();
+        let thrust = thruster.speed.abs() * THRUSTER_THRUST * throttle;
+        let airflow = thruster.speed.abs() * THRUSTER_AIRFLOW;
         // A propeller only accelerates air up to its airflow: past that
         // speed it pushes the sub-level nowhere.
-        let speed_along = body.velocity_at_point(&point).dot(&direction);
-        let remaining = ((THRUSTER_AIRFLOW - speed_along) / THRUSTER_AIRFLOW).clamp(0.0, 1.0);
-        body.apply_impulse_at_point(
-            direction * (THRUSTER_THRUST * throttle * pressure * remaining * dt),
-            point,
-            true,
-        );
+        let speed_along = body.velocity_at_point(&point).dot(&along);
+        let remaining = if airflow.abs() <= 0.001 {
+            1.0
+        } else {
+            ((airflow + speed_along) / airflow).clamp(0.0, 1.0)
+        };
+        body.apply_impulse_at_point(along * (thrust * pressure * remaining * dt), point, true);
     }
     let inverse_rotation = rotation.inverse();
     for surface in &analysed.surfaces {
@@ -530,7 +474,7 @@ pub fn apply_aero(body: &mut RigidBody, analysed: &mut Analysed, throttle: f32, 
         // Drag opposes the motion and lift follows the normal, both in step
         // with the speed of the air past the surface.
         let force = -(velocity * SURFACE_DRAG
-            + normal * (along * SURFACE_PARALLEL_DRAG + across * SURFACE_LIFT))
+            + normal * (along * surface.parallel_drag + across * surface.lift))
             * pressure
             * dt;
         body.apply_impulse_at_point(rotation.transform_vector(&force), point, true);
@@ -550,27 +494,15 @@ mod tests {
     use super::*;
 
     fn solid(x: i32, y: i32, z: i32) -> Voxel {
-        Voxel {
-            position: [x, y, z],
-            kind: VoxelKind::Solid,
-            mass: 1.0,
-        }
+        Voxel::cube([x, y, z], 1.0)
     }
 
     fn wool(x: i32, y: i32, z: i32) -> Voxel {
-        Voxel {
-            position: [x, y, z],
-            kind: VoxelKind::Envelope,
-            mass: 0.25,
-        }
+        Voxel::cube([x, y, z], 0.25).with_kind(VoxelKind::Envelope)
     }
 
     fn heater(x: i32, y: i32, z: i32, output: f32) -> Voxel {
-        Voxel {
-            position: [x, y, z],
-            kind: VoxelKind::Heater { output },
-            mass: 1.0,
-        }
+        Voxel::cube([x, y, z], 1.0).with_kind(VoxelKind::Heater { output })
     }
 
     fn shell(min: [i32; 3], max: [i32; 3]) -> Vec<Voxel> {
@@ -599,35 +531,6 @@ mod tests {
             voxels,
         }
         .analyse()
-    }
-
-    #[test]
-    fn boxes_merge_columns_that_stack_alike_and_keep_their_mass() {
-        // Two rows of three blocks: one box per row, centred on the body.
-        let mut voxels = Vec::new();
-        for x in -1..=1 {
-            for z in -1..=0 {
-                voxels.push(solid(x, 0, z));
-            }
-        }
-        assert_eq!(
-            collision_boxes(&voxels, [0.5; 3]),
-            vec![
-                ([0.0, 0.0, -1.0], [1.5, 0.5, 0.5], 3.0),
-                ([0.0, 0.0, 0.0], [1.5, 0.5, 0.5], 3.0)
-            ]
-        );
-
-        // Two stacked blocks in one column, one in the next: nothing merges,
-        // and a light block weighs less.
-        let boxes = collision_boxes(&[solid(0, 0, 0), wool(0, 1, 0), solid(1, 0, 0)], [0.5; 3]);
-        assert_eq!(
-            boxes,
-            vec![
-                ([0.0, 0.5, 0.0], [0.5, 1.0, 0.5], 1.25),
-                ([1.0, 0.0, 0.0], [0.5, 0.5, 0.5], 1.0)
-            ]
-        );
     }
 
     #[test]

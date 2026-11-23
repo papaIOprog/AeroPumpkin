@@ -282,6 +282,9 @@ pub struct World {
     /// Native sub-levels: rigid bodies carrying blocks and entities.
     /// Simulated sequentially on the tick thread, never on rayon.
     pub sublevels: std::sync::Mutex<sublevel::SubLevelManager>,
+    /// Whether any sub-level exists, refreshed each tick, so that block
+    /// sets can skip the manager while none do.
+    has_sublevels: std::sync::atomic::AtomicBool,
     /// End Dragon fight manager (only present in `THE_END` dimension).
     pub dragon_fight: Option<std::sync::Mutex<dragon_fight::DragonFight>>,
     pub spawn_state: ArcSwap<SpawnState>,
@@ -425,6 +428,7 @@ impl World {
             villager_poi: std::sync::Mutex::new(villager_poi::VillagerPoiStorage::default()),
             raids: std::sync::Mutex::new(raid::Raids::default()),
             sublevels: std::sync::Mutex::new(sublevel::SubLevelManager::with_air(sublevel_air)),
+            has_sublevels: std::sync::atomic::AtomicBool::new(false),
             dragon_fight,
             spawn_state: ArcSwap::new(Arc::new(SpawnState::empty())),
             active_chunks: RwLock::new(FxHashSet::default()),
@@ -5171,6 +5175,18 @@ impl World {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(*position, block_state_id);
+            }
+
+            // A sub-level's physics follows the blocks: an edit inside the
+            // plotyard rescans the sub-level, and any edit resamples the
+            // world around a body that has it as surroundings.
+            if sublevel::SubLevelManager::is_plot_chunk(
+                position.chunk_and_chunk_relative_position().0,
+            ) || self
+                .has_sublevels
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                self.note_sublevel_edit(position);
             }
 
             if flags.contains(BlockFlags::NOTIFY_NEIGHBORS) {
