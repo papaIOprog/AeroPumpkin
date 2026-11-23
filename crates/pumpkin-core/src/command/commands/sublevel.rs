@@ -1,4 +1,5 @@
 use crate::command::argument_builder::{ArgumentBuilder, argument, command, literal};
+use crate::command::argument_types::core::float::FloatArgumentType;
 use crate::command::argument_types::core::integer::IntegerArgumentType;
 use crate::command::context::command_context::CommandContext;
 use crate::command::node::dispatcher::CommandDispatcher;
@@ -240,6 +241,101 @@ impl CommandExecutor for RemoveExecutor {
     }
 }
 
+struct ThrottleExecutor;
+
+impl CommandExecutor for ThrottleExecutor {
+    fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
+        let id = u32::try_from(IntegerArgumentType::get(context, "id")?).unwrap_or(0);
+        let throttle = FloatArgumentType::get(context, "throttle")?;
+        let Some(world) = world_of(context) else {
+            context
+                .source
+                .send_error(TextComponent::text("No worlds are loaded"));
+            return Ok(0);
+        };
+
+        let set = world
+            .sublevels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_throttle(id, throttle);
+        if set {
+            context.source.send_feedback(
+                green(format!(
+                    "Throttled sub-level {id} to {}%",
+                    (throttle * 100.0) as u32
+                )),
+                true,
+            );
+            Ok(1)
+        } else {
+            context
+                .source
+                .send_error(TextComponent::text(format!("No sub-level {id}")));
+            Ok(0)
+        }
+    }
+}
+
+struct InfoExecutor;
+
+impl CommandExecutor for InfoExecutor {
+    fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
+        let id = u32::try_from(IntegerArgumentType::get(context, "id")?).unwrap_or(0);
+        let Some(world) = world_of(context) else {
+            context
+                .source
+                .send_error(TextComponent::text("No worlds are loaded"));
+            return Ok(0);
+        };
+
+        let Some(info) = world
+            .sublevels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .aero_info(id)
+        else {
+            context
+                .source
+                .send_error(TextComponent::text(format!("No assembled sub-level {id}")));
+            return Ok(0);
+        };
+        context.source.send_feedback(
+            green(format!(
+                "Sub-level {id} weighs {:.1} and {}; throttle {}%",
+                info.mass,
+                if info.active {
+                    "flies"
+                } else {
+                    "waits for its ground"
+                },
+                (info.throttle * 100.0) as u32
+            )),
+            false,
+        );
+        for (index, balloon) in info.balloons.iter().enumerate() {
+            context.source.send_feedback(
+                green(format!(
+                    "  Balloon {}: {:.0}/{:.0} m³ of lifting gas, lifts {:.1}",
+                    index + 1,
+                    balloon.fill,
+                    balloon.capacity,
+                    balloon.lift
+                )),
+                false,
+            );
+        }
+        context.source.send_feedback(
+            green(format!(
+                "  {} thruster(s), {} lift surface(s)",
+                info.thrusters, info.surfaces
+            )),
+            false,
+        );
+        Ok(1)
+    }
+}
+
 struct ListExecutor;
 
 impl CommandExecutor for ListExecutor {
@@ -327,6 +423,10 @@ pub fn register(dispatcher: &mut CommandDispatcher, registry: &PermissionRegistr
                 ),
             ),
         )))
+        .then(literal("throttle").then(id_argument().then(
+            argument("throttle", FloatArgumentType::new(0.0, 1.0)).executes(ThrottleExecutor),
+        )))
+        .then(literal("info").then(id_argument().executes(InfoExecutor)))
         .then(literal("stand").then(id_argument().executes(RiderExecutor)))
         .then(literal("remove").then(id_argument().executes(RemoveExecutor)))
         .then(literal("list").executes(ListExecutor));

@@ -377,6 +377,10 @@ impl World {
         let portal_poi = portal::PortalPoiStorage::new(level.level_folder.poi_folder.clone());
         let dragon_fight = (dimension.minecraft_name == Dimension::THE_END.minecraft_name)
             .then(|| std::sync::Mutex::new(dragon_fight::DragonFight::new()));
+        let sublevel_air = pumpkin_sublevel::Air::new(
+            generation_settings.sea_level,
+            dimension.min_y + dimension.height,
+        );
 
         let custom_data_path = level
             .level_folder
@@ -420,7 +424,7 @@ impl World {
             portal_poi: std::sync::Mutex::new(portal_poi),
             villager_poi: std::sync::Mutex::new(villager_poi::VillagerPoiStorage::default()),
             raids: std::sync::Mutex::new(raid::Raids::default()),
-            sublevels: std::sync::Mutex::new(sublevel::SubLevelManager::new()),
+            sublevels: std::sync::Mutex::new(sublevel::SubLevelManager::with_air(sublevel_air)),
             dragon_fight,
             spawn_state: ArcSwap::new(Arc::new(SpawnState::empty())),
             active_chunks: RwLock::new(FxHashSet::default()),
