@@ -27,13 +27,6 @@ use rapier3d::prelude::*;
 /// Seconds per world tick, the fixed step the simulation advances by.
 pub const TICK_DT: f32 = 1.0 / 20.0;
 
-/// Density of stone-like content, kg per block, for test platforms.
-const ROCK_DENSITY: f32 = 1500.0;
-
-/// Damping applied so test platforms drift to rest instead of sliding forever.
-const LINEAR_DAMPING: f32 = 0.5;
-const ANGULAR_DAMPING: f32 = 2.0;
-
 /// Ground is sampled this many blocks beyond a sub-level's footprint.
 const GROUND_MARGIN: i32 = 8;
 /// Coulomb friction between a sub-level and the ground.
@@ -196,10 +189,9 @@ impl SubLevelSystem {
         }
     }
 
-    /// Spawns a hovering dynamic body with a box collider of `half_extents`
-    /// blocks, centred on `position`. Content is treated as solid stone for
-    /// mass purposes until [`Self::set_content`] replaces it.
-    pub fn spawn(&mut self, position: [f32; 3], half_extents: [f32; 3]) -> u32 {
+    /// Spawns a massless dynamic body at `position`. It stays where it is
+    /// until [`Self::set_content`] gives it blocks to carry.
+    pub fn spawn(&mut self, position: [f32; 3]) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -207,23 +199,13 @@ impl SubLevelSystem {
         let body = RigidBodyBuilder::dynamic()
             .position(iso)
             .gravity_scale(0.0)
-            .linear_damping(LINEAR_DAMPING)
-            .angular_damping(ANGULAR_DAMPING)
             .build();
         let body_handle = self.bodies.insert(body);
-
-        let collider = ColliderBuilder::cuboid(half_extents[0], half_extents[1], half_extents[2])
-            .density(ROCK_DENSITY)
-            .collision_groups(CONTENT_GROUPS)
-            .build();
-        let collider_handle =
-            self.colliders
-                .insert_with_parent(collider, body_handle, &mut self.bodies);
 
         self.sublevels.push(SubLevel {
             id,
             body: body_handle,
-            colliders: vec![collider_handle],
+            colliders: Vec::new(),
             content: None,
             ground: None,
             ground_radius: 0,
@@ -679,7 +661,7 @@ mod tests {
         // The ground solver sizes its impulses with this same formula, so
         // it has to predict exactly what rapier does with an impulse.
         let mut system = SubLevelSystem::new(Air::default());
-        let id = system.spawn([0.0, 64.5, 0.0], [2.0, 0.5, 2.0]);
+        let id = system.spawn([0.0, 64.5, 0.0]);
         assert!(system.set_content(id, slab(4, 4)));
         let body = system.sublevels[0].body;
         let Some(body) = system.bodies.get_mut(body) else {
@@ -702,16 +684,17 @@ mod tests {
     #[test]
     fn stepping_moves_a_shoved_body() {
         let mut system = SubLevelSystem::new(Air::default());
-        let id = system.spawn([0.0, 64.0, 0.0], [8.0, 0.5, 8.0]);
+        let id = system.spawn([0.0, 64.0, 0.0]);
+        assert!(system.set_content(id, slab(4, 4)));
         assert!(system.apply_velocity_change(id, [4.0, 0.0, 0.0]));
 
         let snapshots = system.step();
         assert_eq!(snapshots.len(), 1);
-        // 4 blocks/s for one 50 ms tick.
+        // 4 blocks/s for one 50 ms tick; with no ground yet there is no
+        // drag, so the shove carries over whole.
         assert_close(snapshots[0].position[0], 0.2);
         assert_close(snapshots[0].position[1], 64.0);
-        // Linear damping shaves a little off the first step.
-        assert!(snapshots[0].linear_velocity[0] > 3.5);
+        assert_close(snapshots[0].linear_velocity[0], 4.0);
     }
 
     #[test]
@@ -719,8 +702,10 @@ mod tests {
         let mut system = SubLevelSystem::new(Air::default());
         // Two regions assembled from the same spot: without collision
         // groups, contact resolution pushes both half a block apart.
-        let _first = system.spawn([-39.5, 150.5, -39.5], [0.5, 0.5, 0.5]);
-        let _second = system.spawn([-39.5, 150.5, -39.5], [0.5, 0.5, 0.5]);
+        let first = system.spawn([-39.5, 150.5, -39.5]);
+        let second = system.spawn([-39.5, 150.5, -39.5]);
+        assert!(system.set_content(first, slab(1, 1)));
+        assert!(system.set_content(second, slab(1, 1)));
 
         for _ in 0..40 {
             let snapshots = system.step();
@@ -735,7 +720,7 @@ mod tests {
     #[test]
     fn removing_a_body_retires_its_id() {
         let mut system = SubLevelSystem::new(Air::default());
-        let id = system.spawn([0.0, 64.0, 0.0], [4.0, 0.5, 4.0]);
+        let id = system.spawn([0.0, 64.0, 0.0]);
         assert!(system.remove(id));
 
         assert!(system.snapshots().is_empty());
@@ -746,7 +731,7 @@ mod tests {
     #[test]
     fn content_weighs_its_blocks_and_hovers_until_grounded() -> Result<(), &'static str> {
         let mut system = SubLevelSystem::new(Air::default());
-        let id = system.spawn([0.0, 100.0, 0.0], [8.0, 0.5, 8.0]);
+        let id = system.spawn([0.0, 100.0, 0.0]);
         assert!(system.set_content(id, slab(4, 6)));
         let info = system.aero_info(id).ok_or("content set")?;
         assert_close(info.mass, 24.0);
@@ -762,7 +747,7 @@ mod tests {
     fn content_rests_on_the_ground() -> Result<(), &'static str> {
         let mut system = SubLevelSystem::new(Air::default());
         // A 4x4 slab centred at y = 64.5 has its underside at 64.
-        let id = system.spawn([10.3, 64.5, -7.2], [2.0, 0.5, 2.0]);
+        let id = system.spawn([10.3, 64.5, -7.2]);
         land_on(&mut system, id, slab(4, 4), 64.0);
         assert!(system.aero_info(id).ok_or("content set")?.active);
 
@@ -779,7 +764,7 @@ mod tests {
     #[test]
     fn content_falls_until_it_meets_the_ground() {
         let mut system = SubLevelSystem::new(Air::default());
-        let id = system.spawn([0.0, 80.5, 0.0], [2.0, 0.5, 2.0]);
+        let id = system.spawn([0.0, 80.5, 0.0]);
         land_on(&mut system, id, slab(4, 4), 64.0);
 
         let mut lowest = f32::MAX;
@@ -800,7 +785,7 @@ mod tests {
         let mut system = SubLevelSystem::new(Air::default());
         // A long slab dropped across a one block step: the low side lands
         // first and the body settles tilted towards it.
-        let id = system.spawn([0.0, 70.5, 0.0], [6.0, 0.5, 1.0]);
+        let id = system.spawn([0.0, 70.5, 0.0]);
         assert!(system.set_content(id, slab(12, 2)));
         let (_, request) = system.take_ground_requests()[0];
         let side = (request.radius * 2 + 1) as usize;
@@ -851,7 +836,7 @@ mod tests {
                 }
             }
         }
-        let id = system.spawn([-16.0, 208.5, -271.0], [4.5; 3]);
+        let id = system.spawn([-16.0, 208.5, -271.0]);
         land_on(
             &mut system,
             id,
@@ -877,7 +862,7 @@ mod tests {
         let mut system = SubLevelSystem::new(Air::default());
         // Ground far below, so the body keeps the shove instead of braking
         // on it.
-        let id = system.spawn([0.0, 200.5, 0.0], [2.0, 0.5, 2.0]);
+        let id = system.spawn([0.0, 200.5, 0.0]);
         land_on(&mut system, id, slab(4, 4), 64.0);
         assert!(system.take_ground_requests().is_empty());
 
@@ -897,7 +882,7 @@ mod tests {
     #[test]
     fn stale_ground_is_refused() {
         let mut system = SubLevelSystem::new(Air::default());
-        let id = system.spawn([0.0, 64.5, 0.0], [2.0, 0.5, 2.0]);
+        let id = system.spawn([0.0, 64.5, 0.0]);
         assert!(system.set_content(id, slab(4, 4)));
         let requests = system.take_ground_requests();
         let (_, request) = requests[0];
@@ -917,7 +902,7 @@ mod tests {
         // hot air lift 39 at full heat, so a weak heater leaves it on the
         // ground and a proper one takes off.
         let mut system = SubLevelSystem::new(Air::default());
-        let id = system.spawn([0.0, 66.5, 0.0], [2.5; 3]);
+        let id = system.spawn([0.0, 66.5, 0.0]);
         land_on(&mut system, id, balloon(10.0), 64.0);
         for _ in 0..400 {
             system.step();
@@ -932,7 +917,7 @@ mod tests {
         );
         assert_close(system.snapshots()[0].position[1], 66.5);
 
-        let id = system.spawn([0.0, 66.5, 0.0], [2.5; 3]);
+        let id = system.spawn([0.0, 66.5, 0.0]);
         land_on(&mut system, id, balloon(26.0), 64.0);
         let mut rising = false;
         for _ in 0..400 {
@@ -960,7 +945,7 @@ mod tests {
                 direction: [1.0, 0.0, 0.0],
             };
         }
-        let id = system.spawn([0.0, 64.5, 0.0], [2.0, 0.5, 2.0]);
+        let id = system.spawn([0.0, 64.5, 0.0]);
         land_on(&mut system, id, content, 64.0);
 
         // Nothing happens without throttle.
@@ -995,7 +980,7 @@ mod tests {
         content.voxels[0].kind = VoxelKind::Thruster {
             direction: [1.0, 0.0, 0.0],
         };
-        let id = system.spawn([0.0, 64.5, 0.0], [4.0, 0.5, 4.0]);
+        let id = system.spawn([0.0, 64.5, 0.0]);
         land_on(&mut system, id, content, 64.0);
         assert!(system.set_throttle(id, 1.0));
         for _ in 0..10 {

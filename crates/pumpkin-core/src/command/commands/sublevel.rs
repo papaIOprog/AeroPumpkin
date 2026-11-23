@@ -64,11 +64,7 @@ impl CommandExecutor for SpawnExecutor {
         };
 
         let center = command_center(context, &world);
-        // Widths are bounded by the argument range; i16 keeps the conversion exact.
-        let half =
-            f32::from(i16::try_from(width).unwrap_or(i16::try_from(DEFAULT_WIDTH).unwrap_or(16)))
-                / 2.0;
-        let id = world.spawn_sublevel(center, [half, 0.5, half]);
+        let id = world.spawn_sublevel(center, width);
         context.source.send_feedback(
             green(format!(
                 "Sub-level {id} spawned at ({:.1}, {:.1}, {:.1}); its plot chunk is generating",

@@ -1,14 +1,12 @@
 //! Server-side sub-levels: plots of real chunks parked at remote coordinates,
 //! placed in the world by a physics body.
 //!
-//! The model and the wire protocol follow Sable so that the real Sable client
-//! mod renders Pumpkin's sub-levels: a sub-level's content is a set of ordinary
+//! The model and the wire protocol follow Sable so that the Sable client mod
+//! renders Pumpkin's sub-levels: a sub-level's content is a set of ordinary
 //! chunks at a "plot" coordinate, streamed with vanilla chunk packets, and only
 //! the pose travels over custom payloads. Entities keep their parked
-//! coordinates; Sable clients relocate anything inside a tracked plot.
-//!
-//! Clients without Sable get the lightweight `pumpkin:sublevel` debug channel
-//! (a wireframe box) that the Pumpkin Sublevels mod renders.
+//! coordinates; Sable clients relocate anything inside a tracked plot. Sable
+//! is the only client the sub-level system supports.
 //!
 //! Everything here runs sequentially on the world tick thread; the physics
 //! step never touches rayon (see `pumpkin-sublevel`).
@@ -19,7 +17,7 @@ pub mod sable;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::{BufMut, Bytes};
+use bytes::Bytes;
 use pumpkin_nbt::compound::NbtCompound;
 use pumpkin_protocol::codec::var_int::VarInt;
 use pumpkin_protocol::java::client::play::{CBundleDelimiter, CCustomPayload};
@@ -64,15 +62,6 @@ pub const PLOT_ORIGIN_Y: i32 = 128;
 /// unsynced.
 const PLOT_CHUNK_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Custom payload channel for the lightweight debug protocol.
-pub const DEBUG_CHANNEL: &str = "pumpkin:sublevel";
-
-const DEBUG_MSG_CREATE: u8 = 1;
-const DEBUG_MSG_TRANSFORM: u8 = 2;
-const DEBUG_MSG_REMOVE: u8 = 3;
-const DEBUG_REFRESH_TICKS: u64 = 100;
-const DEBUG_TRANSFORM_TICKS: u64 = 2;
-
 /// Sable sends one snapshot bundle per server tick; this is the nominal gap.
 const TICK_MS: i32 = 50;
 
@@ -92,7 +81,6 @@ struct SubLevel {
     from_anchor: Vector3<f64>,
     /// Plot-local block bounds of the content, inclusive.
     bounds: [i32; 6],
-    half_extents: [f32; 3],
     /// Set once the parked chunks hold the content and can be sent.
     ready: bool,
     last_pose: sable::Pose,
@@ -163,7 +151,6 @@ pub struct SubLevelManager {
     last_send: Option<Instant>,
     /// Players still receiving per-tick snapshot info.
     updating: FxHashSet<Uuid>,
-    debug_tick: u64,
 }
 
 impl Default for SubLevelManager {
@@ -189,15 +176,15 @@ impl SubLevelManager {
             tick: 0,
             last_send: None,
             updating: FxHashSet::default(),
-            debug_tick: 0,
         }
     }
 
-    /// Allocates a plot and a body at `pose`, the plot origin's world
-    /// position. The content chunk is prepared asynchronously by
+    /// Allocates a plot and a body for a `width` by `width` stone slab whose
+    /// top face sits at `pose`, the plot origin's world position. The slab is
+    /// laid into the parked chunk asynchronously by
     /// [`World::prepare_sublevel_chunk`]; until then the sub-level is not
     /// networked. Returns the new id and the parked chunk.
-    pub fn spawn(&mut self, pose: Vector3<f64>, half_extents: [f32; 3]) -> (u32, Vector2<i32>) {
+    pub fn spawn(&mut self, pose: Vector3<f64>, width: i32) -> (u32, Vector2<i32>) {
         let plot = self.first_free_plot();
         let corner = Vector2::new(
             (PLOTYARD_ORIGIN + plot.x) << PLOT_LOG_SIZE,
@@ -209,30 +196,29 @@ impl SubLevelManager {
         );
 
         let pose_f32 = pose.to_f32_lossy();
-        let id = self
-            .physics
-            .spawn([pose_f32.x, pose_f32.y, pose_f32.z], half_extents);
-        // The platform always fills its chunk's middle 16x16 with its top
-        // face at the plot origin. Bounds are absolute parked-world block
+        let id = self.physics.spawn([pose_f32.x, pose_f32.y, pose_f32.z]);
+        // The slab is centred on the plot centre block with its top face at
+        // the plot origin. Bounds are absolute parked-world block
         // coordinates, tight to the content and inclusive, as in Sable: the
         // client sizes its render sections and collision box from them.
+        let pivot = plot_center_block(center);
+        let half = width / 2;
         self.levels.push(SubLevel {
             id,
             uuid: Uuid::new_v4(),
             plot,
             chunk: center,
             chunks: vec![center],
-            pivot: plot_center_block(center).to_f64(),
+            pivot: pivot.to_f64(),
             from_anchor: Vector3::new(0.0, 0.0, 0.0),
             bounds: [
-                center.x * 16,
+                pivot.x - half,
                 PLOT_ORIGIN_Y - 1,
-                center.y * 16,
-                center.x * 16 + 15,
+                pivot.z - half,
+                pivot.x - half + width - 1,
                 PLOT_ORIGIN_Y - 1,
-                center.y * 16 + 15,
+                pivot.z - half + width - 1,
             ],
-            half_extents,
             ready: false,
             last_pose: sable::Pose::default(),
             networked_pose: sable::Pose::default(),
@@ -268,15 +254,8 @@ impl SubLevelManager {
         let parked = parked_bounds(plot_center_block(center), &bounds);
         // The pose rotates about the parked point the body sits on.
         let pivot = plot_center_block(center).to_f64() + pivot_offset;
-        let half_extents = [
-            (bounds[3] - bounds[0] + 1) as f32 / 2.0,
-            (bounds[4] - bounds[1] + 1) as f32 / 2.0,
-            (bounds[5] - bounds[2] + 1) as f32 / 2.0,
-        ];
         let pose_f32 = pose.to_f32_lossy();
-        let id = self
-            .physics
-            .spawn([pose_f32.x, pose_f32.y, pose_f32.z], half_extents);
+        let id = self.physics.spawn([pose_f32.x, pose_f32.y, pose_f32.z]);
         self.levels.push(SubLevel {
             id,
             uuid: Uuid::new_v4(),
@@ -286,7 +265,6 @@ impl SubLevelManager {
             pivot,
             from_anchor: pivot_offset,
             bounds: parked,
-            half_extents,
             ready: false,
             last_pose: sable::Pose::default(),
             networked_pose: sable::Pose::default(),
@@ -529,26 +507,10 @@ impl SubLevelManager {
             .collect()
     }
 
-    /// Bodies with their half extents, for the debug channel.
-    #[must_use]
-    pub fn debug_snapshots(&self) -> Vec<(BodySnapshot, [f32; 3])> {
-        self.physics
-            .snapshots()
-            .into_iter()
-            .filter_map(|body| {
-                self.levels
-                    .iter()
-                    .find(|level| level.id == body.id)
-                    .map(|level| (body, level.half_extents))
-            })
-            .collect()
-    }
-
     /// Steps the simulation and syncs every client. Runs from the world tick,
     /// before the entity tracker. Terrain that has gone missing under a body
-    /// is sampled by [`World::load_sublevel_ground`]. Returns the payloads
-    /// for the debug channel.
-    pub fn tick(&mut self, world: &Arc<World>) -> Vec<Vec<u8>> {
+    /// is sampled by [`World::load_sublevel_ground`].
+    pub fn tick(&mut self, world: &Arc<World>) {
         let requests = self.physics.take_ground_requests();
         for (id, request) in requests {
             let world = Arc::clone(world);
@@ -561,7 +523,6 @@ impl SubLevelManager {
         let players: Vec<Arc<Player>> = world.players.load().to_vec();
         self.update_tracking(world, &bodies, &players);
         self.send_movement(&bodies, &players, ms_since_last);
-        self.debug_messages()
     }
 
     fn note_send_time(&mut self) -> i32 {
@@ -599,9 +560,6 @@ impl SubLevelManager {
                 continue;
             }
             for player in players {
-                if !is_sable_client(player) {
-                    continue;
-                }
                 let uuid = player.gameprofile.id;
                 let within = within_range(player, &pose.position);
                 if within && !level.tracking.contains(&uuid) {
@@ -736,27 +694,6 @@ impl SubLevelManager {
         }
         self.remove(id)
     }
-
-    /// Wireframe payloads for the Pumpkin Sublevels mod: a full refresh
-    /// every few seconds so late joiners converge, transforms at 10 Hz.
-    fn debug_messages(&mut self) -> Vec<Vec<u8>> {
-        self.debug_tick += 1;
-        let refresh = self.debug_tick.is_multiple_of(DEBUG_REFRESH_TICKS);
-        let transforms = self.debug_tick.is_multiple_of(DEBUG_TRANSFORM_TICKS);
-        if !refresh && !transforms {
-            return Vec::new();
-        }
-        self.debug_snapshots()
-            .into_iter()
-            .map(|(body, half_extents)| {
-                if refresh {
-                    encode_debug_create(&body, half_extents)
-                } else {
-                    encode_debug_transform(&body)
-                }
-            })
-            .collect()
-    }
 }
 
 thread_local! {
@@ -844,13 +781,6 @@ fn content_chunks(bounds: &[i32; 6]) -> Vec<Vector2<i32>> {
     x_chunks
         .flat_map(|x| z_chunks.clone().map(move |z| Vector2::new(x, z)))
         .collect()
-}
-
-fn is_sable_client(player: &Player) -> bool {
-    player
-        .client
-        .java()
-        .is_some_and(|java| java.has_mod_channel(sable::DETECT_CHANNEL))
 }
 
 fn within_range(player: &Player, position: &[f64; 3]) -> bool {
@@ -971,48 +901,6 @@ fn rotate(quaternion: [f32; 4], vector: Vector3<f64>) -> Vector3<f64> {
     vector.add(&(twice * w)).add(&axis.cross(&twice))
 }
 
-fn encode_debug_create(body: &BodySnapshot, half_extents: [f32; 3]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(57);
-    buf.put_u8(DEBUG_MSG_CREATE);
-    buf.put_u32_le(body.id);
-    put_vec3(&mut buf, &body.position);
-    put_quat(&mut buf, &body.rotation);
-    put_vec3(&mut buf, &half_extents);
-    put_vec3(&mut buf, &body.linear_velocity);
-    buf
-}
-
-fn encode_debug_transform(body: &BodySnapshot) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(45);
-    buf.put_u8(DEBUG_MSG_TRANSFORM);
-    buf.put_u32_le(body.id);
-    put_vec3(&mut buf, &body.position);
-    put_quat(&mut buf, &body.rotation);
-    put_vec3(&mut buf, &body.linear_velocity);
-    buf
-}
-
-/// Tells debug-channel clients a sub-level is gone.
-#[must_use]
-pub fn encode_debug_remove(id: u32) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(5);
-    buf.put_u8(DEBUG_MSG_REMOVE);
-    buf.put_u32_le(id);
-    buf
-}
-
-fn put_vec3(buf: &mut Vec<u8>, values: &[f32; 3]) {
-    for value in values {
-        buf.put_f32_le(*value);
-    }
-}
-
-fn put_quat(buf: &mut Vec<u8>, values: &[f32; 4]) {
-    for value in values {
-        buf.put_f32_le(*value);
-    }
-}
-
 impl World {
     fn lock_sublevels(&self) -> std::sync::MutexGuard<'_, SubLevelManager> {
         self.sublevels
@@ -1020,71 +908,75 @@ impl World {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Spawns a sub-level whose plot origin sits at `pose`, and starts
-    /// preparing its parked chunk. Returns the sub-level id.
-    pub fn spawn_sublevel(self: &Arc<Self>, pose: Vector3<f64>, half_extents: [f32; 3]) -> u32 {
-        let (id, _) = self.lock_sublevels().spawn(pose, half_extents);
+    /// Spawns a stone slab sub-level, `width` blocks on a side and one block
+    /// thick, whose top face sits at `pose`, and starts preparing its parked
+    /// chunk. Returns the sub-level id.
+    pub fn spawn_sublevel(self: &Arc<Self>, pose: Vector3<f64>, width: i32) -> u32 {
+        let (id, _) = self.lock_sublevels().spawn(pose, width);
         let world = Arc::clone(self);
-        tokio::spawn(async move { world.prepare_sublevel_chunk(id).await });
+        tokio::spawn(async move { world.prepare_sublevel_chunk(id, width).await });
         id
     }
 
-    /// Loads the parked chunk of a sub-level and lays a stone platform in it
-    /// with its top face at the plot origin, so the pose places it exactly.
-    pub async fn prepare_sublevel_chunk(self: Arc<Self>, id: u32) {
-        let Some(chunk) = self.lock_sublevels().chunk_of(id) else {
-            return;
+    /// Loads the parked chunk of a slab sub-level, lays the stone in it with
+    /// its top face at the plot origin, so the pose places it exactly, and
+    /// hands the slab to the physics as its content.
+    pub async fn prepare_sublevel_chunk(self: Arc<Self>, id: u32, width: i32) {
+        let (chunk, pivot) = {
+            let manager = self.lock_sublevels();
+            let Some(chunk) = manager.chunk_of(id) else {
+                return;
+            };
+            let Some(pivot) = manager.pivot_of(id) else {
+                return;
+            };
+            (chunk, pivot)
         };
         if !self.await_plot_chunks(&[chunk]).await {
             return;
         }
 
-        let platform_y = PLOT_ORIGIN_Y - 1;
-        for dx in 0..16 {
-            for dz in 0..16 {
-                let pos = BlockPos(Vector3::new(
-                    chunk.x * 16 + dx,
-                    platform_y,
-                    chunk.y * 16 + dz,
-                ));
-                self.set_block_state(&pos, Block::STONE.default_state.id, BlockFlags::NOTIFY_ALL);
+        let slab_y = PLOT_ORIGIN_Y - 1;
+        let half = width / 2;
+        let stone = Block::STONE.default_state.id;
+        let flags = BlockFlags::NOTIFY_ALL;
+        let mut voxels = Vec::with_capacity((width * width) as usize);
+        for dx in 0..width {
+            for dz in 0..width {
+                let x = pivot.x as i32 - half + dx;
+                let z = pivot.z as i32 - half + dz;
+                let pos = BlockPos(Vector3::new(x, slab_y, z));
+                self.set_block_state(&pos, stone, flags);
+                voxels.push(Voxel {
+                    position: [x - pivot.x as i32, -1, z - pivot.z as i32],
+                    kind: aero::voxel_kind(&Block::STONE, Block::STONE.default_state),
+                    mass: aero::block_mass(&Block::STONE, Block::STONE.default_state),
+                });
             }
         }
-        self.lock_sublevels().mark_ready(id);
+        let mut manager = self.lock_sublevels();
+        manager.set_content(
+            id,
+            Content {
+                pivot_offset: [0.0; 3],
+                voxels,
+            },
+        );
+        manager.mark_ready(id);
         info!(
             "sublevel {id} ready at plot chunk ({}, {})",
             chunk.x, chunk.y
         );
     }
 
-    /// Steps sub-levels and broadcasts the debug channel.
+    /// Steps sub-levels and syncs every client.
     pub fn tick_sublevels(self: &Arc<Self>) {
-        let debug = self.lock_sublevels().tick(self);
-        if debug.is_empty() {
-            return;
-        }
-        // Sable clients get the wireframe too: it shows the physics body
-        // next to the rendered blocks, which makes alignment bugs obvious.
-        for player in self.players.load().iter() {
-            for data in &debug {
-                send_payload(player, DEBUG_CHANNEL, data);
-            }
-        }
+        self.lock_sublevels().tick(self);
     }
 
     /// Removes a sub-level, telling every client that tracked it.
     pub fn remove_sublevel(&self, id: u32) -> bool {
-        let removed = self.lock_sublevels().remove_and_notify(self, id);
-        if removed {
-            let message = encode_debug_remove(id);
-            for player in self.players.load().iter() {
-                if is_sable_client(player) {
-                    continue;
-                }
-                send_payload(player, DEBUG_CHANNEL, &message);
-            }
-        }
-        removed
+        self.lock_sublevels().remove_and_notify(self, id)
     }
 
     /// Places an armor stand on a sub-level's platform. It keeps its parked
@@ -1524,9 +1416,6 @@ impl World {
         let Some(chunks) = manager.chunks_of(id) else {
             return Err(format!("No sub-level {id}"));
         };
-        let Some(center_chunk) = manager.chunk_of(id) else {
-            return Err(format!("No sub-level {id}"));
-        };
         drop(manager);
         // Blocks cannot be written back rotated; wait for the sub-level to
         // come level again.
@@ -1695,8 +1584,8 @@ mod tests {
     #[test]
     fn plots_are_parked_inside_the_plotyard() {
         let mut manager = SubLevelManager::new();
-        let (first, first_chunk) = manager.spawn(Vector3::new(0.0, 64.0, 0.0), [8.0, 0.5, 8.0]);
-        let (second, second_chunk) = manager.spawn(Vector3::new(0.0, 64.0, 0.0), [8.0, 0.5, 8.0]);
+        let (first, first_chunk) = manager.spawn(Vector3::new(0.0, 64.0, 0.0), 16);
+        let (second, second_chunk) = manager.spawn(Vector3::new(0.0, 64.0, 0.0), 16);
         assert_ne!(first, second);
 
         // The first plot's centre chunk sits 64 chunks into the plotyard.
@@ -1721,7 +1610,7 @@ mod tests {
         );
 
         assert!(manager.remove(first));
-        let (third, _) = manager.spawn(Vector3::new(0.0, 64.0, 0.0), [8.0, 0.5, 8.0]);
+        let (third, _) = manager.spawn(Vector3::new(0.0, 64.0, 0.0), 16);
         assert_eq!(third, first + 2);
     }
 
@@ -1843,31 +1732,9 @@ mod tests {
     }
 
     #[test]
-    fn debug_layouts_match_the_client_mod() {
-        let body = BodySnapshot {
-            id: 7,
-            position: [1.0, 64.0, -2.0],
-            rotation: [0.0, 0.0, 0.0, 1.0],
-            linear_velocity: [0.5, 0.0, 0.0],
-            angular_velocity: [0.0; 3],
-        };
-        let create = encode_debug_create(&body, [8.0, 0.5, 8.0]);
-        assert_eq!(create.len(), 57);
-        assert_eq!(create[0], DEBUG_MSG_CREATE);
-        assert_eq!(&create[1..5], &[7, 0, 0, 0]);
-        assert_eq!(&create[5..9], &1.0f32.to_le_bytes());
-
-        let transform = encode_debug_transform(&body);
-        assert_eq!(transform.len(), 45);
-        assert_eq!(transform[0], DEBUG_MSG_TRANSFORM);
-
-        assert_eq!(encode_debug_remove(9), [DEBUG_MSG_REMOVE, 9, 0, 0, 0]);
-    }
-
-    #[test]
     fn parked_positions_follow_a_turned_pose() {
         let mut manager = SubLevelManager::new();
-        let (id, chunk) = manager.spawn(Vector3::new(0.0, 64.0, 0.0), [8.0, 0.5, 8.0]);
+        let (id, chunk) = manager.spawn(Vector3::new(0.0, 64.0, 0.0), 16);
         let pivot = manager.pivot_of(id).expect("pivot of a spawned sub-level");
         // Turned a quarter turn around the pivot, which now sits elsewhere.
         let half = std::f32::consts::FRAC_1_SQRT_2;
@@ -1894,8 +1761,8 @@ mod tests {
     #[test]
     fn parked_entities_are_visible_only_to_trackers() {
         let mut manager = SubLevelManager::new();
-        let (id, chunk) = manager.spawn(Vector3::new(0.0, 64.0, 0.0), [8.0, 0.5, 8.0]);
-        let (other, other_chunk) = manager.spawn(Vector3::new(0.0, 64.0, 0.0), [8.0, 0.5, 8.0]);
+        let (id, chunk) = manager.spawn(Vector3::new(0.0, 64.0, 0.0), 16);
+        let (other, other_chunk) = manager.spawn(Vector3::new(0.0, 64.0, 0.0), 16);
         let tracker = Uuid::from_u128(1);
         manager.mark_ready(id);
         manager.mark_ready(other);
