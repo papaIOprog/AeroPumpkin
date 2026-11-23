@@ -45,7 +45,7 @@ const GROUND_VS_CONTENT_FRICTION: f32 = 0.5125;
 /// Sable.
 pub const TICK_DT: f32 = 1.0 / 20.0;
 pub const SUBSTEPS: usize = 2;
-const SUBSTEP_DT: f32 = TICK_DT / SUBSTEPS as f32;
+pub const SUBSTEP_DT: f32 = TICK_DT / SUBSTEPS as f32;
 
 /// The world is collided this many blocks beyond a sub-level's own blocks,
 /// so a sub-level meets the terrain it is about to touch.
@@ -110,11 +110,17 @@ pub struct SurroundingsRequest {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Impact {
     pub sublevel: u32,
-    /// Contact point in the world.
+    /// Where the block met what it hit, in the world.
     pub point: [f32; 3],
-    /// How fast the sub-level's block was moving into what it hit, in
-    /// blocks per second.
+    /// How fast the block and what it hit were closing on each other, in
+    /// blocks per second, when the substep began.
     pub speed: f32,
+    /// The whole contact's impulse over the substep, in block masses times
+    /// blocks per second, and the masses of the two bodies that met (the
+    /// world's is infinite): a knock hard for its mass sounds.
+    pub impulse: f32,
+    pub mass: f32,
+    pub other_mass: f32,
     /// The sub-level's block that hit, in its grid coordinates.
     pub block: [i32; 3],
     /// What it hit.
@@ -211,6 +217,8 @@ struct RecordedManifold {
     normal: [f32; 3],
     /// The two bodies' linear and angular velocities before the substep.
     velocities: [(Vector<f32>, Vector<f32>); 2],
+    /// The whole manifold's impulse over the substep.
+    impulse: f32,
 }
 
 impl EventHandler for ImpactCollector {
@@ -245,10 +253,14 @@ impl EventHandler for ImpactCollector {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for manifold in &contact_pair.manifolds {
+            let mut impulse = 0.0;
             let points = manifold
                 .contacts()
                 .iter()
-                .filter(|contact| contact.data.impulse > 0.0)
+                .filter(|contact| {
+                    impulse += contact.data.impulse;
+                    contact.data.impulse > 0.0
+                })
                 .map(|contact| {
                     let point = first.position() * contact.local_p1;
                     [point.x, point.y, point.z]
@@ -270,6 +282,7 @@ impl EventHandler for ImpactCollector {
                     entering(manifold.data.rigid_body1),
                     entering(manifold.data.rigid_body2),
                 ],
+                impulse,
             });
         }
     }
@@ -818,6 +831,10 @@ impl SubLevelSystem {
             .filter(|handle| *handle != sublevel.body)
             .and_then(|handle| self.bodies.get(handle))
             .map(|other| (other.center_of_mass(), manifold.velocities[1 - side]));
+        let other_mass = other_body
+            .and_then(|handle| self.bodies.get(handle))
+            .map_or(f32::INFINITY, RigidBody::mass);
+        let mass = body.mass();
         let Some(patch) = contact_patch(
             boxed,
             body.position(),
@@ -878,6 +895,9 @@ impl SubLevelSystem {
                     sublevel: sublevel.id,
                     point: [point.x, point.y, point.z],
                     speed,
+                    impulse: manifold.impulse,
+                    mass,
+                    other_mass,
                     block,
                     target,
                 });
@@ -1278,13 +1298,14 @@ mod tests {
     }
 
     #[test]
-    fn content_falls_until_it_meets_the_ground() {
+    fn content_falls_until_it_meets_the_ground() -> Result<(), &'static str> {
         let mut system = SubLevelSystem::new(Air::default());
         let id = system.spawn([0.0, 80.5, 0.0]);
         land_on(&mut system, id, slab(4, 4), 64);
 
         let mut hardest = 0.0f32;
         let mut lowest = f32::MAX;
+        let mut landing_impacts = Vec::new();
         for _ in 0..200 {
             serve(&mut system, 64);
             let step = system.step();
@@ -1296,6 +1317,12 @@ mod tests {
                     .map(|impact| impact.speed)
                     .fold(0.0, f32::max),
             );
+            landing_impacts.extend(
+                step.impacts
+                    .iter()
+                    .filter(|impact| impact.speed > 10.0)
+                    .copied(),
+            );
         }
         let body = system.snapshots()[0];
         // Falls about 15 blocks, lands with its underside on the ground,
@@ -1305,6 +1332,12 @@ mod tests {
         assert!(body.linear_velocity[1].abs() < 0.05);
         // The landing is reported as an impact into a world block.
         assert!(hardest > 10.0, "hardest impact {hardest}");
+        // The landing comes with the momentum it transferred, the falling
+        // body's mass, and the world's infinite one.
+        let landing = landing_impacts.into_iter().next().ok_or("impact")?;
+        assert!(landing.impulse > 0.0 && landing.impulse / SUBSTEP_DT > 25.0 * landing.mass);
+        assert_eq!(landing.other_mass, f32::INFINITY);
+        Ok(())
     }
 
     #[test]

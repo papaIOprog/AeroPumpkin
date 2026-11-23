@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use pumpkin_nbt::compound::NbtCompound;
 use pumpkin_protocol::codec::var_int::VarInt;
-use pumpkin_protocol::java::client::play::{CBundleDelimiter, CCustomPayload};
+use pumpkin_protocol::java::client::play::{CBundleDelimiter, CCustomPayload, CParticle};
 use pumpkin_protocol::ser::NetworkWriteExt;
 use pumpkin_protocol::{ClientPacket, MultiVersionJavaPacket};
 use pumpkin_sublevel::{
@@ -34,18 +34,23 @@ use uuid::Uuid;
 
 use super::World;
 use super::block_entity_from_nbt;
+use crate::block::blocks::ice;
+use crate::block::blocks::redstone::bell::ring_bell;
 use crate::block::entities::BlockEntity;
 use crate::entity::EntityBase;
 use crate::entity::player::Player;
 use crate::entity::tnt::TNTEntity;
 use crate::net::java::JavaClient;
 use crate::net::java::chunk_data::CChunkData;
-use pumpkin_data::Block;
+use pumpkin_data::block_properties::{HorizontalFacing, blocks_movement};
 use pumpkin_data::entity::EntityType;
+use pumpkin_data::sound::{Sound, SoundCategory};
 use pumpkin_data::tag::{self, Taggable};
+use pumpkin_data::{Block, BlockDirection};
 use pumpkin_util::math::position::BlockPos;
 use pumpkin_world::chunk_system::ChunkLoading;
 use pumpkin_world::world::BlockFlags;
+use rand::RngExt;
 
 use crate::entity::r#type::from_type;
 
@@ -148,6 +153,120 @@ struct ParkedCopy {
     bounds: Option<[i32; 6]>,
 }
 
+/// The side a bell was hit from: the horizontal direction from its centre
+/// to the hit.
+fn hit_side(from_centre: Vector3<f64>) -> HorizontalFacing {
+    if from_centre.x.abs() > from_centre.z.abs() {
+        if from_centre.x > 0.0 {
+            HorizontalFacing::East
+        } else {
+            HorizontalFacing::West
+        }
+    } else if from_centre.z > 0.0 {
+        HorizontalFacing::South
+    } else {
+        HorizontalFacing::North
+    }
+}
+
+/// How a block family sounds. Vanilla gives every block one of its
+/// `SoundType`s in code; Pumpkin has no such table, so the families here
+/// come from the block's tags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SoundFamily {
+    Stone,
+    Wood,
+    Wool,
+    Sand,
+    Gravel,
+    Glass,
+    Grass,
+    Metal,
+    Slime,
+    Snow,
+}
+
+impl SoundFamily {
+    fn of(block: &Block) -> Self {
+        use tag::Block::{
+            C_GLASS_BLOCKS, C_GRAVELS, MINECRAFT_ANVIL, MINECRAFT_CONCRETE_POWDER, MINECRAFT_DIRT,
+            MINECRAFT_ICE, MINECRAFT_LEAVES, MINECRAFT_LOGS, MINECRAFT_PLANKS, MINECRAFT_RAILS,
+            MINECRAFT_SAND, MINECRAFT_SNOW, MINECRAFT_WOODEN_SLABS, MINECRAFT_WOODEN_STAIRS,
+            MINECRAFT_WOOL, MINECRAFT_WOOL_CARPETS,
+        };
+        if block.has_tag(&MINECRAFT_PLANKS)
+            || block.has_tag(&MINECRAFT_LOGS)
+            || block.has_tag(&MINECRAFT_WOODEN_SLABS)
+            || block.has_tag(&MINECRAFT_WOODEN_STAIRS)
+        {
+            Self::Wood
+        } else if block.has_tag(&MINECRAFT_WOOL) || block.has_tag(&MINECRAFT_WOOL_CARPETS) {
+            Self::Wool
+        } else if block.has_tag(&MINECRAFT_SAND) || block.has_tag(&MINECRAFT_CONCRETE_POWDER) {
+            Self::Sand
+        } else if block.has_tag(&MINECRAFT_SNOW) {
+            Self::Snow
+        } else if block.has_tag(&C_GRAVELS) || block.has_tag(&MINECRAFT_DIRT) {
+            Self::Gravel
+        } else if block.has_tag(&C_GLASS_BLOCKS) || block.has_tag(&MINECRAFT_ICE) {
+            Self::Glass
+        } else if block.has_tag(&MINECRAFT_LEAVES) || *block == Block::GRASS_BLOCK {
+            Self::Grass
+        } else if block.has_tag(&MINECRAFT_ANVIL) || block.has_tag(&MINECRAFT_RAILS) {
+            Self::Metal
+        } else if *block == Block::SLIME_BLOCK {
+            Self::Slime
+        } else {
+            Self::Stone
+        }
+    }
+
+    const fn step(self) -> Sound {
+        match self {
+            Self::Stone => Sound::BlockStoneStep,
+            Self::Wood => Sound::BlockWoodStep,
+            Self::Wool => Sound::BlockWoolStep,
+            Self::Sand => Sound::BlockSandStep,
+            Self::Gravel => Sound::BlockGravelStep,
+            Self::Glass => Sound::BlockGlassStep,
+            Self::Grass => Sound::BlockGrassStep,
+            Self::Metal => Sound::BlockMetalStep,
+            Self::Slime => Sound::BlockSlimeBlockStep,
+            Self::Snow => Sound::BlockSnowStep,
+        }
+    }
+
+    const fn hit(self) -> Sound {
+        match self {
+            Self::Stone => Sound::BlockStoneHit,
+            Self::Wood => Sound::BlockWoodHit,
+            Self::Wool => Sound::BlockWoolHit,
+            Self::Sand => Sound::BlockSandHit,
+            Self::Gravel => Sound::BlockGravelHit,
+            Self::Glass => Sound::BlockGlassHit,
+            Self::Grass => Sound::BlockGrassHit,
+            Self::Metal => Sound::BlockMetalHit,
+            Self::Slime => Sound::BlockSlimeBlockHit,
+            Self::Snow => Sound::BlockSnowHit,
+        }
+    }
+
+    const fn place(self) -> Sound {
+        match self {
+            Self::Stone => Sound::BlockStonePlace,
+            Self::Wood => Sound::BlockWoodPlace,
+            Self::Wool => Sound::BlockWoolPlace,
+            Self::Sand => Sound::BlockSandPlace,
+            Self::Gravel => Sound::BlockGravelPlace,
+            Self::Glass => Sound::BlockGlassPlace,
+            Self::Grass => Sound::BlockGrassPlace,
+            Self::Metal => Sound::BlockMetalPlace,
+            Self::Slime => Sound::BlockSlimeBlockPlace,
+            Self::Snow => Sound::BlockSnowPlace,
+        }
+    }
+}
+
 /// Whether a block's aerodynamic role depends on the redstone reaching it.
 fn needs_signal(block: &Block) -> bool {
     block.has_tag(&tag::Block::MINECRAFT_CAMPFIRES)
@@ -165,6 +284,8 @@ pub struct SubLevelManager {
     updating: FxHashSet<Uuid>,
     /// Sub-levels whose parked blocks changed since their last scan.
     dirty: FxHashSet<u32>,
+    /// Blocks of sub-levels that sounded on their last knock, and when.
+    recent_sounds: FxHashMap<(u32, [i32; 3]), i32>,
 }
 
 impl Default for SubLevelManager {
@@ -191,6 +312,7 @@ impl SubLevelManager {
             last_send: None,
             updating: FxHashSet::default(),
             dirty: FxHashSet::default(),
+            recent_sounds: FxHashMap::default(),
         }
     }
 
@@ -435,6 +557,16 @@ impl SubLevelManager {
 
     pub fn take_dirty(&mut self) -> Vec<u32> {
         self.dirty.drain().collect()
+    }
+
+    /// Whether sub-level `id`'s block `block` may sound its knock on tick
+    /// `tick`: not if it sounded within the last `quiet` ticks.
+    pub fn note_sound(&mut self, id: u32, block: [i32; 3], tick: i32, quiet: i32) -> bool {
+        self.recent_sounds
+            .retain(|_, sounded| tick - *sounded < quiet);
+        self.recent_sounds
+            .insert((id, block), tick)
+            .is_none_or(|sounded| tick - sounded >= quiet)
     }
 
     /// The body pose of sub-level `id`, for mapping content back to the world.
@@ -1320,7 +1452,8 @@ impl World {
     }
 
     /// Deals with what the sub-levels hit this tick: fragile blocks break,
-    /// TNT primes, and the sub-levels that lost blocks are read again.
+    /// TNT primes, bells ring, knocks hard for their mass sound, and the
+    /// sub-levels that lost blocks are read again.
     fn handle_impacts(self: &Arc<Self>, impacts: &[Impact]) {
         let mut rescans: FxHashSet<u32> = FxHashSet::default();
         for impact in impacts {
@@ -1330,19 +1463,19 @@ impl World {
             let own = self
                 .lock_sublevels()
                 .parked_block(impact.sublevel, impact.block);
-            if own.is_some_and(|pos| self.hit_block(&pos, impact.speed)) {
+            if own.is_some_and(|pos| self.hit_block(&pos, impact)) {
                 rescans.insert(impact.sublevel);
             }
             match impact.target {
                 ImpactTarget::World([x, y, z]) => {
                     let pos = BlockPos(Vector3::new(x, y, z));
-                    self.hit_block(&pos, impact.speed);
+                    self.hit_block(&pos, impact);
                 }
                 ImpactTarget::SubLevel { id, block } => {
                     let Some(pos) = self.lock_sublevels().parked_block(id, block) else {
                         continue;
                     };
-                    if self.hit_block(&pos, impact.speed) {
+                    if self.hit_block(&pos, impact) {
                         rescans.insert(id);
                     }
                 }
@@ -1351,16 +1484,20 @@ impl World {
         for id in rescans {
             self.rescan_sublevel(id);
         }
+        self.sound_impacts(impacts);
     }
 
-    /// Lets a block take the consequences of being hit at `speed`: fragile
-    /// blocks break, TNT primes. Returns whether the block changed.
-    fn hit_block(self: &Arc<Self>, pos: &BlockPos, speed: f32) -> bool {
+    /// Lets a block take the consequences of being hit: fragile blocks break,
+    /// TNT primes, bells ring. Returns whether the block changed.
+    fn hit_block(self: &Arc<Self>, pos: &BlockPos, impact: &Impact) -> bool {
         /// Sable's `FragileBlockCallback` threshold, in blocks per second.
         const FRAGILE_SPEED: f32 = 4.0;
         /// Sable's `ExplosiveBlockCallback` threshold.
         const TNT_SPEED: f32 = 5.0;
+        /// Sable's `BellBlockCallback` threshold, inherited from fragile blocks.
+        const BELL_SPEED: f32 = FRAGILE_SPEED;
 
+        let speed = impact.speed;
         let (block, state) = self.get_block_and_state(pos);
         if *block == Block::TNT && speed >= TNT_SPEED {
             self.set_block_state(
@@ -1371,15 +1508,125 @@ impl World {
             self.spawn_entity(TNTEntity::primed(self, pos, 4));
             return true;
         }
-        if speed >= FRAGILE_SPEED
-            && aero::collision_shape(state).is_solid()
+        if speed < FRAGILE_SPEED {
+            return false;
+        }
+        if *block == Block::BELL && speed >= BELL_SPEED {
+            // The bell swings from the side that was hit. One parked on a
+            // sub-level is rung where it stands, but heard where it was hit.
+            let centre = pos.to_centered_f64();
+            let from = Vector3::new(
+                f64::from(impact.point[0]),
+                f64::from(impact.point[1]),
+                f64::from(impact.point[2]),
+            );
+            let parked = SubLevelManager::is_plot_chunk(pos.chunk_and_chunk_relative_position().0);
+            ring_bell(*pos, self, Some(hit_side(from - centre)), None);
+            if parked {
+                self.play_sound_fine(Sound::BlockBellUse, SoundCategory::Blocks, &from, 1.0, 2.0);
+            }
+            return false;
+        }
+        if aero::collision_shape(state).is_solid()
             && aero::block_voxel([0; 3], block, state, 0).material.fragile
         {
-            // Sable destroys the block with its drops.
-            self.set_block_state(pos, Block::AIR.default_state.id, BlockFlags::NOTIFY_ALL);
+            let melts = (*block == Block::ICE || *block == Block::FROSTED_ICE) && {
+                let below = pos.offset(BlockDirection::Down.to_offset());
+                let (below_block, below_state) = self.get_block_and_state(&below);
+                blocks_movement(below_state, below_block.id) || below_state.is_liquid()
+            };
+            if melts {
+                ice::melt(self, pos);
+            } else {
+                // Sable destroys the block with its drops.
+                self.set_block_state(pos, Block::AIR.default_state.id, BlockFlags::NOTIFY_ALL);
+            }
             return true;
         }
         false
+    }
+
+    /// Sounds the knocks that were hard for the lighter body's mass, as
+    /// Sable's `processCollisionEffects` does: the hit block's particles and
+    /// step, hit and place sounds at the contact, a block sounding once per
+    /// two ticks.
+    fn sound_impacts(self: &Arc<Self>, impacts: &[Impact]) {
+        /// Sable plays a contact's sounds when its force, the impulse over
+        /// the substep, exceeds this multiple of the smaller mass.
+        const FORCE_PER_MASS: f32 = 25.0;
+        /// A block that just sounded stays quiet this many ticks.
+        const QUIET_TICKS: i32 = 2;
+        /// Sable caps the collisions it reports per tick.
+        const MAX_PER_TICK: usize = 100;
+        const VOLUME: f32 = 0.08;
+
+        let tick = self.lock_sublevels().tick;
+        let mut sounded = 0;
+        for impact in impacts {
+            if sounded >= MAX_PER_TICK || impact.impulse <= 0.0 {
+                break;
+            }
+            let lighter = impact.mass.min(impact.other_mass);
+            if impact.impulse / pumpkin_sublevel::SUBSTEP_DT <= FORCE_PER_MASS * lighter {
+                continue;
+            }
+            if !self
+                .lock_sublevels()
+                .note_sound(impact.sublevel, impact.block, tick, QUIET_TICKS)
+            {
+                continue;
+            }
+            let state = match impact.target {
+                ImpactTarget::World([x, y, z]) => {
+                    self.get_block_state_id(&BlockPos(Vector3::new(x, y, z)))
+                }
+                ImpactTarget::SubLevel { id, block } => self
+                    .lock_sublevels()
+                    .parked_block(id, block)
+                    .map_or(Block::AIR.default_state.id, |pos| {
+                        self.get_block_state_id(&pos)
+                    }),
+            };
+            let block = Block::from_state_id(state);
+            if *block == Block::AIR {
+                continue;
+            }
+            sounded += 1;
+            let at = Vector3::new(
+                f64::from(impact.point[0]),
+                f64::from(impact.point[1]),
+                f64::from(impact.point[2]),
+            );
+            self.block_particles(state, at, 2);
+            let family = SoundFamily::of(block);
+            for (sound, pitch) in [
+                (family.step(), 0.4..0.8),
+                (family.hit(), 0.0..0.4),
+                (family.place(), 0.3..0.7),
+            ] {
+                let pitch = rand::rng().random_range(pitch);
+                self.play_sound_fine(sound, SoundCategory::Blocks, &at, VOLUME, pitch);
+            }
+        }
+    }
+
+    /// A few chips of a block state flying off a point.
+    fn block_particles(&self, state: pumpkin_data::BlockStateId, at: Vector3<f64>, count: i32) {
+        let mut data = Vec::new();
+        if VarInt(i32::from(state.as_u16())).encode(&mut data).is_err() {
+            return;
+        }
+        let packet = CParticle::new(
+            false,
+            false,
+            at,
+            Vector3::new(0.0, 0.0, 0.0),
+            0.0,
+            count,
+            VarInt(pumpkin_data::particle::Particle::Block.to_id() as i32),
+            &data,
+        );
+        self.broadcast_packet_all(&packet);
     }
 
     /// Copies a world region's blocks and block entities into the plot
