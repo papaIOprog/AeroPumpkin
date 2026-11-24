@@ -127,12 +127,20 @@ pub fn encode_channel_list(identifiers: &[&str]) -> Vec<u8> {
     out
 }
 
-/// Server config files every modded client expects.
+/// Server config files the clients of the mods Pumpkin ports expect.
 ///
 /// The installed profile adds the rest of its pack's. A client only loads
-/// a mod's server config once that file arrives; an empty file is corrected
-/// to the mod's defaults.
-pub const SERVER_CONFIG_FILES: &[&str] = &["neoforge-server.toml", "sable-server.toml"];
+/// a mod's server config once that file arrives, and a mod reading an
+/// unloaded config crashes the client; an empty file is corrected to the
+/// mod's defaults.
+pub const SERVER_CONFIG_FILES: &[&str] = &[
+    "neoforge-server.toml",
+    "sable-server.toml",
+    "create-server.toml",
+    "simulated-server.toml",
+    "aeronautics-server.toml",
+    "offroad-server.toml",
+];
 const CONFIG_FILE_CHANNEL: &str = "neoforge:config_file";
 
 /// Encodes `ConfigFilePayload`: the file name, then a length-prefixed body.
