@@ -601,7 +601,7 @@ impl PendingConnection {
                             self.send_packet_now(&payload).await;
                             // A modded client keeps its server configs unloaded
                             // until the server sends them; defaults are fine.
-                            for file in neoforge::SERVER_CONFIG_FILES {
+                            for file in crate::mods::server_config_files() {
                                 let body = neoforge::encode_config_file(file, &[]);
                                 let payload = neoforge::config_file_payload(&body);
                                 self.send_packet_now(&payload).await;

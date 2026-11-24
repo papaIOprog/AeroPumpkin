@@ -124,9 +124,11 @@ pub fn encode_channel_list(identifiers: &[&str]) -> Vec<u8> {
     out
 }
 
-/// Server-type config files a modded client expects the server to send.
-/// A client only loads a mod's server config once that file arrives; an
-/// empty file is corrected to the mod's defaults.
+/// Server config files every modded client expects.
+///
+/// The installed profile adds the rest of its pack's. A client only loads
+/// a mod's server config once that file arrives; an empty file is corrected
+/// to the mod's defaults.
 pub const SERVER_CONFIG_FILES: &[&str] = &["neoforge-server.toml", "sable-server.toml"];
 const CONFIG_FILE_CHANNEL: &str = "neoforge:config_file";
 

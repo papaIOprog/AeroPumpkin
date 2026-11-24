@@ -1,7 +1,7 @@
 //! The pack profile: a registry dump of the clients that join, turned into
 //! the tables `pumpkin_data::mods` resolves modded ids by.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use pumpkin_data::block_properties::{BLOCK_ENTITY_TYPES, COLLISION_SHAPES, NoteblockInstrument};
@@ -23,8 +23,9 @@ use pumpkin_util::math::boundingbox::BoundingBox;
 use pumpkin_util::math::vector3::Vector3;
 use serde::Deserialize;
 
-/// The dump format `tools/pumpkin_registry_dump.js` writes.
-const FORMAT: u32 = 1;
+/// The dump format `tools/pumpkin-registry-dump/pumpkin_registry_dump.js`
+/// writes.
+const FORMAT: u32 = 2;
 
 #[derive(Deserialize)]
 struct Dump {
@@ -37,6 +38,13 @@ struct Dump {
     items: HashMap<String, DumpItem>,
     #[serde(default)]
     entities: HashMap<String, DumpEntity>,
+    /// The tags of blocks and entity types, by registry: each tag's id and
+    /// the ids of its entries. Vanilla's own tags are left out.
+    #[serde(default)]
+    tags: HashMap<String, Vec<(String, Vec<u16>)>>,
+    /// The SERVER config files of the pack, by file name.
+    #[serde(default, rename = "serverConfigs")]
+    server_configs: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -118,6 +126,9 @@ struct DumpState {
     ignite: u16,
     #[serde(default)]
     burn: u16,
+    /// The state's properties, by name.
+    #[serde(default)]
+    props: BTreeMap<String, String>,
 }
 
 const fn slippery() -> f32 {
@@ -154,10 +165,17 @@ struct DumpEntity {
     category: Option<String>,
 }
 
-/// Reads the dump at `path` and builds the modded registries from it, with
-/// the namespaces the dump shows. The dump's vanilla ids must agree with
-/// the server's, or the dump is from another game version and is refused.
-pub(crate) fn load(path: &Path) -> Result<(Modded, Box<[String]>), String> {
+/// A dump, as the server keeps it: the modded registries, the mods they
+/// show content of, and the server config files their clients expect.
+pub(crate) struct Profile {
+    pub modded: Modded,
+    pub namespaces: Box<[String]>,
+    pub server_configs: Box<[String]>,
+}
+
+/// Reads the dump at `path`. The dump's vanilla ids must agree with the
+/// server's, or the dump is from another game version and is refused.
+pub(crate) fn load(path: &Path) -> Result<Profile, String> {
     let bytes = std::fs::read(path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
     let dump: Dump = serde_json::from_slice(&bytes)
@@ -172,17 +190,21 @@ pub(crate) fn load(path: &Path) -> Result<(Modded, Box<[String]>), String> {
     let block_ids = ids_of(&dump, "minecraft:block")?;
     let types = ids_of(&dump, "minecraft:block_entity_type")?;
     let namespaces = namespaces(&dump);
-    Ok((
-        Modded {
-            blocks: blocks(&dump, &block_ids, &types)?,
-            block_entity_types: BlockEntityTypes {
-                by_id: block_entity_types(&dump, &block_ids, &types)?,
-            },
-            items: items(&dump)?,
-            entities: entities(&dump)?,
+    let modded = Modded {
+        blocks: blocks(&dump, &block_ids, &types)?,
+        block_entity_types: BlockEntityTypes {
+            by_id: block_entity_types(&dump, &block_ids, &types)?,
         },
+        items: items(&dump)?,
+        entities: entities(&dump)?,
+        block_tags: tags(&dump, "block", BlockId::new_or_air)?,
+        entity_tags: tags(&dump, "entity_type", |id| id)?,
+    };
+    Ok(Profile {
+        modded,
         namespaces,
-    ))
+        server_configs: dump.server_configs.into_boxed_slice(),
+    })
 }
 
 /// The dump's registry `name`, as id and name pairs.
@@ -327,6 +349,7 @@ fn blocks(
     let mut built: Vec<&'static Block> = Vec::with_capacity(found.len());
     let mut states = Vec::new();
     let mut state_blocks = Vec::new();
+    let mut props = Vec::new();
     for (name, dumped) in &found {
         let id = block_ids[name];
         if dumped.states.is_empty() {
@@ -349,6 +372,23 @@ fn blocks(
                 state_of(id, state, kind, &mut shapes)
             })
             .collect();
+        let properties: Vec<&'static [(&'static str, &'static str)]> = dumped
+            .states
+            .iter()
+            .map(|state| {
+                let props: Box<[_]> = state
+                    .props
+                    .iter()
+                    .map(|(name, value)| (leaked(name), leaked(value)))
+                    .collect();
+                if props.is_empty() {
+                    &[]
+                } else {
+                    &*Box::leak(props)
+                }
+            })
+            .collect();
+        props.extend(properties);
         let states_of: &'static [BlockState] = Box::leak(values.into_boxed_slice());
         let owned: Vec<&'static BlockState> = states_of.iter().collect();
         let default = dumped
@@ -393,7 +433,33 @@ fn blocks(
         state_blocks,
         by_item,
         shapes: shapes.owned,
+        props,
     })
+}
+
+/// The dump's tags of the registry `registry` (`block` or `entity_type`):
+/// each tag's id and the ids of the blocks, or entity types, in it, each
+/// id through `of`.
+fn tags<T>(
+    dump: &Dump,
+    registry: &str,
+    of: impl Fn(u16) -> T,
+) -> Result<HashMap<&'static str, Box<[T]>>, String> {
+    let Some(dumped) = dump.tags.get(registry) else {
+        return Ok(HashMap::new());
+    };
+    let mut known: HashSet<&str> = HashSet::new();
+    let mut tags = HashMap::with_capacity(dumped.len());
+    for (tag, entries) in dumped {
+        if tag.starts_with("minecraft:") {
+            continue;
+        }
+        if !known.insert(tag.as_str()) {
+            return Err(format!("dump lists the tag {tag} twice"));
+        }
+        tags.insert(leaked(tag), entries.iter().map(|id| of(*id)).collect());
+    }
+    Ok(tags)
 }
 
 /// One state of a modded block, from what the game reported of it.
@@ -663,7 +729,7 @@ mod tests {
         let item = Item::COUNT;
         let entity = EntityType::ALL.len() as u16;
         serde_json::json!({
-            "format": 1,
+            "format": 2,
             "game": { "version": "test" },
             "registries": {
                 "minecraft:block": { "sync": true, "entries": [[0, vanilla_first_block], [block, "test:slab"]] },
@@ -682,15 +748,20 @@ mod tests {
                         { "shape": [[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]], "solid": true, "solidRender": true,
                           "fullCube": true, "canOcclude": true, "sturdy": [true, true, true, true, true, true],
                           "light": 3, "opacity": 15, "push": "normal", "hardness": 1.5, "mapColor": 8,
-                          "friction": 0.6, "burn": 20, "ignite": 5 },
+                          "friction": 0.6, "burn": 20, "ignite": 5, "props": { "facing": "north", "half": "top" } },
                         { "shape": [[0.0, 0.0, 0.0, 1.0, 0.5, 1.0]], "outline": [[0.1, 0.2, 0.3, 0.9, 0.7, 0.9]],
                           "solid": true, "fullCube": false, "sturdy": [true, false, true, true, true, true],
-                          "opacity": 0, "push": "destroy", "hardness": 0.5, "toolRequired": true }
+                          "opacity": 0, "push": "destroy", "hardness": 0.5, "toolRequired": true, "props": { "facing": "south", "half": "top" } }
                     ]
                 }
             },
             "items": { "test:slab": { "maxStack": 16, "maxDamage": 250 } },
-            "entities": { "test:glue": { "width": 0.5, "height": 0.5, "eye": 0.25, "tracking": 10, "interval": 2147483647u32, "summon": true } }
+            "entities": { "test:glue": { "width": 0.5, "height": 0.5, "eye": 0.25, "tracking": 10, "interval": 2147483647u32, "summon": true } },
+            "tags": {
+                "block": [["test:sticky", [block]], ["minecraft:mineable/pickaxe", [block]]],
+                "entity_type": [["test:keeps", [entity]]]
+            },
+            "serverConfigs": ["test-server.toml", "sable-server.toml"]
         })
     }
 
@@ -700,14 +771,105 @@ mod tests {
         path
     }
 
+    /// Every lookup a server makes into the installed tables ends at the
+    /// dump's entries.
+    fn every_way_in_resolves(
+        slab: &'static Block,
+        first: &'static BlockState,
+        half: &'static BlockState,
+        item: &'static Item,
+        glue: &'static EntityType,
+        entity_type: u16,
+    ) {
+        let entity = EntityType::ALL.len() as u16;
+        assert_eq!(
+            BlockStateId::new_or_air(first.id.as_u16() + 1)
+                .to_block()
+                .name,
+            "test:slab"
+        );
+        assert_eq!(Block::from_registry_key("test:slab"), Some(slab));
+        assert_eq!(Block::from_item_id(Item::COUNT), Some(slab));
+        assert_eq!(Item::from_id(Item::COUNT), Some(item));
+        assert_eq!(
+            pumpkin_data::mods::block_entity_type(entity_type),
+            Some("test:holder")
+        );
+        assert_eq!(
+            pumpkin_data::mods::block_entity_type_id("test:holder"),
+            Some(entity_type)
+        );
+        assert_eq!(EntityType::from_raw(entity), Some(glue));
+        assert_eq!(EntityType::from_name("test:glue"), Some(glue));
+        // The shape ids past the vanilla boxes reach the new boxes.
+        let boxed: Vec<_> = half.get_block_outline_shapes().collect();
+        assert_eq!(boxed.len(), 1);
+        assert_eq!((boxed[0].min.x, boxed[0].max.y), (0.1, 0.7));
+        let collision: Vec<_> = half.get_block_collision_shapes().collect();
+        assert_eq!(collision[0].max.y, 0.5);
+    }
+
+    /// The states' properties and the mod's tags are read back; vanilla's
+    /// own tags are the server's already.
+    fn properties_and_tags_resolve(
+        slab: &'static Block,
+        first: &'static BlockState,
+        half: &'static BlockState,
+        glue: &'static EntityType,
+    ) {
+        assert_eq!(
+            pumpkin_data::mods::state_props(first.id),
+            [("facing", "north"), ("half", "top")]
+        );
+        assert_eq!(
+            pumpkin_data::mods::state_with(slab, &[("facing", "south"), ("half", "top")])
+                .map(|s| s.id),
+            Some(half.id)
+        );
+        assert!(pumpkin_data::mods::block_has_tag(slab, "test:sticky"));
+        assert!(!pumpkin_data::mods::block_has_tag(
+            slab,
+            "minecraft:mineable/pickaxe"
+        ));
+        assert!(pumpkin_data::mods::entity_has_tag(glue, "test:keeps"));
+        // A turn moves a mod's block by its properties, as vanilla's does;
+        // with no state for the turned properties, it stays as it is.
+        assert_eq!(
+            first
+                .rotate(pumpkin_data::block_rotation::Rotation::Rotate180)
+                .id,
+            half.id
+        );
+        assert_eq!(
+            first
+                .rotate(pumpkin_data::block_rotation::Rotation::Clockwise90)
+                .id,
+            first.id
+        );
+    }
+
     #[test]
     fn a_dump_becomes_the_modded_registries() -> Result<(), &'static str> {
         let path = write(&dump(0, "minecraft:air"), "pumpkin-profile-ok.json");
-        let (modded, namespaces) = load(&path).map_err(|_| "dump refused")?;
-        let _ = std::fs::remove_file(&path);
+        let profile = load(&path).map_err(|error| -> &'static str {
+            let _ = std::fs::remove_file(&path);
+            Box::leak(error.into_boxed_str())
+        })?;
+        let Profile {
+            modded,
+            namespaces,
+            server_configs,
+        } = profile;
         assert_eq!(
             namespaces.iter().map(String::as_str).collect::<Vec<_>>(),
             ["test"]
+        );
+        assert_eq!(
+            server_configs
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["test-server.toml", "sable-server.toml"]
         );
         assert_eq!(modded.block_entity_types.by_id, ["", "", "", "test:holder"]);
         // The collision boxes are vanilla's; the odd outline is a new one.
@@ -738,6 +900,11 @@ mod tests {
         assert_eq!(slab.states.len(), 2);
         let flammable = slab.flammable.as_ref().ok_or("flammable")?;
         assert_eq!((flammable.spread_chance, flammable.burn_chance), (5, 20));
+        // The mod's tags, without vanilla's own.
+        assert_eq!(
+            modded.block_tags.keys().copied().collect::<Vec<_>>(),
+            ["test:sticky"]
+        );
         let item = modded.items.by_id[0].ok_or("item")?;
         assert_eq!(item.registry_key, "test:slab");
         assert_eq!(item.components.len(), 2);
@@ -749,33 +916,8 @@ mod tests {
         assert!(glue.summonable && glue.client_tracking_range == 10);
 
         pumpkin_data::mods::install(modded).map_err(|_| "installed twice")?;
-        // Every way in resolves to the same entries.
-        let entity = EntityType::ALL.len() as u16;
-        assert_eq!(
-            BlockStateId::new_or_air(first.id.as_u16() + 1)
-                .to_block()
-                .name,
-            "test:slab"
-        );
-        assert_eq!(Block::from_registry_key("test:slab"), Some(slab));
-        assert_eq!(Block::from_item_id(Item::COUNT), Some(slab));
-        assert_eq!(Item::from_id(Item::COUNT), Some(item));
-        assert_eq!(
-            pumpkin_data::mods::block_entity_type(entity_type),
-            Some("test:holder")
-        );
-        assert_eq!(
-            pumpkin_data::mods::block_entity_type_id("test:holder"),
-            Some(entity_type)
-        );
-        assert_eq!(EntityType::from_raw(entity), Some(glue));
-        assert_eq!(EntityType::from_name("test:glue"), Some(glue));
-        // The shape ids past the vanilla boxes reach the new boxes.
-        let boxed: Vec<_> = half.get_block_outline_shapes().collect();
-        assert_eq!(boxed.len(), 1);
-        assert_eq!((boxed[0].min.x, boxed[0].max.y), (0.1, 0.7));
-        let collision: Vec<_> = half.get_block_collision_shapes().collect();
-        assert_eq!(collision[0].max.y, 0.5);
+        every_way_in_resolves(slab, first, half, item, glue, entity_type);
+        properties_and_tags_resolve(slab, first, half, glue);
         Ok(())
     }
 

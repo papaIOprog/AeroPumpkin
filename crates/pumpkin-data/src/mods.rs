@@ -13,6 +13,8 @@ use std::sync::OnceLock;
 #[cfg(feature = "block")]
 use crate::block_properties::COLLISION_SHAPES;
 #[cfg(feature = "block")]
+use crate::block_rotation::{Mirror, Rotation, transform_block_properties};
+#[cfg(feature = "block")]
 use crate::block_state::PistonBehavior;
 #[cfg(feature = "entity_type")]
 use crate::entity::EntityType;
@@ -35,6 +37,12 @@ pub struct Modded {
     pub block_entity_types: BlockEntityTypes,
     #[cfg(feature = "entity_type")]
     pub entities: Entities,
+    /// The tags the mods put blocks in, by tag id; the blocks in each.
+    #[cfg(feature = "block")]
+    pub block_tags: HashMap<&'static str, Box<[BlockId]>>,
+    /// The tags the mods put entity types in, by tag id; the types in each.
+    #[cfg(feature = "entity_type")]
+    pub entity_tags: HashMap<&'static str, Box<[u16]>>,
 }
 
 /// Blocks and block states, by ids past the vanilla ones.
@@ -53,6 +61,9 @@ pub struct Blocks {
     /// The collision boxes of the mods' blocks, by shape id past the
     /// vanilla ones.
     pub shapes: Vec<BoundingBox>,
+    /// The properties of each state, by the same index as `states`, as
+    /// `(name, value)` in the client's order.
+    pub props: Vec<&'static [(&'static str, &'static str)]>,
 }
 
 /// Items by ids past the vanilla ones; `None` where the client has none.
@@ -240,6 +251,98 @@ pub(crate) fn entity_by_name(name: &str) -> Option<&'static EntityType> {
     MODDED.get()?.entities.by_name.get(name).copied()
 }
 
+/// The value of the property `name` of the modded block state `state`;
+/// `None` where it has no such property or is not one of the mods'.
+#[cfg(feature = "block")]
+#[must_use]
+pub fn state_prop(state: BlockStateId, name: &str) -> Option<&'static str> {
+    state_props(state)
+        .iter()
+        .find(|(key, _)| *key == name)
+        .map(|(_, value)| *value)
+}
+
+/// The properties of a modded block state; empty for any other.
+#[cfg(feature = "block")]
+#[must_use]
+pub fn state_props(state: BlockStateId) -> &'static [(&'static str, &'static str)] {
+    MODDED
+        .get()
+        .and_then(|modded| {
+            modded
+                .blocks
+                .props
+                .get(past(state.as_u16(), BlockStateId::COUNT as usize)?)
+                .copied()
+        })
+        .unwrap_or(&[])
+}
+
+/// The state of the modded block `block` whose properties are exactly `props`.
+#[cfg(feature = "block")]
+#[must_use]
+pub fn state_with(block: &Block, props: &[(&str, &str)]) -> Option<&'static BlockState> {
+    block
+        .states
+        .iter()
+        .find(|state| state_props(state.id) == props)
+}
+
+/// The state a modded block's state `id` becomes under `rotation` and
+/// `mirror`: vanilla's turning of the properties any block may have. `None`
+/// when no state of the block has the turned properties.
+#[cfg(feature = "block")]
+pub(crate) fn state_rotated(
+    block: &Block,
+    id: BlockStateId,
+    rotation: Rotation,
+    mirror: Mirror,
+) -> Option<&'static BlockState> {
+    let props = state_props(id);
+    if props.is_empty() {
+        return None;
+    }
+    let turned = transform_block_properties(block.name, props, rotation, mirror);
+    if turned.is_empty() {
+        return None;
+    }
+    block.states.iter().find(|state| {
+        let own = state_props(state.id);
+        own.len() == turned.len()
+            && own
+                .iter()
+                .zip(&turned)
+                .all(|((key, value), (turned_key, turned_value))| {
+                    *key == turned_key && *value == turned_value
+                })
+    })
+}
+
+/// Whether the installed profile puts `block` in the tag `tag`
+/// (`namespace:path`). Vanilla's own tags are the generated ones.
+#[cfg(feature = "block")]
+#[must_use]
+pub fn block_has_tag(block: &Block, tag: &str) -> bool {
+    MODDED.get().is_some_and(|modded| {
+        modded
+            .block_tags
+            .get(tag)
+            .is_some_and(|blocks| blocks.contains(&block.id))
+    })
+}
+
+/// Whether the installed profile puts the entity type in the tag `tag`.
+#[cfg(feature = "entity_type")]
+#[must_use]
+pub fn entity_has_tag(entity_type: &EntityType, tag: &str) -> bool {
+    MODDED.get().is_some_and(|modded| {
+        modded
+            .entity_tags
+            .get(tag)
+            .is_some_and(|types| types.contains(&entity_type.id))
+    })
+}
+
 // A block nobody has a profile for: one stand-in state per state id, and
 // one stand-in block per state, so that ids stay distinct and come back
 // out unchanged. They are made on first use and never freed.
@@ -367,7 +470,9 @@ mod tests {
                 by_name: HashMap::from([("test:slab", slab)]),
                 by_item: HashMap::from([(1400, slab)]),
                 shapes: Vec::new(),
+                props: vec![&[], &[("half", "bottom")]],
             },
+            block_tags: HashMap::from([("test:sticky".into(), vec![id].into_boxed_slice())]),
             ..Modded::default()
         })
         .ok();
@@ -401,5 +506,20 @@ mod tests {
             Block::STONE.default_state.id.to_state().id,
             Block::STONE.default_state.id
         );
+
+        // Properties and tags of the mods' states.
+        assert_eq!(state_prop(BlockStateId::from_raw(first), "half"), None);
+        assert_eq!(
+            state_prop(BlockStateId::from_raw(first + 1), "half"),
+            Some("bottom")
+        );
+        assert_eq!(
+            state_with(slab, &[("half", "bottom")]).map(|state| state.id),
+            Some(BlockStateId::from_raw(first + 1))
+        );
+        assert!(state_with(slab, &[("half", "top")]).is_none());
+        assert!(block_has_tag(slab, "test:sticky"));
+        assert!(!block_has_tag(slab, "test:none"));
+        assert!(!block_has_tag(&Block::STONE, "test:sticky"));
     }
 }

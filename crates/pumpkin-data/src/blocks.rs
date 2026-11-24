@@ -262,7 +262,9 @@ impl Block {
             let new_state_id = new_props.to_state_id(self);
             BlockState::from_id(new_state_id)
         } else {
-            BlockState::from_id(id)
+            // A mod's block: what its properties say, once turned.
+            crate::mods::state_rotated(self, id, crate::block_rotation::Rotation::None, mirror)
+                .unwrap_or_else(|| BlockState::from_id(id))
         }
     }
 
@@ -291,7 +293,9 @@ impl Block {
             let new_state_id = new_props.to_state_id(self);
             BlockState::from_id(new_state_id)
         } else {
-            BlockState::from_id(id)
+            // A mod's block: what its properties say, once turned.
+            crate::mods::state_rotated(self, id, rotation, crate::block_rotation::Mirror::None)
+                .unwrap_or_else(|| BlockState::from_id(id))
         }
     }
 }
