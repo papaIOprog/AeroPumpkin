@@ -80,7 +80,9 @@ impl JavaClient {
         // y = feet Y. Sable clients standing on a sub-level report the
         // position in that sub-level's parked coordinates; bring it back to
         // the world frame.
-        let position = player.world().to_world_position(packet.position);
+        let position = player
+            .world()
+            .to_world_position(player.gameprofile.id, packet.position);
         if position.x.is_nan() || position.y.is_nan() || position.z.is_nan() {
             self.try_kick(&TextComponent::translate_cross(
                 translation::java::MULTIPLAYER_DISCONNECT_INVALID_PLAYER_MOVEMENT,
@@ -217,7 +219,9 @@ impl JavaClient {
         }
         // y = feet Y; parked sub-level coordinates come back to the world
         // frame (see handle_position).
-        let position = player.world().to_world_position(packet.position);
+        let position = player
+            .world()
+            .to_world_position(player.gameprofile.id, packet.position);
         if !position.x.is_finite()
             || !position.y.is_finite()
             || !position.z.is_finite()

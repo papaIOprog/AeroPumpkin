@@ -1092,6 +1092,8 @@ impl JavaClient {
                                 .fire_blocking(server, &mut unreg_event);
                         }
                     }
+                } else if channel_str == crate::world::sublevel::sable::PUNCH {
+                    player.world().punch_sublevel(player, payload.data);
                 }
             }
             id if id == SRecipeBookChangeSettings::to_id(version) => {

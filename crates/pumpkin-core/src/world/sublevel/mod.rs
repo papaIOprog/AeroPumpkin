@@ -119,6 +119,60 @@ struct SubLevel {
     disassembling: Option<Disassembly>,
 }
 
+/// Sable's `sub_level_punch_strength_multiplier`.
+const PUNCH_STRENGTH: f64 = 2.1;
+/// Sable's `sub_level_punch_downward_strength_multiplier`.
+const DOWNWARD_PUNCH_STRENGTH: f64 = 0.175;
+
+/// Sable's `punchCurve`: the impulse a punch gives a body of `mass`
+/// along the punched line, in block masses times blocks per second.
+fn punch_curve(mass: f64) -> f64 {
+    // Falloff scale and exponent at and above one mass, the slope at one,
+    // and the impulse at none.
+    let (s, e, k, p) = (2.0, 0.5, 0.8, 1.75);
+    let u = mass - 1.0;
+    if mass < 1.0 {
+        (((p + k - 2.0) * u + k - 1.0) * u + 1.0) * mass
+    } else {
+        let g = k / (s * e);
+        let inverse_e = 1.0 / (e - 1.0);
+        s * ((u + g.powf(inverse_e)).powf(e) - g.powf(e * inverse_e)) + 1.0
+    }
+}
+
+/// Sable's `ServerboundPunchSubLevelPacket`: the punched block, where the hit
+/// lies from the sub-level's place in world axes, and the direction.
+struct Punch;
+
+impl Punch {
+    /// Reads the payload: a packed block position and two vectors.
+    fn read(data: &[u8]) -> Option<(Vector3<i32>, Vector3<f64>, Vector3<f64>)> {
+        if data.len() != 8 + 6 * 8 {
+            return None;
+        }
+        let long = i64::from_be_bytes(data[..8].try_into().ok()?);
+        let block = Vector3::new(
+            (long >> 38) as i32,
+            (long << 52 >> 52) as i32,
+            (long << 26 >> 38) as i32,
+        );
+        let vector = |offset: usize| -> Option<f64> {
+            Some(f64::from_be_bytes(
+                data[offset..offset + 8].try_into().ok()?,
+            ))
+        };
+        let local = Vector3::new(vector(8)?, vector(16)?, vector(24)?);
+        let direction = Vector3::new(vector(32)?, vector(40)?, vector(48)?);
+        Some((block, local, direction))
+    }
+}
+
+/// `vector` as a unit vector, or `None` if it has no length.
+fn normalize(vector: Vector3<f64>) -> Option<Vector3<f64>> {
+    let length = vector.length();
+    (length > 1.0e-6).then(|| Vector3::new(vector.x / length, vector.y / length, vector.z / length))
+}
+
 /// A block a sub-level hit this tick: the hardest speed it was hit at, a
 /// point it was hit from, and the sub-levels it belongs to.
 struct Hit {
@@ -452,6 +506,10 @@ pub struct SubLevelManager {
     pending_updates: FxHashMap<u32, Vec<(BlockPos, BlockStateId)>>,
     /// Sub-levels whose bounds changed since their players last heard.
     pending_bounds: FxHashSet<u32>,
+    /// The sub-level each player last reported standing in, by player.
+    riders: FxHashMap<Uuid, u32>,
+    /// Ticks left before each player may punch a sub-level again.
+    punch_cooldowns: FxHashMap<Uuid, i32>,
 }
 
 impl Default for SubLevelManager {
@@ -481,6 +539,8 @@ impl SubLevelManager {
             recent_sounds: FxHashMap::default(),
             pending_updates: FxHashMap::default(),
             pending_bounds: FxHashSet::default(),
+            riders: FxHashMap::default(),
+            punch_cooldowns: FxHashMap::default(),
         }
     }
 
@@ -818,6 +878,137 @@ impl SubLevelManager {
 
     /// Whether sub-level `id`'s block `block` may sound its knock on tick
     /// `tick`: not if it sounded within the last `quiet` ticks.
+    /// Sable's punch: sub-level `target` is shoved at the hit, its place
+    /// plus `local`, towards `direction`, and sub-level `standing`, the one
+    /// the player stands on at `position`, is shoved back the other way; a
+    /// punch on the world shoves `standing` alone. Both legs of the punch
+    /// get the strength of the leg that meets the heavier mass. Returns
+    /// where the punch landed in the world.
+    pub fn punch(
+        &mut self,
+        target: Option<u32>,
+        standing: Option<u32>,
+        position: Vector3<f64>,
+        local: Vector3<f64>,
+        direction: Vector3<f64>,
+    ) -> Option<Vector3<f64>> {
+        // How hard the punch lands on a side: the lighter mass along the
+        // punched line feels it more.
+        let strength = |id: u32, point: Vector3<f64>, along: Vector3<f64>| {
+            self.physics
+                .inverse_normal_mass(
+                    id,
+                    [point.x as f32, point.y as f32, point.z as f32],
+                    [along.x as f32, along.y as f32, along.z as f32],
+                )
+                .filter(|inverse| *inverse > 0.0)
+                .map_or(0.0, |inverse| {
+                    punch_curve(1.0 / f64::from(inverse)) * PUNCH_STRENGTH
+                })
+        };
+        let hit = target
+            .and_then(|id| self.physics.pivot_of(id))
+            .map(|pivot| {
+                Vector3::new(
+                    f64::from(pivot[0]),
+                    f64::from(pivot[1]),
+                    f64::from(pivot[2]),
+                )
+            })
+            .map(|pivot| pivot + local);
+        let back = Vector3::new(-direction.x, -direction.y, -direction.z);
+        // The shoves to give, as sub-level, point, direction and strength.
+        let shoves: Vec<(u32, Vector3<f64>, Vector3<f64>, f64)> = match (target, standing, hit) {
+            (Some(target), None, Some(hit)) => {
+                vec![(target, hit, direction, strength(target, hit, direction))]
+            }
+            (Some(target), Some(standing), Some(hit)) => {
+                let scalar =
+                    strength(target, hit, direction).min(strength(standing, position, back));
+                vec![
+                    (standing, position, back, scalar),
+                    (target, hit, direction, scalar),
+                ]
+            }
+            (None, Some(standing), _) => {
+                vec![(standing, position, back, strength(standing, position, back))]
+            }
+            _ => Vec::new(),
+        };
+        for (id, point, along, scalar) in shoves {
+            self.physics.punch(
+                id,
+                [point.x as f32, point.y as f32, point.z as f32],
+                [
+                    (along.x * scalar) as f32,
+                    (along.y * scalar) as f32,
+                    (along.z * scalar) as f32,
+                ],
+            );
+        }
+        hit
+    }
+
+    /// The sub-level `player` last reported standing in, if any.
+    #[must_use]
+    pub fn ridden_by(&self, player: Uuid) -> Option<u32> {
+        self.riders.get(&player).copied()
+    }
+
+    /// Notes that `player`'s position was reported in `position`: inside a
+    /// sub-level's plot, they stand on that sub-level; anywhere else, on
+    /// the world.
+    pub fn note_rider(&mut self, player: Uuid, position: Vector3<f64>) {
+        let chunk = Vector2::new(
+            (position.x.floor() as i32).div_euclid(16),
+            (position.z.floor() as i32).div_euclid(16),
+        );
+        if !Self::is_plot_chunk(chunk) {
+            self.riders.remove(&player);
+            return;
+        }
+        let plot = Vector2::new(
+            (chunk.x >> PLOT_LOG_SIZE) - PLOTYARD_ORIGIN,
+            (chunk.y >> PLOT_LOG_SIZE) - PLOTYARD_ORIGIN,
+        );
+        if let Some(level) = self.levels.iter().find(|level| level.plot == plot) {
+            self.riders.insert(player, level.id);
+        }
+    }
+
+    /// The sub-level whose parked content holds `block`, if any.
+    #[must_use]
+    pub fn containing(&self, block: &BlockPos) -> Option<u32> {
+        let [x, y, z] = [block.0.x, block.0.y, block.0.z];
+        self.levels
+            .iter()
+            .find(|level| {
+                let [x0, y0, z0, x1, y1, z1] = level.bounds;
+                x >= x0 && x <= x1 && y >= y0 && y <= y1 && z >= z0 && z <= z1
+            })
+            .map(|level| level.id)
+    }
+
+    /// The orientation of sub-level `id`'s body as a quaternion, `(x, y, z, w)`.
+    #[must_use]
+    pub fn orientation_of(&self, id: u32) -> Option<[f32; 4]> {
+        self.snapshot_of(id).map(|body| body.rotation)
+    }
+
+    /// Whether `player` may punch a sub-level now, with `cooldown` ticks
+    /// between punches: not if their last one was more recent than that.
+    pub fn try_punch(&mut self, player: Uuid, cooldown: i32) -> bool {
+        if self
+            .punch_cooldowns
+            .get(&player)
+            .is_some_and(|left| *left > 0)
+        {
+            return false;
+        }
+        self.punch_cooldowns.insert(player, cooldown);
+        true
+    }
+
     /// Forgets the blocks that sounded before `tick`.
     pub fn forget_sounds_before(&mut self, tick: i32) {
         self.recent_sounds.retain(|_, sounded| *sounded >= tick);
@@ -996,6 +1187,10 @@ impl SubLevelManager {
         self.tick = self.tick.wrapping_add(1);
         let ms_since_last = self.note_send_time();
 
+        for left in self.punch_cooldowns.values_mut() {
+            *left -= 1;
+        }
+        self.punch_cooldowns.retain(|_, left| *left > 0);
         let players: Vec<Arc<Player>> = world.players.load().to_vec();
         self.update_tracking(world, bodies, &players);
         self.send_movement(bodies, &players, ms_since_last);
@@ -2630,12 +2825,76 @@ impl World {
     }
 
     /// Converts a player-reported position in sub-level-local (parked)
-    /// coordinates to its world position, if it lies in the plotyard.
-    #[must_use]
-    pub fn to_world_position(&self, position: Vector3<f64>) -> Vector3<f64> {
-        self.lock_sublevels()
-            .parked_to_world(position)
-            .unwrap_or(position)
+    /// coordinates to its world position, if it lies in the plotyard, and
+    /// remembers which sub-level the player stands on.
+    pub fn to_world_position(&self, player: Uuid, position: Vector3<f64>) -> Vector3<f64> {
+        let mut manager = self.lock_sublevels();
+        manager.note_rider(player, position);
+        manager.parked_to_world(position).unwrap_or(position)
+    }
+
+    /// Sable's `ServerboundPunchSubLevelPacket`: the player punched the block
+    /// `data` names, at `local` from a sub-level's place and towards
+    /// `direction`. A sub-level is shoved; the one the player stands on is
+    /// shoved back, and takes the shove when the player punched the world.
+    pub fn punch_sublevel(&self, player: &Arc<Player>, data: &[u8]) {
+        /// Sable's `sub_level_punch_cooldown_ticks`.
+        const COOLDOWN: i32 = 3;
+
+        let Some((block, local, direction)) = Punch::read(data) else {
+            return;
+        };
+        // Sable: only a player with something to push against may punch.
+        let entity = &player.living_entity.entity;
+        if !(entity.on_ground.load(std::sync::atomic::Ordering::Relaxed)
+            || entity.is_in_water()
+            || player.is_flying())
+        {
+            return;
+        }
+        let Some(direction) = normalize(direction) else {
+            return;
+        };
+        let uuid = player.gameprofile.id;
+        let hit = {
+            let mut manager = self.lock_sublevels();
+            let standing = manager.ridden_by(uuid);
+            let target = manager.containing(&BlockPos(block));
+            // Nobody punches the sub-level they stand on, nor twice in a row.
+            if standing == target || !manager.try_punch(uuid, COOLDOWN) {
+                return;
+            }
+            // Standing on a sub-level, the client sends the direction in its
+            // frame.
+            let direction = standing
+                .and_then(|id| manager.orientation_of(id))
+                .map_or(direction, |orientation| rotate(orientation, direction));
+            // A downward punch is weakened, so it cannot lift the player by
+            // shoving what they stand on.
+            let downward = direction.y < 0.0;
+            let direction = Vector3::new(
+                direction.x,
+                direction.y
+                    * if downward {
+                        DOWNWARD_PUNCH_STRENGTH
+                    } else {
+                        1.0
+                    },
+                direction.z,
+            );
+            manager.punch(target, standing, entity.pos.load(), local, direction)
+        };
+        // The punch costs the hand its swing for a moment, and throws chips
+        // of the block punched where it landed.
+        let held = player.inventory.held_item();
+        player.set_item_cooldown(held.get_item().registry_key, COOLDOWN);
+        let count = i32::try_from((rand::random::<f64>() * 3.0) as u64).unwrap_or(0);
+        let at = hit.unwrap_or(Vector3::new(
+            f64::from(block.x) + 0.5,
+            f64::from(block.y) + 0.5,
+            f64::from(block.z) + 0.5,
+        )) - direction * 0.1;
+        self.block_particles(self.get_block_state_id(&BlockPos(block)), at, count);
     }
 
     /// Whether the entity stands in the plotyard, i.e. inside some
@@ -2870,6 +3129,37 @@ mod tests {
             .len(),
             9
         );
+    }
+
+    #[test]
+    fn punch_payload_reads_a_packed_position_and_two_vectors() -> Result<(), &'static str> {
+        // BlockPos.asLong packs x in 26 bits, z in 26 and y in 12.
+        let packed: i64 = (i64::from(-44) & 0x3FF_FFFF) << 38
+            | (i64::from(7) & 0x3FF_FFFF) << 12
+            | i64::from(-2 & 0xFFF);
+        let mut data = packed.to_be_bytes().to_vec();
+        for value in [1.5f64, -0.25, 2.0, 0.0, 0.0, -1.0] {
+            data.extend_from_slice(&value.to_be_bytes());
+        }
+        let (block, local, direction) = Punch::read(&data).ok_or("payload")?;
+        assert_eq!(block, Vector3::new(-44, -2, 7));
+        assert_eq!(local, Vector3::new(1.5, -0.25, 2.0));
+        assert_eq!(direction, Vector3::new(0.0, 0.0, -1.0));
+        // Truncated or padded payloads are refused.
+        assert!(Punch::read(&data[..55]).is_none());
+        data.push(0);
+        assert!(Punch::read(&data).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn punches_move_light_bodies_more_than_heavy_ones() {
+        // Sable's curve: no mass, no shove; one mass, the base impulse.
+        assert_eq!(punch_curve(0.0), 0.0);
+        assert!((punch_curve(1.0) - 1.0).abs() < 1.0e-9);
+        // And the velocity change it buys falls as mass grows.
+        let velocity = |mass: f64| punch_curve(mass) / mass;
+        assert!(velocity(10.0) < velocity(1.0) && velocity(1000.0) < velocity(10.0));
     }
 
     #[test]

@@ -707,6 +707,54 @@ impl SubLevelSystem {
         Some((angle, distance))
     }
 
+    /// The body's place in the world, which the pose reports.
+    #[must_use]
+    pub fn pivot_of(&self, id: u32) -> Option<[f32; 3]> {
+        let sublevel = self.sublevels.iter().find(|s| s.id == id)?;
+        self.bodies
+            .get(sublevel.body)
+            .map(|body| (*body.translation()).into())
+    }
+
+    /// How readily a push at the world `point` along `direction` moves
+    /// sub-level `id`: Sable's `getInverseNormalMass`, the inverse of the
+    /// mass a punch along that line meets.
+    #[must_use]
+    pub fn inverse_normal_mass(
+        &self,
+        id: u32,
+        point: [f32; 3],
+        direction: [f32; 3],
+    ) -> Option<f32> {
+        let sublevel = self.sublevels.iter().find(|s| s.id == id)?;
+        let body = self.bodies.get(sublevel.body)?;
+        let normal = Vector3::from(direction).try_normalize(1.0e-6)?;
+        let lever = (Point::from(point) - body.center_of_mass()).cross(&normal);
+        let properties = &body.mass_properties().local_mprops;
+        let frame = *properties
+            .principal_inertia_local_frame
+            .to_rotation_matrix()
+            .matrix();
+        let inverses = Vector3::from_fn(|axis, _| 1.0 / properties.principal_inertia()[axis]);
+        let inverse = frame * Matrix3::from_diagonal(&inverses) * frame.transpose();
+        let rotation = *body.rotation().to_rotation_matrix().matrix();
+        let inverse_world = rotation * inverse * rotation.transpose();
+        Some(lever.dot(&(inverse_world * lever)) + properties.inv_mass)
+    }
+
+    /// Shoves sub-level `id` with an impulse at a world `point`, as a punch
+    /// does.
+    pub fn punch(&mut self, id: u32, point: [f32; 3], impulse: [f32; 3]) -> bool {
+        let Some(sublevel) = self.sublevels.iter().find(|s| s.id == id) else {
+            return false;
+        };
+        let Some(body) = self.bodies.get_mut(sublevel.body) else {
+            return false;
+        };
+        body.apply_impulse_at_point(impulse.into(), Point::from(point), true);
+        true
+    }
+
     /// Scales how hard sub-level `id`'s propellers push, from 0 to 1 on top
     /// of their rpm; 1 by default.
     pub fn set_throttle(&mut self, id: u32, throttle: f32) -> bool {
@@ -2103,6 +2151,40 @@ mod tests {
         // Let go, the slab stays where it was put.
         assert!(system.set_alignment(id, None));
         assert!(system.alignment_error(id).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_punch_off_centre_turns_the_body_and_meets_more_mass() -> Result<(), &'static str> {
+        // A 3x3 slab of 1-mass blocks on the ground. Its centre of mass is
+        // the body's place: a punch there only slides it; the same punch at
+        // a corner also yaws it, and Sable's inverse normal mass, which sets
+        // how hard a punch lands, is the larger for it.
+        let mut system = SubLevelSystem::new(Air::default());
+        let id = system.spawn([0.0, 64.5, 0.0]);
+        land_on(&mut system, id, slab(3, 3), 64);
+        let centre = [0.0, 64.5, 0.0];
+        let corner = [1.4, 64.5, 1.4];
+        let straight = system
+            .inverse_normal_mass(id, centre, [1.0, 0.0, 0.0])
+            .ok_or("body")?;
+        let turned = system
+            .inverse_normal_mass(id, corner, [1.0, 0.0, 0.0])
+            .ok_or("body")?;
+        assert!((straight - 1.0 / 9.0).abs() < 1.0e-4, "{straight}");
+        assert!(turned > straight, "{turned}");
+
+        assert!(system.punch(id, centre, [9.0, 0.0, 0.0]));
+        let body = system.snapshots()[0];
+        assert_close(body.linear_velocity[0], 1.0);
+        assert!(body.angular_velocity.iter().all(|value| value.abs() < 0.01));
+        // The yaw a corner punch gives: the lever times the impulse, over
+        // the slab's inertia about the vertical (1/6 per block, plus each
+        // block's distance from the centre), about 0.93 rad/s.
+        assert!(system.punch(id, corner, [9.0, 0.0, 0.0]));
+        let body = system.snapshots()[0];
+        assert_close(body.linear_velocity[0], 2.0);
+        assert_close(body.angular_velocity[1], 0.93);
         Ok(())
     }
 

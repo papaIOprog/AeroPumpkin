@@ -16,6 +16,8 @@ pub const STOP_MOVING: &str = "sable:stop_moving_sub_level";
 pub const SNAPSHOT: &str = "sable:snapshot_packet";
 pub const SNAPSHOT_INFO: &str = "sable:snapshot_info_packet";
 pub const CHANGE_BOUNDS: &str = "sable:change_bounds_sublevel";
+/// The one payload Sable clients send: a player's punch on a sub-level.
+pub const PUNCH: &str = "sable:punch_sub_level";
 
 /// Sable clients register this channel, so its presence identifies them
 /// during `NeoForge` network negotiation.
