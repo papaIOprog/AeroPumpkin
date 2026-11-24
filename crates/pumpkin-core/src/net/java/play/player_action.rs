@@ -16,7 +16,10 @@ impl JavaClient {
         match Status::try_from(player_action.status.0) {
             Ok(status) => match status {
                 Status::StartedDigging => {
-                    if !player.can_interact_with_block_at(&player_action.position, 1.0) {
+                    if !player
+                        .world()
+                        .block_within_reach(player, &player_action.position, 1.0)
+                    {
                         warn!(
                             "Player {0} tried to interact with block out of reach at {1}",
                             player.gameprofile.name, player_action.position
@@ -152,7 +155,10 @@ impl JavaClient {
                     self.update_sequence(player_action.sequence.0);
                 }
                 Status::CancelledDigging => {
-                    if !player.can_interact_with_block_at(&player_action.position, 1.0) {
+                    if !player
+                        .world()
+                        .block_within_reach(player, &player_action.position, 1.0)
+                    {
                         warn!(
                             "Player {0} tried to interact with block out of reach at {1}",
                             player.gameprofile.name, player_action.position
@@ -185,7 +191,7 @@ impl JavaClient {
                 Status::FinishedDigging => {
                     // TODO: do validation
                     let location = player_action.position;
-                    if !player.can_interact_with_block_at(&location, 1.0) {
+                    if !player.world().block_within_reach(player, &location, 1.0) {
                         warn!(
                             "Player {0} tried to interact with block out of reach at {1}",
                             player.gameprofile.name, player_action.position

@@ -21,7 +21,7 @@ impl JavaClient {
 
         let mut should_try_decrement = false;
 
-        if !player.can_interact_with_block_at(&position, 1.0) {
+        if !player.world().block_within_reach(player, &position, 1.0) {
             // TODO: maybe log?
             return Err(BlockPlacingError::BlockOutOfReach);
         }

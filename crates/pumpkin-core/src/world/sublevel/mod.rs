@@ -2855,6 +2855,29 @@ impl World {
         manager.parked_to_world(position).unwrap_or(position)
     }
 
+    /// Whether `player`'s reach covers the block at `position`, plus
+    /// `additional_range`. A Sable client names a sub-level's blocks in the
+    /// plot's coordinates, millions of blocks out: those are in reach where
+    /// their sub-level shows them.
+    pub fn block_within_reach(
+        &self,
+        player: &Player,
+        position: &BlockPos,
+        additional_range: f64,
+    ) -> bool {
+        self.lock_sublevels()
+            .parked_to_world(position.0.to_f64() + Vector3::new(0.5, 0.5, 0.5))
+            .map_or_else(
+                || player.can_interact_with_block_at(position, additional_range),
+                |shown| {
+                    player.can_interact_with_block_at(
+                        &BlockPos(shown.floor_to_i32()),
+                        additional_range,
+                    )
+                },
+            )
+    }
+
     /// Sable's `ServerboundPunchSubLevelPacket`: the player punched the block
     /// `data` names, at `local` from a sub-level's place and towards
     /// `direction`. A sub-level is shoved; the one the player stands on is
