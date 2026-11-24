@@ -1,4 +1,4 @@
-// Pumpkin registry dump, a KubeJS 7 startup script (NeoForge 1.21.1).
+// Pumpkin registry dump, a KubeJS 7 client script (NeoForge 1.21.1).
 //
 // Writes <game directory>/local/kubejs/export/pumpkin-registry.json with every
 // built-in registry's entries and numeric ids, every block state with its
@@ -7,8 +7,9 @@
 // expect. The Pumpkin server loads it as its picture of this client: dump it
 // with exactly the mods the players join with.
 //
-// Where: <instance>/kubejs/startup_scripts/pumpkin_registry_dump.js
-// How:   launch the game once and quit at the main menu.
+// Where: <instance>/kubejs/client_scripts/pumpkin_registry_dump.js
+// How:   launch the game, join any singleplayer world once (tags only exist
+//        once a world's data packs are loaded) and quit.
 
 const safe = fn => {
   try {
@@ -26,7 +27,11 @@ const aabbs = shape => {
   return out
 }
 
-StartupEvents.postInit(event => {
+ClientEvents.loggedIn(event => {
+  if (global.pumpkinRegistryDumped) {
+    return
+  }
+  global.pumpkinRegistryDumped = true
   const started = Date.now()
   try {
     const BuiltInRegistries = Java.loadClass('net.minecraft.core.registries.BuiltInRegistries')
