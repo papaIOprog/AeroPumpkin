@@ -957,6 +957,17 @@ impl SubLevelSystem {
                 recovered.push(sublevel.id);
             }
         }
+        Step {
+            bodies: self.snapshots(),
+            impacts: self.collect_impacts(),
+            recovered,
+            gone: self.past_height_limits(),
+        }
+    }
+
+    /// Sub-levels whose blocks left the heights Sable lets sub-levels exist
+    /// at.
+    fn past_height_limits(&self) -> Vec<u32> {
         let mut gone = Vec::new();
         for sublevel in &self.sublevels {
             let (Some(analysed), Some(body)) = (&sublevel.content, self.bodies.get(sublevel.body))
@@ -968,12 +979,7 @@ impl SubLevelSystem {
                 gone.push(sublevel.id);
             }
         }
-        Step {
-            bodies: self.snapshots(),
-            impacts: self.collect_impacts(),
-            recovered,
-            gone,
-        }
+        gone
     }
 
     /// Turns the contacts of the tick into impacts of sub-level blocks
@@ -1523,15 +1529,13 @@ mod tests {
     }
 
     #[test]
-    fn a_sub_level_past_sable_height_limits_is_reported_gone() -> Result<(), &'static str> {
+    fn a_sub_level_past_sable_height_limits_is_reported_gone() {
         let mut system = SubLevelSystem::new(Air::default());
         let id = system.spawn([0.0, 64.0, 0.0]);
         assert!(system.set_content(id, slab(4, 4)));
         assert!(system.step().gone.is_empty());
         assert!(system.set_body_pose(id, [0.0, -20_000.5, 0.0], [0.0, 0.0, 0.0, 1.0]));
-        let gone = system.step().gone;
-        assert_eq!(gone.first(), Some(&id));
-        Ok(())
+        assert_eq!(system.step().gone, vec![id]);
     }
 
     #[test]
