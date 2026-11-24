@@ -32,7 +32,7 @@ pub use aero::{
 
 pub use voxel::{FloatingMaterial, Material, MaterialBox, Voxel, VoxelKind, VoxelShape};
 
-use rapier3d::na::{Matrix3, Quaternion, Vector3};
+use rapier3d::na::{Matrix3, Quaternion, UnitQuaternion, Vector3};
 use rapier3d::prelude::*;
 
 /// Sable gives sub-level colliders a friction of 0.525, which rapier
@@ -194,6 +194,32 @@ const ALIGN_SHIFT_DAMPING: f32 = 1.0;
 const MAX_ALIGN_TURN: f32 = 60.0;
 const MAX_ALIGN_SHIFT: f32 = 20.0;
 
+/// What the creative physics staff does to a sub-level, as Simulated's
+/// `PhysicsStaffServerHandler` keeps it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Hold {
+    /// Held in place where it was locked.
+    Locked,
+    /// Pulled so that the point `anchor` of its content, in the body's
+    /// own coordinates, comes to `goal` in the world, while the body is
+    /// turned to `orientation`, a quaternion `(x, y, z, w)`.
+    Dragged {
+        anchor: Vector3<f32>,
+        goal: Vector3<f32>,
+        orientation: Quaternion<f32>,
+    },
+}
+
+/// Simulated's `physics_staff_linear_stiffness` and
+/// `physics_staff_linear_damping`: the gains of the motors that pull a
+/// dragged sub-level.
+const STAFF_LINEAR_STIFFNESS: f32 = 2650.0;
+const STAFF_LINEAR_DAMPING: f32 = 125.0;
+/// Simulated's `physics_staff_angular_stiffness` and
+/// `physics_staff_angular_damping`.
+const STAFF_ANGULAR_STIFFNESS: f32 = 10_000.0;
+const STAFF_ANGULAR_DAMPING: f32 = 850.0;
+
 /// What a collider is: a box of a sub-level's content, or of the static
 /// surroundings sampled for one. Encoded in rapier's `user_data`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,6 +266,10 @@ struct SubLevel {
     persistent: Vec<PersistentForce>,
     /// Set while the body is steered to an orientation and onto the blocks.
     alignment: Option<Alignment>,
+    /// Set while the physics staff holds the body.
+    hold: Option<Hold>,
+    /// The constraint that holds it, while one does.
+    hold_joint: Option<ImpulseJointHandle>,
     /// The body's pose at the start of the tick, to fall back on.
     last_pose: (Isometry<f32>, bool),
     throttle: f32,
@@ -357,6 +387,8 @@ pub struct SubLevelSystem {
     gravity: Vector<f32>,
     integration: IntegrationParameters,
     air: Air,
+    /// The fixed body the staff's constraints tie a sub-level to.
+    ground: RigidBodyHandle,
     sublevels: Vec<SubLevel>,
     next_id: u32,
     impacts: ImpactCollector,
@@ -375,7 +407,7 @@ impl SubLevelSystem {
     #[must_use]
     pub fn new(air: Air) -> Self {
         let content_friction_factor = CONTENT_FRICTION.sqrt();
-        Self {
+        let mut system = Self {
             content_friction_factor,
             static_friction_factor: GROUND_VS_CONTENT_FRICTION / content_friction_factor,
             bodies: RigidBodySet::new(),
@@ -392,9 +424,12 @@ impl SubLevelSystem {
             integration: integration_parameters(),
             air,
             sublevels: Vec::new(),
+            ground: RigidBodyHandle::invalid(),
             next_id: 1,
             impacts: ImpactCollector::default(),
-        }
+        };
+        system.ground = system.bodies.insert(RigidBodyBuilder::fixed().build());
+        system
     }
 
     /// Spawns a massless dynamic body at `position`. It stays where it is
@@ -428,6 +463,8 @@ impl SubLevelSystem {
             refresh: false,
             persistent: Vec::new(),
             alignment: None,
+            hold: None,
+            hold_joint: None,
             last_pose: (Isometry::identity(), false),
             throttle: 1.0,
             active: false,
@@ -808,6 +845,178 @@ impl SubLevelSystem {
         Some(lever.dot(&(inverse_world * lever)) + properties.inv_mass)
     }
 
+    /// Locks sub-level `id` in place where it stands, or lets it go when
+    /// it is locked: Simulated's `toggleLock`. Whether it is locked now;
+    /// `None` for no such sub-level.
+    pub fn toggle_lock(&mut self, id: u32) -> Option<bool> {
+        let index = self.sublevels.iter().position(|s| s.id == id)?;
+        if self.sublevels[index].hold == Some(Hold::Locked) {
+            self.let_go(index);
+            Some(false)
+        } else {
+            self.lock(index);
+            Some(true)
+        }
+    }
+
+    /// Whether sub-level `id` is locked in place.
+    #[must_use]
+    pub fn is_locked(&self, id: u32) -> bool {
+        self.sublevels
+            .iter()
+            .find(|s| s.id == id)
+            .is_some_and(|s| s.hold == Some(Hold::Locked))
+    }
+
+    /// Lets sub-level `id` go, locked or dragged as it was.
+    pub fn let_go_id(&mut self, id: u32) -> bool {
+        let Some(index) = self
+            .sublevels
+            .iter()
+            .position(|s| s.id == id && s.hold.is_some())
+        else {
+            return false;
+        };
+        self.let_go(index);
+        true
+    }
+
+    /// What the staff does to every sub-level, with the sub-level's id.
+    pub fn holds(&self) -> impl Iterator<Item = (u32, Hold)> + '_ {
+        self.sublevels.iter().filter_map(|s| Some((s.id, s.hold?)))
+    }
+
+    fn lock(&mut self, index: usize) {
+        self.let_go(index);
+        let body_handle = self.sublevels[index].body;
+        let Some(body) = self.bodies.get(body_handle) else {
+            return;
+        };
+        // Held where it stands: the joint's frames coincide only at this pose.
+        let joint = FixedJointBuilder::new()
+            .local_frame1(*body.position())
+            .local_frame2(Isometry::identity());
+        let handle = self
+            .impulse_joints
+            .insert(self.ground, body_handle, joint, true);
+        let sublevel = &mut self.sublevels[index];
+        sublevel.hold = Some(Hold::Locked);
+        sublevel.hold_joint = Some(handle);
+    }
+
+    fn let_go(&mut self, index: usize) {
+        let sublevel = &mut self.sublevels[index];
+        sublevel.hold = None;
+        if let Some(joint) = sublevel.hold_joint.take() {
+            self.impulse_joints.remove(joint, false);
+        }
+    }
+
+    /// Drags sub-level `id`: the point `anchor` of its content, in the
+    /// body's own coordinates, is pulled to `goal` in the world while the
+    /// body is turned to `orientation`, a quaternion `(x, y, z, w)`, as
+    /// Simulated's `drag`. A lock gives way.
+    pub fn drag(
+        &mut self,
+        id: u32,
+        anchor: [f32; 3],
+        goal: [f32; 3],
+        orientation: [f32; 4],
+    ) -> bool {
+        let Some(index) = self.sublevels.iter().position(|s| s.id == id) else {
+            return false;
+        };
+        self.let_go(index);
+        self.sublevels[index].hold = Some(Hold::Dragged {
+            anchor: anchor.into(),
+            goal: goal.into(),
+            orientation: Quaternion::new(
+                orientation[3],
+                orientation[0],
+                orientation[1],
+                orientation[2],
+            ),
+        });
+        true
+    }
+
+    /// Where the staff drags sub-level `id`'s anchor to now.
+    pub fn set_drag_goal(&mut self, id: u32, goal: [f32; 3]) -> bool {
+        let goal = goal.into();
+        let Some(sublevel) = self.sublevels.iter_mut().find(|s| s.id == id) else {
+            return false;
+        };
+        match sublevel.hold.as_mut() {
+            Some(Hold::Dragged { goal: at, .. }) => *at = goal,
+            _ => return false,
+        }
+        true
+    }
+
+    /// Re-ties every dragged sub-level for this substep.
+    fn retie_dragged(&mut self) {
+        for index in 0..self.sublevels.len() {
+            if self.sublevels[index].active
+                && matches!(self.sublevels[index].hold, Some(Hold::Dragged { .. }))
+            {
+                self.retie(index);
+            }
+        }
+    }
+
+    /// Re-ties a dragged sub-level for this substep, as Sable re-creates
+    /// the constraint every physics tick. Only the staff's frame carries
+    /// the orientation, so the angular motors turn the body into it, and
+    /// the linear ones aim at the goal turned into that frame.
+    fn retie(&mut self, index: usize) {
+        let sublevel = &mut self.sublevels[index];
+        let Hold::Dragged {
+            anchor,
+            goal,
+            orientation,
+        } = sublevel.hold.unwrap_or(Hold::Locked)
+        else {
+            return;
+        };
+        let (anchor, goal, orientation) = (anchor, goal, orientation);
+        let body = sublevel.body;
+        if let Some(joint) = sublevel.hold_joint.take() {
+            self.impulse_joints.remove(joint, false);
+        }
+        let orientation = UnitQuaternion::new_normalize(orientation);
+        let joint = GenericJointBuilder::new(JointAxesMask::empty())
+            .local_frame1(Isometry::from_parts(Translation::identity(), orientation))
+            .local_frame2(Isometry::from_parts(
+                Translation::from(anchor),
+                UnitQuaternion::identity(),
+            ));
+        let handle = self.impulse_joints.insert(self.ground, body, joint, true);
+        self.sublevels[index].hold_joint = Some(handle);
+        let Some(joint) = self.impulse_joints.get_mut(handle, false) else {
+            return;
+        };
+        for axis in [JointAxis::AngX, JointAxis::AngY, JointAxis::AngZ] {
+            joint.data.set_motor_position(
+                axis,
+                0.0,
+                STAFF_ANGULAR_STIFFNESS,
+                STAFF_ANGULAR_DAMPING,
+            );
+        }
+        let local_goal = orientation.conjugate() * goal;
+        for (axis, target) in [JointAxis::LinX, JointAxis::LinY, JointAxis::LinZ]
+            .into_iter()
+            .zip(local_goal.iter())
+        {
+            joint.data.set_motor_position(
+                axis,
+                *target,
+                STAFF_LINEAR_STIFFNESS,
+                STAFF_LINEAR_DAMPING,
+            );
+        }
+    }
+
     /// Shoves sub-level `id` with an impulse at a world `point`, as a punch
     /// does.
     pub fn punch(&mut self, id: u32, point: [f32; 3], impulse: [f32; 3]) -> bool {
@@ -876,6 +1085,7 @@ impl SubLevelSystem {
             }
         }
         for _ in 0..SUBSTEPS {
+            self.retie_dragged();
             for sublevel in &mut self.sublevels {
                 if !sublevel.active {
                     continue;
@@ -1536,6 +1746,60 @@ mod tests {
         assert!(system.step().gone.is_empty());
         assert!(system.set_body_pose(id, [0.0, -20_000.5, 0.0], [0.0, 0.0, 0.0, 1.0]));
         assert_eq!(system.step().gone, vec![id]);
+    }
+
+    #[test]
+    fn a_locked_body_stays_put_until_let_go() {
+        // Shoved and locked, the body keeps its place against the shove and
+        // the staff; let go, a shove moves it again.
+        let mut system = SubLevelSystem::new(Air::default());
+        let id = airborne(&mut system, slab(4, 4), [0.0, 64.5, 0.0]);
+        assert!(system.drag(id, [0.0; 3], [0.0, 64.5, 0.0], [0.0, 0.0, 0.0, 1.0]));
+        settle(&mut system, id, 2);
+        assert_eq!(system.toggle_lock(id), Some(true));
+        assert!(system.is_locked(id));
+        let locked = system.snapshots()[0].position;
+        assert!(system.punch(id, [1.9, 64.5, 1.9], [40.0, 0.0, 0.0]));
+        settle(&mut system, id, 20);
+        let held = system.snapshots()[0];
+        assert!(held.linear_velocity.iter().all(|value| value.abs() < 0.01));
+        for (axis, at) in locked.iter().enumerate() {
+            assert!((held.position[axis] - at).abs() < 0.05, "{axis}");
+        }
+        assert_eq!(system.toggle_lock(id), Some(false));
+        assert!(!system.is_locked(id));
+        assert!(system.punch(id, [1.9, 64.5, 1.9], [40.0, 0.0, 0.0]));
+        settle(&mut system, id, 20);
+        let moved = system.snapshots()[0];
+        assert!(moved.position[0] > locked[0] + 1.0, "{moved:?}");
+    }
+
+    #[test]
+    fn a_dragged_body_follows_its_goal_held_up_and_turned() {
+        // Nothing holds the body up but the staff: dragged to a point in the
+        // air it settles there, turned as asked, and falls once let go.
+        let mut system = SubLevelSystem::new(Air::default());
+        let id = airborne(&mut system, slab(4, 4), [0.0, 64.5, 0.0]);
+        let eighth = std::f32::consts::FRAC_PI_4;
+        let half = [0.0, eighth.sin(), 0.0, eighth.cos()];
+        let goal = [6.0, 80.0, -2.0];
+        assert!(system.drag(id, [0.0; 3], goal, half));
+        settle(&mut system, id, 120);
+        let dragged = system.snapshots()[0];
+        for (axis, at) in goal.iter().enumerate() {
+            assert!(
+                (dragged.position[axis] - at).abs() < 0.1,
+                "{axis}: {dragged:?}"
+            );
+        }
+        // A quarter turn about up: the body's x axis now points along the
+        // world's negative z.
+        let [x, y, z, w] = dragged.rotation;
+        let x_axis_z = 2.0 * (x * z - y * w);
+        assert!(x_axis_z < -0.95, "{dragged:?}");
+        assert!(system.let_go_id(id));
+        settle(&mut system, id, 40);
+        assert!(system.snapshots()[0].position[1] < goal[1] - 5.0);
     }
 
     #[test]
