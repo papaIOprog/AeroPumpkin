@@ -566,8 +566,17 @@ pub(crate) fn build() -> TokenStream {
                     } else {
                         None
                     }
-                })?;
-                Some(items.contains(&self.registry_id()))
+                });
+                Some(
+                    items.is_some_and(|items| items.contains(&self.registry_id()))
+                        || self.is_modded_tagged(tag),
+                )
+            }
+
+            /// Whether the installed profile puts `self` in the tag `tag`
+            /// (`namespace:path`): the generated tables know vanilla only.
+            fn is_modded_tagged(&self, _tag: &str) -> bool {
+                false
             }
 
             #[must_use]

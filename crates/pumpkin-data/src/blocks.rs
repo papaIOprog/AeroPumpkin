@@ -112,6 +112,18 @@ impl Taggable for Block {
     fn registry_id(&self) -> u16 {
         self.id.as_u16()
     }
+
+    fn is_modded_tagged(&self, tag: &str) -> bool {
+        let tag = tag.strip_prefix('#').unwrap_or(tag);
+        if tag.contains(':') {
+            crate::mods::block_has_tag(self, tag)
+        } else {
+            let mut full = String::with_capacity(10 + tag.len());
+            full.push_str("minecraft:");
+            full.push_str(tag);
+            crate::mods::block_has_tag(self, &full)
+        }
+    }
 }
 
 impl ToResourceLocation for &'static Block {
