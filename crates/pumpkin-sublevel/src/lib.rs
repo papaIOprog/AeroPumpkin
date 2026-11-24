@@ -707,6 +707,54 @@ impl SubLevelSystem {
         Some((angle, distance))
     }
 
+    /// Places sub-level `id`'s body at `position` with `rotation`.
+    pub fn set_body_pose(&mut self, id: u32, position: [f64; 3], rotation: [f32; 4]) -> bool {
+        let Some(body) = self
+            .body_of(id)
+            .and_then(|handle| self.bodies.get_mut(handle))
+        else {
+            return false;
+        };
+        let rotation = Quaternion::new(rotation[3], rotation[0], rotation[1], rotation[2]);
+        body.set_position(
+            Isometry::from_parts(
+                rapier3d::na::Translation::from(Vector3::new(
+                    position[0] as f32,
+                    position[1] as f32,
+                    position[2] as f32,
+                )),
+                rapier3d::na::UnitQuaternion::new_normalize(rotation),
+            ),
+            true,
+        );
+        true
+    }
+
+    /// Sub-level `to` takes up the motion of sub-level `from` at the
+    /// place they share, as a piece split off from a sub-level does: the
+    /// velocity at its centre of mass, and the spin.
+    pub fn inherit_velocity(&mut self, from: u32, to: u32) -> bool {
+        let (Some(source), Some(target)) = (self.body_of(from), self.body_of(to)) else {
+            return false;
+        };
+        let Some(motion) = self.bodies.get(source).and_then(|source| {
+            let target = self.bodies.get(target)?;
+            Some((
+                *source.linvel(),
+                *source.angvel(),
+                target.center_of_mass() - source.center_of_mass(),
+            ))
+        }) else {
+            return false;
+        };
+        let Some(target) = self.bodies.get_mut(target) else {
+            return false;
+        };
+        target.set_linvel(motion.0 + motion.1.cross(&motion.2), true);
+        target.set_angvel(motion.1, true);
+        true
+    }
+
     /// The body's place in the world, which the pose reports.
     #[must_use]
     pub fn pivot_of(&self, id: u32) -> Option<[f32; 3]> {

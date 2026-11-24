@@ -16,6 +16,7 @@ pub const STOP_MOVING: &str = "sable:stop_moving_sub_level";
 pub const SNAPSHOT: &str = "sable:snapshot_packet";
 pub const SNAPSHOT_INFO: &str = "sable:snapshot_info_packet";
 pub const CHANGE_BOUNDS: &str = "sable:change_bounds_sublevel";
+pub const RECENTLY_SPLIT: &str = "sable:recently_split_sub_level";
 /// The one payload Sable clients send: a player's punch on a sub-level.
 pub const PUNCH: &str = "sable:punch_sub_level";
 
@@ -112,13 +113,7 @@ pub fn encode_start_tracking(
 ) -> Result<Vec<u8>, WritingError> {
     let mut buf = Vec::with_capacity(133);
     buf.write_i64(plot)?;
-    let bits = id.as_u128();
-    buf.extend_from_slice(&u64::try_from(bits >> 64).unwrap_or(0).to_be_bytes());
-    buf.extend_from_slice(
-        &u64::try_from(bits & 0xFFFF_FFFF_FFFF_FFFF)
-            .unwrap_or(0)
-            .to_be_bytes(),
-    );
+    write_uuid(&mut buf, id);
     last_pose.write(&mut buf)?;
     pose.write(&mut buf)?;
     for value in bounds {
@@ -127,6 +122,24 @@ pub fn encode_start_tracking(
     buf.write_bool(false)?;
     buf.write_i32(game_tick)?;
     Ok(buf)
+}
+
+/// `sable:recently_split_sub_level`.
+///
+/// A sub-level split off another one, so the client continues the origin's
+/// motion for it until its own snapshots arrive. The pose is the new
+/// sub-level's in the origin's frame.
+pub fn encode_recently_split(id: Uuid, from: Uuid, pose: &Pose) -> Result<Vec<u8>, WritingError> {
+    let mut buf = Vec::with_capacity(96);
+    write_uuid(&mut buf, id);
+    write_uuid(&mut buf, from);
+    pose.write(&mut buf)?;
+    Ok(buf)
+}
+
+/// `UUIDUtil.STREAM_CODEC`: the most significant bits first.
+fn write_uuid(buf: &mut Vec<u8>, id: Uuid) {
+    buf.extend_from_slice(id.as_bytes());
 }
 
 /// `sable:finalize_sub_level`, `sable:stop_tracking_sub_level` and
@@ -250,6 +263,29 @@ mod tests {
         );
         assert_eq!(bytes[176], 0);
         assert_eq!(&bytes[177..181], &[0, 0, 0, 4]);
+    }
+
+    #[test]
+    fn recently_split_layout() {
+        let id = Uuid::from_u128(0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210);
+        let from = Uuid::from_u128(0xFEDC_BA98_7654_3210_0123_4567_89AB_CDEF);
+        let pose = Pose {
+            position: [20481033.0, 129.0, 20481032.5],
+            ..Pose::default()
+        };
+        let bytes = encode_recently_split(id, from, &pose).unwrap();
+        // Two UUIDs, then the pose.
+        assert_eq!(bytes.len(), 16 + 16 + 64);
+        assert_eq!(&bytes[..16], &id.as_bytes()[..]);
+        assert_eq!(&bytes[16..32], &from.as_bytes()[..]);
+        let read_f64 = |at: usize| f64::from_be_bytes(bytes[at..at + 8].try_into().unwrap());
+        assert_eq!(read_f64(32), 20481033.0);
+        assert_eq!(read_f64(40), 129.0);
+        assert_eq!(read_f64(48), 20481032.5);
+        // The identity quaternion follows, then a rotation point at zero.
+        assert!(bytes[56..68].iter().all(|byte| *byte == 0));
+        assert_eq!(bytes[68..72], [0x3F, 0x80, 0, 0]);
+        assert!(bytes[72..96].iter().all(|byte| *byte == 0));
     }
 
     #[test]

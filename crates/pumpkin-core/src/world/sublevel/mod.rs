@@ -117,6 +117,89 @@ struct SubLevel {
     /// Set while the sub-level is driven level and onto block centres to be
     /// melted back into the world.
     disassembling: Option<Disassembly>,
+    /// The block Sable's heat map grows from, in the content's grid: the
+    /// piece holding it keeps the sub-level when the content comes apart.
+    root: Option<[i32; 3]>,
+    /// Set while a piece of the sub-level is moving to a plot of its own.
+    splitting: bool,
+    /// The sub-level a piece was split off from and the pose it had in that
+    /// one's frame, until the sub-level's first full sync: Sable's
+    /// `ClientboundRecentlySplitSubLevelPacket`.
+    split_from: Option<(u32, sable::Pose)>,
+}
+
+/// A piece of a sub-level's content that holds together: its blocks, their
+/// mass, and their grid bounds.
+struct Piece {
+    voxels: Vec<Voxel>,
+    mass: f32,
+    bounds: [i32; 6],
+}
+
+/// The pieces of a content: blocks joined through faces and edges, as
+/// Sable's heat map joins them. One piece for content that holds together.
+fn pieces_of(voxels: &[Voxel]) -> Vec<Piece> {
+    let mut place: FxHashMap<[i32; 3], usize> = FxHashMap::default();
+    for (index, voxel) in voxels.iter().enumerate() {
+        place.insert(voxel.position, index);
+    }
+    let mut visited = vec![false; voxels.len()];
+    let mut pieces = Vec::new();
+    for start in 0..voxels.len() {
+        if visited[start] {
+            continue;
+        }
+        visited[start] = true;
+        let mut piece = Piece {
+            voxels: Vec::new(),
+            mass: 0.0,
+            bounds: [i32::MAX, i32::MAX, i32::MAX, i32::MIN, i32::MIN, i32::MIN],
+        };
+        let mut stack = vec![start];
+        while let Some(index) = stack.pop() {
+            let voxel = &voxels[index];
+            piece.voxels.push(voxel.clone());
+            piece.mass += voxel.mass;
+            for axis in 0..3 {
+                piece.bounds[axis] = piece.bounds[axis].min(voxel.position[axis]);
+                piece.bounds[axis + 3] = piece.bounds[axis + 3].max(voxel.position[axis]);
+            }
+            for offset in ASSEMBLY_NEIGHBOURS {
+                let next = [
+                    voxel.position[0] + offset.x,
+                    voxel.position[1] + offset.y,
+                    voxel.position[2] + offset.z,
+                ];
+                if let Some(&neighbour) = place.get(&next)
+                    && !visited[neighbour]
+                {
+                    visited[neighbour] = true;
+                    stack.push(neighbour);
+                }
+            }
+        }
+        pieces.push(piece);
+    }
+    pieces
+}
+
+/// The piece that keeps the sub-level when its content comes apart, as
+/// Sable's heat map decides it: the one holding the block the heat map grows
+/// from. With that block gone every piece would part ways, so the largest
+/// stays. Index into `pieces`, which has more than one.
+fn kept_piece(pieces: &[Piece], root: Option<[i32; 3]>) -> usize {
+    if let Some(root) = root
+        && let Some(kept) = pieces
+            .iter()
+            .position(|piece| piece.voxels.iter().any(|voxel| voxel.position == root))
+    {
+        return kept;
+    }
+    pieces
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, piece)| piece.voxels.len())
+        .map_or(0, |(index, _)| index)
 }
 
 /// Sable's `sub_level_punch_strength_multiplier`.
@@ -611,6 +694,9 @@ impl SubLevelManager {
             tracking: FxHashSet::default(),
             surroundings_chunks: Vec::new(),
             source: None,
+            root: None,
+            splitting: false,
+            split_from: None,
             disassembling: None,
         });
         (id, center)
@@ -627,7 +713,7 @@ impl SubLevelManager {
         pose: Vector3<f64>,
         bounds: [i32; 6],
         pivot_offset: Vector3<f64>,
-        source: [[i32; 3]; 2],
+        source: Option<[[i32; 3]; 2]>,
     ) -> u32 {
         let plot = self.first_free_plot();
         let corner = Vector2::new(
@@ -659,10 +745,87 @@ impl SubLevelManager {
             stop_sent: false,
             tracking: FxHashSet::default(),
             surroundings_chunks: Vec::new(),
-            source: Some(source),
+            source,
             disassembling: None,
+            root: None,
+            splitting: false,
+            split_from: None,
         });
         id
+    }
+
+    /// Sable's heat map split: a piece of sub-level `id`'s parked blocks,
+    /// `piece` being its absolute parked bounds, becomes a sub-level of its
+    /// own, with the same pose and pivot so the piece stays exactly where it
+    /// is. The plot it moves to is empty until [`World::move_piece`] fills
+    /// it. Returns the new sub-level and how far its blocks move in the
+    /// plotyard.
+    pub fn split(&mut self, id: u32, piece: [i32; 6]) -> Option<(u32, Vector3<i32>)> {
+        let level = self.levels.iter().find(|level| level.id == id)?;
+        let old_center = plot_center_block(level.chunk);
+        let from_anchor = level.from_anchor;
+        let pose = self.pose_of(id)?;
+        let relative = [
+            piece[0] - old_center.x,
+            piece[1] - old_center.y,
+            piece[2] - old_center.z,
+            piece[3] - old_center.x,
+            piece[4] - old_center.y,
+            piece[5] - old_center.z,
+        ];
+        let new_id = self.assemble(
+            Vector3::new(pose.position[0], pose.position[1], pose.position[2]),
+            relative,
+            from_anchor,
+            None,
+        );
+        // Turned as the old one is, so the piece keeps its place.
+        self.physics
+            .set_body_pose(new_id, pose.position, pose.orientation);
+        let new_center = plot_center_block(self.chunk_of(new_id)?);
+        if let Some(level) = self.levels.iter_mut().find(|level| level.id == id) {
+            level.splitting = true;
+        }
+        // Sable's recently split packet carries the piece's pose in the old
+        // sub-level's frame, for the client to continue its motion from. The
+        // piece starts on the old sub-level's pivot, so there it sits on the
+        // rotation point.
+        if let Some(level) = self.levels.iter_mut().find(|level| level.id == new_id) {
+            level.split_from = Some((
+                id,
+                sable::Pose {
+                    position: pose.rotation_point,
+                    rotation_point: [level.pivot.x, level.pivot.y, level.pivot.z],
+                    ..sable::Pose::default()
+                },
+            ));
+        }
+        Some((new_id, new_center - old_center))
+    }
+
+    /// The block Sable's heat map grows from in sub-level `id`, in its
+    /// content's grid.
+    #[must_use]
+    pub fn root_of(&self, id: u32) -> Option<[i32; 3]> {
+        self.levels
+            .iter()
+            .find(|level| level.id == id)
+            .and_then(|level| level.root)
+    }
+
+    /// Whether a piece of sub-level `id` is on its way to a plot of its own.
+    pub fn is_splitting(&self, id: u32) -> bool {
+        self.levels
+            .iter()
+            .find(|level| level.id == id)
+            .is_some_and(|level| level.splitting)
+    }
+
+    /// Notes that sub-level `id`'s pieces have left its plot.
+    pub fn end_split(&mut self, id: u32) {
+        if let Some(level) = self.levels.iter_mut().find(|level| level.id == id) {
+            level.splitting = false;
+        }
     }
 
     /// Starts driving sub-level `id` to the alignment its disassembly
@@ -896,6 +1059,11 @@ impl SubLevelManager {
         self.dirty.drain().collect()
     }
 
+    /// Schedules a rescan of sub-level `id`.
+    pub fn note_rescan(&mut self, id: u32) {
+        self.dirty.insert(id);
+    }
+
     /// Whether sub-level `id`'s block `block` may sound its knock on tick
     /// `tick`: not if it sounded within the last `quiet` ticks.
     /// Sable's punch: sub-level `target` is shoved at the hit, its place
@@ -1084,6 +1252,18 @@ impl SubLevelManager {
     /// Hands sub-level `id` its content once its blocks are parked; the
     /// body then takes their mass and shape and waits for its surroundings.
     pub fn set_content(&mut self, id: u32, content: Content) -> bool {
+        // Sable's heat map grows from the first block placed in a sub-level.
+        // The piece holding that block keeps the sub-level when the content
+        // comes apart; with the block gone, the first block of what remains
+        // takes over.
+        if let Some(level) = self.levels.iter_mut().find(|level| level.id == id)
+            && !content
+                .voxels
+                .iter()
+                .any(|voxel| Some(voxel.position) == level.root)
+        {
+            level.root = content.voxels.first().map(|voxel| voxel.position);
+        }
         self.physics.set_content(id, content)
     }
 
@@ -1318,7 +1498,22 @@ impl SubLevelManager {
             let Some(body) = bodies.iter().find(|body| body.id == *id) else {
                 continue;
             };
-            send_full_sync(world, player, level, body, self.tick);
+            // A piece split off another sub-level follows that one's motion
+            // until its own snapshots arrive, for players who track both.
+            let split_from = level.split_from.and_then(|(from, pose)| {
+                let origin = self.levels.iter().find(|other| other.id == from)?;
+                origin
+                    .tracking
+                    .contains(uuid)
+                    .then_some((origin.uuid, pose))
+            });
+            send_full_sync(world, player, level, body, self.tick, split_from);
+        }
+        // The split is news only to the players a sub-level starts with.
+        for level in &mut self.levels {
+            if level.ready {
+                level.split_from = None;
+            }
         }
     }
 
@@ -1581,13 +1776,15 @@ fn send_payload(player: &Player, channel: &str, data: &[u8]) {
 }
 
 /// Sable's full sync: start tracking, one chunk packet per content chunk,
-/// finalize, in a bundle.
+/// finalize, in a bundle; a sub-level split off another one comes with what
+/// Sable's recently split packet says about it.
 fn send_full_sync(
     world: &World,
     player: &Player,
     level: &SubLevel,
     body: &BodySnapshot,
     tick: i32,
+    split_from: Option<(Uuid, sable::Pose)>,
 ) {
     let version = player.client.java_version();
     let mut members = Vec::with_capacity(level.chunks.len() + 2);
@@ -1603,6 +1800,13 @@ fn send_full_sync(
             tick,
         )),
     ));
+    if let Some((origin, pose)) = split_from {
+        members.push(encode_payload(
+            player,
+            sable::RECENTLY_SPLIT,
+            &encode(sable::encode_recently_split(level.uuid, origin, &pose)),
+        ));
+    }
     for chunk in &level.chunks {
         let Some(chunk) = world.level.read_chunk_sync(chunk, Arc::clone) else {
             debug!("sublevel: plot chunk of {} is not readable yet", level.id);
@@ -1919,7 +2123,7 @@ impl World {
             pose,
             bounds,
             pivot_offset,
-            [[min.x, min.y, min.z], [max.x, max.y, max.z]],
+            Some([[min.x, min.y, min.z], [max.x, max.y, max.z]]),
         );
         let world = Arc::clone(self);
         tokio::spawn(async move {
@@ -2084,12 +2288,56 @@ impl World {
             self.remove_sublevel(id);
             return;
         }
-        // Sable keeps its bounds tight to the content: a block gone from an
-        // edge shrinks the client's render and collision box.
-        manager.tighten_bounds(id, tight_bounds(anchor, &voxels));
         let pivot_offset = manager.from_anchor_of(id).map_or([0.0; 3], |offset| {
             [offset.x as f32, offset.y as f32, offset.z as f32]
         });
+        // Sable's heat map: blocks that no longer hold together part ways.
+        // Every piece but the one keeping the sub-level becomes a sub-level of
+        // its own, and a piece without mass goes. While pieces are on their
+        // way, the content is read as it is.
+        let mut pieces = if manager.is_splitting(id) {
+            Vec::new()
+        } else {
+            pieces_of(&voxels)
+        };
+        if pieces.len() > 1 {
+            let kept = kept_piece(&pieces, manager.root_of(id));
+            pieces.swap(kept, 0);
+            let mut kept = pieces.swap_remove(0).voxels;
+            let mut moves = Vec::new();
+            let mut discards = Vec::new();
+            for piece in pieces {
+                let bounds = parked_bounds(anchor, &piece.bounds);
+                if piece.mass <= 0.0 {
+                    discards.push(bounds);
+                } else if let Some((new_id, delta)) = manager.split(id, bounds) {
+                    moves.push((new_id, delta, bounds));
+                } else {
+                    kept.extend(piece.voxels);
+                }
+            }
+            manager.tighten_bounds(id, tight_bounds(anchor, &kept));
+            manager.set_content(
+                id,
+                Content {
+                    pivot_offset,
+                    voxels: kept,
+                },
+            );
+            drop(manager);
+            // Its own statement: the edits take the lock again.
+            for bounds in discards {
+                self.discard_piece(bounds);
+            }
+            for (new_id, delta, bounds) in moves {
+                let world = Arc::clone(self);
+                tokio::spawn(async move { world.move_piece(id, new_id, delta, bounds).await });
+            }
+            return;
+        }
+        // Sable keeps its bounds tight to the content: a block gone from an
+        // edge shrinks the client's render and collision box.
+        manager.tighten_bounds(id, tight_bounds(anchor, &voxels));
         manager.set_content(
             id,
             Content {
@@ -2097,6 +2345,119 @@ impl World {
                 voxels,
             },
         );
+    }
+
+    /// Moves a piece of sub-level `old`, the blocks in its absolute parked
+    /// `bounds`, into sub-level `new`'s plot, `delta` blocks over in the
+    /// plotyard, then gives the new sub-level its content, the old one's
+    /// motion, and lets both be seen.
+    async fn move_piece(
+        self: Arc<Self>,
+        old: u32,
+        new: u32,
+        delta: Vector3<i32>,
+        bounds: [i32; 6],
+    ) {
+        let Some(chunks) = self.lock_sublevels().chunks_of(new) else {
+            return;
+        };
+        if !self.await_plot_chunks(&chunks).await {
+            warn!("sublevel {new}: its plot chunks never loaded; the piece stays with {old}");
+            self.lock_sublevels().remove(new);
+            self.lock_sublevels().end_split(old);
+            return;
+        }
+        for chunk in &chunks {
+            self.clear_parked_chunk(*chunk);
+        }
+        let copy = BlockFlags::SKIP_BLOCK_ADDED_CALLBACK | BlockFlags::UPDATE_KNOWN_SHAPE;
+        let clear = BlockFlags::NOTIFY_ALL
+            | BlockFlags::SKIP_DROPS
+            | BlockFlags::FORCE_STATE
+            | BlockFlags::SKIP_BLOCK_ENTITY_REPLACED_CALLBACK;
+        for x in bounds[0]..=bounds[3] {
+            for y in bounds[1]..=bounds[4] {
+                for z in bounds[2]..=bounds[5] {
+                    let parked = BlockPos(Vector3::new(x, y, z));
+                    let state = self.get_block_state_id(&parked);
+                    if state == Block::AIR.default_state.id {
+                        continue;
+                    }
+                    let to = BlockPos(parked.0 + delta);
+                    self.set_block_state(&to, state, copy);
+                    if let Some(block_entity) = self.get_block_entity(&parked) {
+                        self.restore_block_entity_at(&block_entity, to);
+                    }
+                    self.set_block_state(&parked, Block::AIR.default_state.id, clear);
+                }
+            }
+        }
+        // Entities parked on the piece move with it.
+        for entity in self.entities.load().iter() {
+            let entity = entity.get_entity();
+            let pos = entity.pos.load();
+            let block = pos.floor_to_i32();
+            if block.x >= bounds[0]
+                && block.x <= bounds[3]
+                && block.y >= bounds[1]
+                && block.y <= bounds[4]
+                && block.z >= bounds[2]
+                && block.z <= bounds[5]
+            {
+                entity.set_pos(pos + delta.to_f64());
+            }
+        }
+        let anchor = self
+            .lock_sublevels()
+            .anchor_of(new)
+            .map(|anchor| anchor.floor_to_i32());
+        let Some(anchor) = anchor else {
+            return;
+        };
+        let Some(voxels) = self.content_from_plot(new, anchor) else {
+            return;
+        };
+        let mut manager = self.lock_sublevels();
+        if voxels.is_empty() {
+            drop(manager);
+            self.remove_sublevel(new);
+            self.lock_sublevels().end_split(old);
+            return;
+        }
+        let pivot_offset = manager.from_anchor_of(new).map_or([0.0; 3], |offset| {
+            [offset.x as f32, offset.y as f32, offset.z as f32]
+        });
+        manager.set_content(
+            new,
+            Content {
+                pivot_offset,
+                voxels,
+            },
+        );
+        manager.physics.inherit_velocity(old, new);
+        manager.mark_ready(new);
+        manager.end_split(old);
+        manager.note_rescan(old);
+        drop(manager);
+        info!("sublevel {new} split off sublevel {old}");
+    }
+
+    /// Destroys a massless piece of a sub-level, with its drops.
+    fn discard_piece(self: &Arc<Self>, bounds: [i32; 6]) {
+        for x in bounds[0]..=bounds[3] {
+            for y in bounds[1]..=bounds[4] {
+                for z in bounds[2]..=bounds[5] {
+                    let pos = BlockPos(Vector3::new(x, y, z));
+                    if self.get_block_state_id(&pos) != Block::AIR.default_state.id {
+                        self.set_block_state(
+                            &pos,
+                            Block::AIR.default_state.id,
+                            BlockFlags::NOTIFY_ALL,
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Deals with what the sub-levels hit this tick: fragile blocks break,
@@ -3067,7 +3428,7 @@ mod tests {
                 max.z - anchor.z,
             ],
             pose - anchor.to_f64(),
-            [[min.x, min.y, min.z], [max.x, max.y, max.z]],
+            Some([[min.x, min.y, min.z], [max.x, max.y, max.z]]),
         );
 
         let bounds = manager.bounds_of(id).expect("assembled sub-level exists");
@@ -3205,6 +3566,153 @@ mod tests {
         // And the velocity change it buys falls as mass grows.
         let velocity = |mass: f64| punch_curve(mass) / mass;
         assert!(velocity(10.0) < velocity(1.0) && velocity(1000.0) < velocity(10.0));
+    }
+
+    #[test]
+    fn pieces_hold_together_through_faces_and_edges_only() {
+        // Two blocks touching on a face, two on an edge, and one touching
+        // the first only at a corner: three pieces, the corner one alone.
+        let voxels = [
+            Voxel::cube([0, 0, 0], 1.0),
+            Voxel::cube([1, 0, 0], 1.0),
+            Voxel::cube([2, 1, 0], 1.0),
+            Voxel::cube([2, 2, 2], 0.5),
+        ];
+        let mut pieces = pieces_of(&voxels);
+        pieces.sort_by_key(|piece| piece.bounds[0]);
+        assert_eq!(pieces.len(), 2);
+        assert_eq!((pieces[0].voxels.len(), pieces[1].voxels.len()), (3, 1));
+        assert_eq!((pieces[0].mass, pieces[1].mass), (3.0, 0.5));
+        assert_eq!(pieces[0].bounds, [0, 0, 0, 2, 1, 0]);
+        assert_eq!(pieces[1].bounds, [2, 2, 2, 2, 2, 2]);
+        // Held together, a content is one piece.
+        assert_eq!(pieces_of(&voxels[..3]).len(), 1);
+    }
+
+    #[test]
+    fn a_split_piece_stays_where_it_was() -> Result<(), &'static str> {
+        // A sub-level turned a quarter and placed off the pivot, split in
+        // two: the piece's blocks map to the same world places from the new
+        // plot as they did from the old one.
+        let mut manager = SubLevelManager::new();
+        let half = std::f32::consts::FRAC_PI_4;
+        let pose = Vector3::new(10.0, 70.25, -4.5);
+        let bounds = [-2, -1, -2, 1, 0, 1];
+        let old = manager.assemble(pose, bounds, Vector3::new(0.5, 0.5, 0.5), None);
+        let old_pivot = manager.anchor_of(old).expect("old sub-level");
+        manager.physics.set_body_pose(
+            old,
+            [pose.x, pose.y, pose.z],
+            [0.0, half.sin(), 0.0, half.cos()],
+        );
+        let old_pose = manager.pose_of(old).expect("pose");
+        let piece = parked_bounds(old_pivot.floor_to_i32(), &[-2, -1, -2, -2, 0, 1]);
+        let (new, delta) = manager.split(old, piece).expect("split");
+        let new_pivot = manager
+            .anchor_of(new)
+            .expect("new sub-level")
+            .floor_to_i32();
+        let new_pose = manager.pose_of(new).expect("pose");
+        for block in [[-2, -1, -2], [-2, 0, 1]] {
+            let old_at = old_pivot.floor_to_i32() + Vector3::new(block[0], block[1], block[2]);
+            let new_at = new_pivot + Vector3::new(block[0], block[1], block[2]);
+            assert_eq!(new_at, old_at + delta);
+            let place = |pose: &sable::Pose, pivot: Vector3<i32>, at: Vector3<i32>| {
+                let [x, y, z] = pose.position;
+                Vector3::new(x, y, z) + rotate(pose.orientation, at.to_f64() - pivot.to_f64())
+            };
+            assert_eq!(
+                place(&old_pose, old_pivot.floor_to_i32(), old_at),
+                place(&new_pose, new_pivot, new_at)
+            );
+        }
+        // The old sub-level waits for the piece until it has moved.
+        assert!(manager.is_splitting(old));
+        manager.end_split(old);
+        assert!(!manager.is_splitting(old));
+        // What the recently split packet carries: the piece sits on the old
+        // sub-level's rotation point, in the old one's frame, and keeps its
+        // own.
+        let new_level = manager
+            .levels
+            .iter()
+            .find(|level| level.id == new)
+            .ok_or("piece")?;
+        let (from, split_pose) = new_level.split_from.ok_or("split origin")?;
+        assert_eq!(from, old);
+        assert_eq!(split_pose.position, old_pose.rotation_point);
+        let pivot =
+            manager.anchor_of(new).ok_or("piece")? + manager.from_anchor_of(new).ok_or("piece")?;
+        assert_eq!(split_pose.rotation_point, [pivot.x, pivot.y, pivot.z]);
+        // Sable's client continues the origin's motion from there: placed by
+        // the origin's pose, the pose maps onto the piece's own.
+        let local = [
+            split_pose.position[0] - old_pose.rotation_point[0],
+            split_pose.position[1] - old_pose.rotation_point[1],
+            split_pose.position[2] - old_pose.rotation_point[2],
+        ];
+        let carried = rotate(
+            old_pose.orientation,
+            Vector3::new(local[0], local[1], local[2]),
+        );
+        for axis in 0..3 {
+            let carried = [carried.x, carried.y, carried.z][axis] + old_pose.position[axis];
+            assert!(
+                (carried - new_pose.position[axis]).abs() < 1.0e-4,
+                "{axis}: {carried}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_piece_holding_the_heat_map_root_keeps_the_sub_level() {
+        // A short, heavy piece and a longer, light one.
+        let voxels = [
+            Voxel::cube([0, 0, 0], 5.0),
+            Voxel::cube([1, 0, 0], 5.0),
+            Voxel::cube([5, 0, 0], 0.5),
+            Voxel::cube([6, 0, 0], 0.5),
+            Voxel::cube([7, 0, 0], 0.5),
+        ];
+        let pieces = pieces_of(&voxels);
+        assert_eq!(pieces.len(), 2);
+        // Whichever piece the heat map grows from stays, mass aside.
+        assert_eq!(kept_piece(&pieces, Some([1, 0, 0])), 0);
+        assert_eq!(kept_piece(&pieces, Some([5, 0, 0])), 1);
+        // With the root gone every piece would part ways, so the largest
+        // stays: the longer one, not the heavier one.
+        assert_eq!(kept_piece(&pieces, Some([3, 0, 0])), 1);
+        assert_eq!(kept_piece(&pieces, None), 1);
+    }
+
+    #[test]
+    fn the_heat_map_root_follows_the_content() {
+        let mut manager = SubLevelManager::new();
+        let (id, _) = manager.spawn(Vector3::new(0.0, 64.0, 0.0), 4);
+        let content = |voxels: [Voxel; 2]| Content {
+            pivot_offset: [0.0; 3],
+            voxels: voxels.to_vec(),
+        };
+        // Sable's heat map grows from the first block placed.
+        manager.set_content(
+            id,
+            content([Voxel::cube([0, 0, 0], 1.0), Voxel::cube([1, 0, 0], 1.0)]),
+        );
+        assert_eq!(manager.root_of(id), Some([0, 0, 0]));
+        // A rescan that keeps the block keeps the root.
+        manager.set_content(
+            id,
+            content([Voxel::cube([1, 0, 0], 1.0), Voxel::cube([0, 0, 0], 1.0)]),
+        );
+        assert_eq!(manager.root_of(id), Some([0, 0, 0]));
+        // With the block gone, the first block of what remains takes over.
+        manager.set_content(
+            id,
+            content([Voxel::cube([2, 0, 0], 1.0), Voxel::cube([1, 0, 0], 1.0)]),
+        );
+        assert_eq!(manager.root_of(id), Some([2, 0, 0]));
+        assert_eq!(manager.root_of(id + 1), None);
     }
 
     #[test]
