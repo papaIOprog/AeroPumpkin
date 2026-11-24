@@ -31,6 +31,8 @@ pub struct Modded {
     pub blocks: Blocks,
     #[cfg(feature = "item")]
     pub items: Items,
+    #[cfg(feature = "block")]
+    pub block_entity_types: BlockEntityTypes,
     #[cfg(feature = "entity_type")]
     pub entities: Entities,
 }
@@ -63,6 +65,13 @@ pub struct Items {
 
 /// Entity types by ids past the vanilla ones; `None` where the client has
 /// none.
+/// The block entity types the mods add, by id past the vanilla ones.
+#[cfg(feature = "block")]
+#[derive(Default)]
+pub struct BlockEntityTypes {
+    pub by_id: Vec<&'static str>,
+}
+
 #[cfg(feature = "entity_type")]
 #[derive(Default)]
 pub struct Entities {
@@ -181,6 +190,49 @@ pub(crate) fn item_by_name(name: &str) -> Option<&'static Item> {
 pub(crate) fn entity(id: u16) -> Option<&'static EntityType> {
     let index = past(id, EntityType::ALL.len())?;
     MODDED.get()?.entities.by_id.get(index).copied().flatten()
+}
+
+/// The name of the block entity type an id names: a vanilla one, or a
+/// mod's for an id past those; `None` where there is none.
+#[cfg(feature = "block")]
+#[must_use]
+pub fn block_entity_type(id: u16) -> Option<&'static str> {
+    MODDED
+        .get()
+        .and_then(|modded| {
+            modded
+                .block_entity_types
+                .by_id
+                .get(past(id, crate::block_properties::BLOCK_ENTITY_TYPES.len())?)
+                .copied()
+        })
+        .or_else(|| {
+            crate::block_properties::BLOCK_ENTITY_TYPES
+                .get(usize::from(id))
+                .copied()
+        })
+}
+
+/// The id the clients' registry gives the block entity type `name`
+/// (`namespace:path`): a vanilla one by its path, or a mod's.
+#[cfg(feature = "block")]
+#[must_use]
+pub fn block_entity_type_id(name: &str) -> Option<u16> {
+    let path = name.rsplit(':').next().unwrap_or(name);
+    crate::block_properties::BLOCK_ENTITY_TYPES
+        .iter()
+        .position(|known| *known == path)
+        .and_then(|index| u16::try_from(index).ok())
+        .or_else(|| {
+            let vanilla = crate::block_properties::BLOCK_ENTITY_TYPES.len();
+            MODDED
+                .get()?
+                .block_entity_types
+                .by_id
+                .iter()
+                .position(|known| *known == name)
+                .and_then(|index| u16::try_from(vanilla + index).ok())
+        })
 }
 
 #[cfg(feature = "entity_type")]

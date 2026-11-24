@@ -176,6 +176,9 @@ impl Server {
 
         let world_path = basic_config.get_world_path();
 
+        // Before the first registry is built, so that it covers the mods' content.
+        crate::mods::install(&advanced_config.mods);
+
         let block_registry = super::block::registry::default_registry();
 
         let level_info = match AnvilLevelInfo.read_world_info(&world_path) {

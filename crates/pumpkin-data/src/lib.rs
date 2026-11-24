@@ -452,7 +452,7 @@ pub use block_rotation::{Mirror, Rotation, transform_block_properties, transform
 #[cfg(feature = "block")]
 pub use block_state::{BlockState, BlockStateId};
 #[cfg(feature = "block")]
-pub use blocks::{Block, BlockId, SpawnFloorPredicate};
+pub use blocks::{Block, BlockId, Flammable, SpawnFloorPredicate};
 
 /// What a client's mods add to the vanilla registries.
 pub mod mods;

@@ -347,31 +347,31 @@ impl std::fmt::Display for BlockStateId {
     }
 }
 
-//This is the Layout of state_props in the right order
-// state_flags
-pub(crate) const IS_AIR: u16 = 1 << 0;
-pub(crate) const BURNABLE: u16 = 1 << 1;
-pub(crate) const TOOL_REQUIRED: u16 = 1 << 2;
-pub(crate) const SIDED_TRANSPARENCY: u16 = 1 << 3;
-pub(crate) const REPLACEABLE: u16 = 1 << 4;
-pub(crate) const IS_LIQUID: u16 = 1 << 5;
-pub(crate) const IS_SOLID: u16 = 1 << 6;
-pub(crate) const IS_FULL_CUBE: u16 = 1 << 7;
-pub(crate) const IS_SOLID_BLOCK: u16 = 1 << 8;
-pub(crate) const HAS_RANDOM_TICKS: u16 = 1 << 9;
-pub(crate) const IS_SOLID_RENDER: u16 = 1 << 10;
-pub(crate) const CAN_OCCLUDE: u16 = 1 << 11;
-pub(crate) const HAS_ANALOG_OUTPUT_SIGNAL: u16 = 1 << 12;
+// The layout of `state_flags`, in the right order. Public for whoever
+// builds states of modded blocks.
+pub const IS_AIR: u16 = 1 << 0;
+pub const BURNABLE: u16 = 1 << 1;
+pub const TOOL_REQUIRED: u16 = 1 << 2;
+pub const SIDED_TRANSPARENCY: u16 = 1 << 3;
+pub const REPLACEABLE: u16 = 1 << 4;
+pub const IS_LIQUID: u16 = 1 << 5;
+pub const IS_SOLID: u16 = 1 << 6;
+pub const IS_FULL_CUBE: u16 = 1 << 7;
+pub const IS_SOLID_BLOCK: u16 = 1 << 8;
+pub const HAS_RANDOM_TICKS: u16 = 1 << 9;
+pub const IS_SOLID_RENDER: u16 = 1 << 10;
+pub const CAN_OCCLUDE: u16 = 1 << 11;
+pub const HAS_ANALOG_OUTPUT_SIGNAL: u16 = 1 << 12;
 
-// side_flags
-pub(crate) const DOWN_SIDE_SOLID: u8 = 1 << 0;
-pub(crate) const UP_SIDE_SOLID: u8 = 1 << 1;
-pub(crate) const NORTH_SIDE_SOLID: u8 = 1 << 2;
-pub(crate) const SOUTH_SIDE_SOLID: u8 = 1 << 3;
-pub(crate) const WEST_SIDE_SOLID: u8 = 1 << 4;
-pub(crate) const EAST_SIDE_SOLID: u8 = 1 << 5;
-pub(crate) const DOWN_CENTER_SOLID: u8 = 1 << 6;
-pub(crate) const UP_CENTER_SOLID: u8 = 1 << 7;
+// The layout of `side_flags`.
+pub const DOWN_SIDE_SOLID: u8 = 1 << 0;
+pub const UP_SIDE_SOLID: u8 = 1 << 1;
+pub const NORTH_SIDE_SOLID: u8 = 1 << 2;
+pub const SOUTH_SIDE_SOLID: u8 = 1 << 3;
+pub const WEST_SIDE_SOLID: u8 = 1 << 4;
+pub const EAST_SIDE_SOLID: u8 = 1 << 5;
+pub const DOWN_CENTER_SOLID: u8 = 1 << 6;
+pub const UP_CENTER_SOLID: u8 = 1 << 7;
 
 #[cfg(test)]
 mod tests {

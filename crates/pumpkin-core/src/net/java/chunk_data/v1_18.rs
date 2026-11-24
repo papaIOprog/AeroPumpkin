@@ -137,13 +137,12 @@ pub fn write_chunk_data(
         write.write_u8(local_xz as u8)?;
         write.write_i16_be(pos.0.y as i16)?;
 
-        let id = nbt.get_string("id").map_or(0, |id_str| {
-            let name = id_str.split(':').next_back().unwrap_or(id_str);
-            pumpkin_data::block_properties::BLOCK_ENTITY_TYPES
-                .iter()
-                .position(|&n| n == name)
-                .unwrap_or(0)
-        });
+        // The id in the clients' registry, which the mods' types share with
+        // the vanilla ones.
+        let id = nbt
+            .get_string("id")
+            .and_then(crate::block::entities::block_entity_type_id)
+            .unwrap_or(0);
         write.write_var_int(&VarInt(id as i32))?;
 
         let mut client_nbt = nbt.clone();

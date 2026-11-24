@@ -24,6 +24,7 @@ pub mod daylight_detector;
 pub mod dropper;
 pub mod end_portal;
 pub mod ender_chest;
+pub mod foreign;
 pub mod furnace;
 pub mod furnace_like_block_entity;
 pub mod hopper;
@@ -313,13 +314,26 @@ pub fn block_entity_from_nbt(nbt: &NbtCompound) -> Option<Arc<dyn BlockEntity>> 
         potent_sulfur::PotentSulfurBlockEntity::ID => Some(Arc::new(
             potent_sulfur::PotentSulfurBlockEntity::from_nbt(nbt, pos),
         )),
+        // A mod's block entity: nothing of it is run, nothing of it lost.
+        id if !id.starts_with("minecraft:") => {
+            Some(Arc::new(foreign::ForeignBlockEntity::from_nbt(nbt, pos)))
+        }
         _ => None,
     }
+}
+
+/// The id the clients' registry gives the block entity type `name`
+/// (`namespace:path`): a vanilla one by its path, or a mod's.
+#[must_use]
+pub fn block_entity_type_id(name: &str) -> Option<u16> {
+    pumpkin_data::mods::block_entity_type_id(name)
 }
 
 #[must_use]
 pub fn has_block_block_entity(block: &Block) -> bool {
     BLOCK_ENTITY_TYPES.contains(&block.name)
+        || pumpkin_data::mods::block_entity_type(block.default_state.block_entity_type)
+            .is_some_and(|kind| !BLOCK_ENTITY_TYPES.contains(&kind))
 }
 
 #[must_use]
@@ -331,6 +345,16 @@ pub fn create_block_entity(
     use pumpkin_data::block_properties::FacingHopper;
     if block_entity_type_id == u16::MAX {
         return None;
+    }
+    if let Some(kind) = pumpkin_data::mods::block_entity_type(block_entity_type_id)
+        && !BLOCK_ENTITY_TYPES.contains(&kind)
+    {
+        return Some(Arc::new(foreign::ForeignBlockEntity::new(
+            kind,
+            block_entity_type_id,
+            NbtCompound::new(),
+            position,
+        )));
     }
     let name = BLOCK_ENTITY_TYPES.get(block_entity_type_id as usize)?;
     match *name {

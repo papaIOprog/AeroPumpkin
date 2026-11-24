@@ -19,10 +19,13 @@ use tracing::{debug, error, warn};
 pub mod fun;
 /// Server logging configuration options.
 pub mod logging;
+/// Modded content: the registry profile and per-mod switches.
+pub mod mods;
 /// Networking and protocol configuration options.
 pub mod networking;
 /// Plugin management configuration options.
 pub mod plugins;
+
 /// Recipe system configuration options.
 pub mod recipe;
 
@@ -31,6 +34,7 @@ pub mod resource_pack;
 
 pub use chat::{AntiSpamConfig, ChatConfig};
 pub use commands::{CommandOverride, CommandsConfig};
+pub use mods::ModsConfig;
 pub use networking::auth::AuthenticationConfig;
 pub use networking::bedrock::BedrockConfig;
 pub use networking::compression::CompressionConfig;
@@ -176,6 +180,8 @@ pub struct AdvancedConfiguration {
     pub plugins: PluginsConfig,
     /// Advancement configuration
     pub advancement: AdvancementConfig,
+    /// Modded content: the registry profile and per-mod switches.
+    pub mods: ModsConfig,
 }
 
 /// Basic configuration for core server settings.
