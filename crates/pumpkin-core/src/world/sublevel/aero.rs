@@ -34,9 +34,9 @@ const SAIL_PARALLEL_DRAG: f32 = 0.75;
 const SAIL_LIFT: f32 = 0.475;
 const SYMMETRIC_SAIL_PARALLEL_DRAG: f32 = 1.75;
 
-/// Aeronautics' hot air burner: heats the balloon above it in proportion
-/// to the redstone signal reaching it.
-pub const HOT_AIR_BURNER: &str = "aeronautics:hot_air_burner";
+/// Aeronautics' adjustable burner (`HotAirBurnerBlock`): heats the balloon
+/// above it in proportion to the redstone signal reaching it.
+pub const HOT_AIR_BURNER: &str = "aeronautics:adjustable_burner";
 /// Aeronautics' steam vent: the same, with ten times the gas.
 pub const STEAM_VENT: &str = "aeronautics:steam_vent";
 
