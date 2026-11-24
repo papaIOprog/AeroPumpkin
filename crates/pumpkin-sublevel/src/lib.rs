@@ -521,9 +521,6 @@ impl SubLevelSystem {
             let Some(analysed) = &sublevel.content else {
                 continue;
             };
-            if sublevel.surroundings_pending.is_some() {
-                continue;
-            }
             let Some(body) = self.bodies.get(sublevel.body) else {
                 continue;
             };
@@ -535,6 +532,16 @@ impl SubLevelSystem {
                         || blocks.1[axis] > region.max[axis] as f32 + 1.0 - SURROUNDINGS_REFRESH
                 })
             });
+            if sublevel.surroundings_pending.is_some() {
+                // Past the inner half of what it was given, a body runs off
+                // the edge of that world: it waits where it is until the
+                // sample arrives. Its colliders stay, so nothing falls
+                // through it meanwhile.
+                if left_behind && let Some(body) = self.bodies.get_mut(sublevel.body) {
+                    body.set_body_type(RigidBodyType::KinematicPositionBased, true);
+                }
+                continue;
+            }
             if !left_behind && !sublevel.refresh {
                 continue;
             }
@@ -627,6 +634,10 @@ impl SubLevelSystem {
             colliders,
             liquids,
         });
+        // Set going again, if it had to wait past the edge of the old ones.
+        if let Some(body) = self.bodies.get_mut(self.sublevels[index].body) {
+            body.set_body_type(RigidBodyType::Dynamic, true);
+        }
         self.activate(index);
         true
     }
@@ -1456,6 +1467,40 @@ mod tests {
                 .unwrap_or(body);
         }
         body
+    }
+
+    #[test]
+    fn a_body_outgrowing_its_surroundings_waits_for_the_next_sample() {
+        // A slab given nothing to stand on falls; past the inner half of
+        // what it was given, with the next sample still outstanding, it
+        // waits instead of running off the edge of that world.
+        let mut system = SubLevelSystem::new(Air::default());
+        let id = system.spawn([0.0, 64.0, 0.0]);
+        assert!(system.set_content(id, slab(4, 4)));
+        let (_, request) = system.take_surroundings_requests().swap_remove(0);
+        assert!(system.set_surroundings(id, request, &[]));
+        let mut outstanding = Vec::new();
+        let mut lowest = f32::MAX;
+        for _ in 0..200 {
+            let requests = system.take_surroundings_requests();
+            if !requests.is_empty() {
+                outstanding = requests;
+            }
+            system.step();
+            lowest = lowest.min(system.snapshots()[0].position[1]);
+        }
+        assert_eq!(outstanding.len(), 1);
+        assert!(lowest > request.min[1] as f32, "{lowest}");
+        // Served, it carries on down to the ground.
+        for (id, request) in outstanding {
+            assert!(system.set_surroundings(id, request, &flat_ground(request, 50)));
+        }
+        // `settle` serves flat ground with its top at 58.
+        let body = settle(&mut system, id, 200);
+        assert!(
+            body.position[1] > 58.0 && body.position[1] < 59.5,
+            "{body:?}"
+        );
     }
 
     #[test]
