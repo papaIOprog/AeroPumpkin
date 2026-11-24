@@ -2151,13 +2151,13 @@ impl World {
         if !news.locks && !news.sessions {
             return;
         }
-        let dimension = format!("minecraft:{}", self.dimension.minecraft_name);
+        let dimension = self.dimension.minecraft_name;
         let manager = self.lock_sublevels();
         let (locks, sessions) = (
             news.locks
-                .then(|| physics_staff::encode_locks(&dimension, &manager.locked())),
+                .then(|| physics_staff::encode_locks(dimension, &manager.locked())),
             news.sessions
-                .then(|| physics_staff::encode_sessions(&dimension, &manager.drag_sessions())),
+                .then(|| physics_staff::encode_sessions(dimension, &manager.drag_sessions())),
         );
         for player in self.players.load().iter() {
             if let Some(locks) = &locks {
@@ -2172,17 +2172,17 @@ impl World {
     /// Simulated's `PhysicsStaffServerHandler.sendAllData`, for a player
     /// who joined: the locks and the drag sessions of this dimension.
     pub fn send_staff_data(&self, player: &Player) {
-        let dimension = format!("minecraft:{}", self.dimension.minecraft_name);
+        let dimension = self.dimension.minecraft_name;
         let manager = self.lock_sublevels();
         send_mod_payload(
             player,
             PHYSICS_STAFF_LOCKS,
-            &physics_staff::encode_locks(&dimension, &manager.locked()),
+            &physics_staff::encode_locks(dimension, &manager.locked()),
         );
         send_mod_payload(
             player,
             PHYSICS_STAFF_DRAG_SESSIONS,
-            &physics_staff::encode_sessions(&dimension, &manager.drag_sessions()),
+            &physics_staff::encode_sessions(dimension, &manager.drag_sessions()),
         );
     }
 
