@@ -12,6 +12,7 @@
 //! step never touches rayon (see `pumpkin-sublevel`).
 
 pub mod aero;
+pub mod attachment;
 pub mod sable;
 
 use std::collections::VecDeque;
@@ -46,9 +47,7 @@ use crate::entity::player::Player;
 use crate::entity::tnt::TNTEntity;
 use crate::net::java::JavaClient;
 use crate::net::java::chunk_data::CChunkData;
-use pumpkin_data::block_properties::{
-    Axis, ChainLikeProperties, HorizontalFacing, blocks_movement,
-};
+use pumpkin_data::block_properties::{HorizontalFacing, blocks_movement};
 use pumpkin_data::block_rotation::Rotation;
 use pumpkin_data::entity::EntityType;
 use pumpkin_data::sound::{Sound, SoundCategory};
@@ -60,6 +59,7 @@ use pumpkin_world::world::BlockFlags;
 use rand::RngExt;
 
 use crate::entity::r#type::from_type;
+use crate::mods::glue::{GlueEntity, GlueKind, glue_boxes, with_glue_by_id};
 
 /// Each plot is `1 << PLOT_LOG_SIZE` chunks on a side, as in Sable.
 pub const PLOT_LOG_SIZE: i32 = 7;
@@ -484,48 +484,6 @@ const ASSEMBLY_NEIGHBOURS: [Vector3<i32>; 18] = [
     Vector3::new(0, -1, 1),
     Vector3::new(0, -1, -1),
 ];
-
-/// Whether a block cannot be moved at all, as an unbreakable block cannot.
-fn unmovable(block: &Block) -> bool {
-    block.hardness < 0.0
-}
-
-/// Whether two blocks are stuck together, as pistons know it: slime and
-/// honey stick to anything but each other.
-fn stuck(a: &Block, b: &Block) -> bool {
-    let slime = |block: &Block| *block == Block::SLIME_BLOCK;
-    let honey = |block: &Block| *block == Block::HONEY_BLOCK;
-    if (slime(a) && honey(b)) || (honey(a) && slime(b)) {
-        return false;
-    }
-    slime(a) || honey(a) || slime(b) || honey(b)
-}
-
-/// Whether a contraption reaching from block `from` takes the block `to`
-/// that touches it at `offset`: every face counts, except for a symmetric
-/// sail (a chain) reached across its axis; an edge counts only where slime
-/// or honey holds the two together.
-fn attached(
-    from: &Block,
-    _from_state: &pumpkin_data::BlockState,
-    to: &Block,
-    to_state: &pumpkin_data::BlockState,
-    offset: Vector3<i32>,
-) -> bool {
-    let face = offset.x.abs() + offset.y.abs() + offset.z.abs() == 1;
-    if !face {
-        return stuck(from, to);
-    }
-    if *to == Block::CHAIN {
-        let axis = ChainLikeProperties::from_state_id(to_state.id).r#axis;
-        return match axis {
-            Axis::X => offset.x != 0,
-            Axis::Y => offset.y != 0,
-            Axis::Z => offset.z != 0,
-        };
-    }
-    true
-}
 
 /// The quarter turn a pose is closest to: how many clockwise quarter turns
 /// it is from upright, from 0 to 3.
@@ -2022,15 +1980,16 @@ impl World {
         min: Vector3<i32>,
         max: Vector3<i32>,
     ) -> Result<u32, String> {
-        self.assemble_region(min, max, None)
+        self.assemble_region(min, max, None, Vec::new())
     }
 
-    /// Freezes the contraption standing on the block at `start` into a new
-    /// sub-level, as Simulated's assembler does: every block connected to it
-    /// through faces and edges is taken, up to [`MAX_ASSEMBLE_BLOCKS`], and
-    /// unmovable blocks stop it. Returns the sub-level id.
+    /// Freezes the contraption around the block at `start` into a new
+    /// sub-level, as Simulated's assembler gathers one: every block held to
+    /// it by glue, by slime or honey, or by being fastened to what it
+    /// touches, up to [`MAX_ASSEMBLE_BLOCKS`]. The glue that held it
+    /// together goes along. Returns the sub-level id.
     pub fn assemble_connected(self: &Arc<Self>, start: Vector3<i32>) -> Result<u32, String> {
-        let blocks = self.connected_blocks(start)?;
+        let (blocks, glue) = self.gathered(start)?;
         let (mut min, mut max) = (blocks[0], blocks[0]);
         for block in &blocks {
             min.x = min.x.min(block.x);
@@ -2041,7 +2000,104 @@ impl World {
             max.z = max.z.max(block.z);
         }
         let include: FxHashSet<BlockPos> = blocks.iter().copied().map(BlockPos).collect();
-        self.assemble_region(min, max, Some(include))
+        self.assemble_region(min, max, Some(include), glue)
+    }
+
+    /// The blocks of the contraption around `start`, and the ids of the glue
+    /// entities that held it together: Simulated's
+    /// `SimAssemblyContraption.searchMovedStructure`, which is Create's
+    /// `Contraption.moveBlock`. A block that cannot be moved is left out,
+    /// unless it is the one the contraption is gathered around.
+    fn gathered(
+        self: &Arc<Self>,
+        start: Vector3<i32>,
+    ) -> Result<(Vec<Vector3<i32>>, Vec<i32>), String> {
+        let start_pos = BlockPos(start);
+        if !self.is_in_build_limit(start_pos) {
+            return Err("the block is outside the build limit".to_owned());
+        }
+        if !self.chunk_loaded(start) {
+            return Err("the block's chunk is not loaded".to_owned());
+        }
+        let (block, state) = self.get_block_and_state(&start_pos);
+        if state.is_air() {
+            return Err("there is no block to assemble there".to_owned());
+        }
+        if !attachment::movement_allowed(block, state) {
+            return Err("that block cannot be moved".to_owned());
+        }
+        let glue = glue_boxes(self);
+        // Simulated's addInitialHoneyGlue: the honey glue over the first
+        // block goes along, whether or not it holds anything.
+        let mut used: Vec<i32> = glue
+            .iter()
+            .filter(|glue| glue.kind == GlueKind::Honey && glue.contains(start_pos))
+            .map(|glue| glue.entity_id)
+            .collect();
+        let mut blocks: Vec<Vector3<i32>> = Vec::new();
+        let mut seen: FxHashSet<BlockPos> = FxHashSet::default();
+        // A brittle first block is not searched around.
+        let mut frontier = VecDeque::new();
+        if !attachment::brittle(block, state) {
+            frontier.push_back(start);
+        }
+        while let Some(at) = frontier.pop_front() {
+            let pos = BlockPos(at);
+            if !seen.insert(pos) {
+                continue;
+            }
+            if !self.is_in_build_limit(pos) {
+                continue;
+            }
+            if !self.chunk_loaded(at) {
+                return Err("the contraption reaches unloaded chunks".to_owned());
+            }
+            let (block, state) = self.get_block_and_state(&pos);
+            if state.is_air() {
+                continue;
+            }
+            if !attachment::movement_allowed(block, state) {
+                return Err("a block of the contraption cannot be moved".to_owned());
+            }
+            // The halves of a double chest go together.
+            if let Some(towards) = attachment::chest_half(block, state) {
+                let half = pos.offset(towards.to_offset());
+                if !seen.contains(&half) {
+                    frontier.push_back(half.0);
+                }
+            }
+            for offset in ASSEMBLY_NEIGHBOURS {
+                let next = BlockPos(at + offset);
+                if seen.contains(&next) {
+                    continue;
+                }
+                let (next_block, next_state) = self.get_block_and_state(&next);
+                if !attachment::movement_allowed(next_block, next_state) {
+                    continue;
+                }
+                let mut holding = glue.iter().filter(|glue| glue.holds(pos, next)).peekable();
+                if holding.peek().is_some() {
+                    for entity_id in holding.map(|glue| glue.entity_id) {
+                        if !used.contains(&entity_id) {
+                            used.push(entity_id);
+                        }
+                    }
+                    frontier.push_back(next.0);
+                } else if attachment::takes(block, state, next_block, next_state, offset) {
+                    frontier.push_back(next.0);
+                }
+            }
+            blocks.push(at);
+            if blocks.len() > MAX_ASSEMBLE_BLOCKS {
+                return Err(format!(
+                    "the contraption is over {MAX_ASSEMBLE_BLOCKS} blocks"
+                ));
+            }
+        }
+        if blocks.is_empty() {
+            return Err("there is nothing to assemble".to_owned());
+        }
+        Ok((blocks, used))
     }
 
     /// Whether the chunk holding `pos` is loaded.
@@ -2050,62 +2106,14 @@ impl World {
             .is_chunk_loaded(&Vector2::new(pos.x >> 4, pos.z >> 4))
     }
 
-    /// The blocks of the contraption `start` belongs to.
-    fn connected_blocks(&self, start: Vector3<i32>) -> Result<Vec<Vector3<i32>>, String> {
-        let start_block = BlockPos(start);
-        if !self.is_in_build_limit(start_block) {
-            return Err("the block is outside the build limit".to_string());
-        }
-        if !self.chunk_loaded(start) {
-            return Err("the block's chunk is not loaded".to_string());
-        }
-        let (block, state) = self.get_block_and_state(&start_block);
-        if state.is_air() {
-            return Err("there is no block to assemble there".to_string());
-        }
-        if unmovable(block) {
-            return Err("that block cannot be moved".to_string());
-        }
-        let mut blocks = vec![start];
-        let mut seen: FxHashSet<BlockPos> = FxHashSet::from_iter([start_block]);
-        let mut frontier = VecDeque::from([start]);
-        while let Some(at) = frontier.pop_front() {
-            let (from, from_state) = self.get_block_and_state(&BlockPos(at));
-            for offset in ASSEMBLY_NEIGHBOURS {
-                let next = at + offset;
-                if seen.contains(&BlockPos(next)) {
-                    continue;
-                }
-                if !self.chunk_loaded(next) {
-                    return Err("the contraption reaches unloaded chunks".to_string());
-                }
-                let (block, state) = self.get_block_and_state(&BlockPos(next));
-                if state.is_air() || unmovable(block) {
-                    continue;
-                }
-                if !attached(from, from_state, block, state, offset) {
-                    continue;
-                }
-                seen.insert(BlockPos(next));
-                blocks.push(next);
-                if blocks.len() > MAX_ASSEMBLE_BLOCKS {
-                    return Err(format!(
-                        "the contraption is over {MAX_ASSEMBLE_BLOCKS} blocks"
-                    ));
-                }
-                frontier.push_back(next);
-            }
-        }
-        Ok(blocks)
-    }
-
     /// Freezes a world region into a sub-level, or with `include` only the
-    /// listed blocks of it.
+    /// listed blocks of it, with the glue entities `glue` by id.
     fn assemble_region(
         self: &Arc<Self>,
         min: Vector3<i32>,
         max: Vector3<i32>,
         include: Option<FxHashSet<BlockPos>>,
+        glue: Vec<i32>,
     ) -> Result<u32, String> {
         let (min, max) = (
             Vector3::new(min.x.min(max.x), min.y.min(max.y), min.z.min(max.z)),
@@ -2160,19 +2168,22 @@ impl World {
         );
         let world = Arc::clone(self);
         tokio::spawn(async move {
-            world.copy_region_into_plot(id, min, max, include).await;
+            world
+                .copy_region_into_plot(id, min, max, include, glue)
+                .await;
         });
         Ok(id)
     }
 
-    /// Copies a region into a sub-level's parked chunks, parks its entities,
-    /// clears the original, then networks the sub-level.
+    /// Copies a region into a sub-level's parked chunks, parks its entities
+    /// and its glue, clears the original, then networks the sub-level.
     async fn copy_region_into_plot(
         self: Arc<Self>,
         id: u32,
         min: Vector3<i32>,
         max: Vector3<i32>,
         include: Option<FxHashSet<BlockPos>>,
+        glue: Vec<i32>,
     ) {
         let (chunks, anchor, center_chunk, from_anchor) = {
             let manager = self.lock_sublevels();
@@ -2240,6 +2251,7 @@ impl World {
             return;
         };
         self.park_entities_in_region(min, max, anchor, center, include.as_ref());
+        self.park_glue(&glue, center.to_f64() - anchor.to_f64());
         self.clear_region(min, max, include.as_ref());
         self.lock_sublevels().end_assembly(id);
 
@@ -2775,9 +2787,89 @@ impl World {
         }
     }
 
+    /// Brings the glue parked in a sub-level's `bounds` back into the
+    /// world, its box turned and moved the way the blocks go: Simulated's
+    /// `disassembleSubLevel`. The blocks' map is the pose's `pose`, the
+    /// pivot `pivot` and `turns` clockwise quarter turns.
+    fn unpark_glue(self: &Arc<Self>, bounds: [i32; 6], pivot: [f64; 3], pose: [f64; 3], turns: u8) {
+        let low = [
+            f64::from(bounds[0]),
+            f64::from(bounds[1]),
+            f64::from(bounds[2]),
+        ];
+        let high = [
+            f64::from(bounds[3]) + 1.0,
+            f64::from(bounds[4]) + 1.0,
+            f64::from(bounds[5]) + 1.0,
+        ];
+        for entity in self.entities.load().iter() {
+            let Some(glue) = entity.cast_any().downcast_ref::<GlueEntity>() else {
+                continue;
+            };
+            let [min_x, min_y, min_z, max_x, max_y, max_z] = glue.bounds();
+            let outside = |axis: usize| {
+                [max_x, max_y, max_z][axis] <= low[axis]
+                    || [min_x, min_y, min_z][axis] >= high[axis]
+            };
+            if (0..3).any(outside) {
+                continue;
+            }
+            let lands = |corner: [f64; 3]| {
+                std::array::from_fn::<f64, 3, _>(|axis| {
+                    let local = [
+                        corner[0] - pivot[0],
+                        corner[1] - pivot[1],
+                        corner[2] - pivot[2],
+                    ];
+                    (pose[axis] + placed(local, turns)[axis]).floor()
+                })
+            };
+            let from = lands([min_x, min_y, min_z]);
+            let to = lands([max_x, max_y, max_z]);
+            let kind = glue.kind();
+            glue.remove();
+            GlueEntity::spawn(
+                self,
+                kind,
+                [
+                    from[0].min(to[0]),
+                    from[1].min(to[1]),
+                    from[2].min(to[2]),
+                    from[0].max(to[0]),
+                    from[1].max(to[1]),
+                    from[2].max(to[2]),
+                ],
+            );
+        }
+    }
+
+    /// Moves the glue entities `glue` into a sub-level's plot by the offset
+    /// its blocks moved: Simulated's `assembleFromSingleBlock`.
+    fn park_glue(self: &Arc<Self>, glue: &[i32], offset: Vector3<f64>) {
+        for id in glue {
+            with_glue_by_id(self, *id, |glue| {
+                let (kind, bounds) = (glue.kind(), glue.bounds());
+                glue.remove();
+                GlueEntity::spawn(
+                    self,
+                    kind,
+                    [
+                        bounds[0] + offset.x,
+                        bounds[1] + offset.y,
+                        bounds[2] + offset.z,
+                        bounds[3] + offset.x,
+                        bounds[4] + offset.y,
+                        bounds[5] + offset.z,
+                    ],
+                );
+            });
+        }
+    }
+
     /// Moves every entity standing in the region to its parked position.
     /// Players stay: their position is client authoritative. With `include`,
-    /// only entities on the contraption's own blocks go.
+    /// only entities on the contraption's own blocks go. Glue goes by its
+    /// own box, in [`World::park_glue`].
     fn park_entities_in_region(
         &self,
         min: Vector3<i32>,
@@ -2797,6 +2889,10 @@ impl World {
             f64::from(anchor.z),
         );
         for entity in self.entities.load().iter() {
+            // Glue goes by its own box, in `park_glue`.
+            if entity.cast_any().downcast_ref::<GlueEntity>().is_some() {
+                continue;
+            }
             let entity = entity.get_entity();
             if entity.entity_type == &EntityType::PLAYER {
                 continue;
@@ -3188,6 +3284,8 @@ impl World {
                 }
             }
         }
+
+        self.unpark_glue(bounds, pivot, pose, turns);
 
         // Entities keep fractional positions; move them the way the blocks
         // went.
@@ -3799,39 +3897,5 @@ mod tests {
             // The upright orientation at that quarter turn is that quarter turn.
             assert_eq!(quarter_turn(quarter.upright()).turns, turns);
         }
-    }
-
-    #[test]
-    fn contraptions_connect_through_faces_and_sticky_edges() {
-        let state = |block: &Block| block.default_state;
-        let stone = &Block::STONE;
-        let slime = &Block::SLIME_BLOCK;
-        let honey = &Block::HONEY_BLOCK;
-        let side = Vector3::new(1, 0, 0);
-        let edge = Vector3::new(1, 1, 0);
-        assert!(attached(stone, state(stone), stone, state(stone), side));
-        assert!(!attached(stone, state(stone), stone, state(stone), edge));
-        assert!(attached(slime, state(slime), stone, state(stone), side));
-        // Over an edge, slime or honey on either side holds; slime and
-        // honey stick to each other neither way.
-        assert!(attached(stone, state(stone), slime, state(slime), edge));
-        assert!(attached(honey, state(honey), stone, state(stone), edge));
-        assert!(!attached(slime, state(slime), honey, state(honey), edge));
-        assert!(!attached(honey, state(honey), slime, state(slime), edge));
-        // A chain is a symmetric sail: it comes along when reached along its
-        // axis, and pulls whatever touches it.
-        let chain = &Block::CHAIN;
-        assert!(attached(
-            stone,
-            state(stone),
-            chain,
-            state(chain),
-            Vector3::new(0, 1, 0)
-        ));
-        assert!(!attached(stone, state(stone), chain, state(chain), side));
-        assert!(attached(chain, state(chain), stone, state(stone), side));
-        // Unbreakable blocks stay put.
-        assert!(unmovable(&Block::BEDROCK));
-        assert!(!unmovable(stone));
     }
 }
