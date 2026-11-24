@@ -60,6 +60,10 @@ use rand::RngExt;
 
 use crate::entity::r#type::from_type;
 use crate::mods::glue::{GlueEntity, GlueKind, glue_boxes, with_glue_by_id};
+use crate::mods::simulated::physics_staff::{self, Action};
+use crate::mods::simulated::{
+    PHYSICS_STAFF_BEAM, PHYSICS_STAFF_DRAG_SESSIONS, PHYSICS_STAFF_LOCKS,
+};
 
 /// Each plot is `1 << PLOT_LOG_SIZE` chunks on a side, as in Sable.
 pub const PLOT_LOG_SIZE: i32 = 7;
@@ -293,6 +297,26 @@ struct Disassembly {
     ticks: u32,
     /// Ticks in a row the sub-level has held its alignment.
     ready_ticks: u32,
+}
+
+/// A player dragging a sub-level with Simulated's physics staff: its
+/// `DragSession`.
+struct Drag {
+    sublevel: u32,
+    /// Where the staff's goal lies from the player's eyes.
+    goal: Vector3<f64>,
+    /// The point of the sub-level the staff holds, in the plot's
+    /// coordinates: where the other players' clients end its beam.
+    anchor: Vector3<f64>,
+}
+
+/// What the players have not heard of the physics staff since it changed.
+#[derive(Default, Clone, Copy)]
+pub struct StaffNews {
+    /// The locked sub-levels changed.
+    pub locks: bool,
+    /// Who drags what changed.
+    pub sessions: bool,
 }
 
 impl SubLevel {
@@ -571,6 +595,9 @@ pub struct SubLevelManager {
     riders: FxHashMap<Uuid, u32>,
     /// Ticks left before each player may punch a sub-level again.
     punch_cooldowns: FxHashMap<Uuid, i32>,
+    /// Simulated's `PhysicsStaffServerHandler.draggingSessions`, by player.
+    drags: FxHashMap<Uuid, Drag>,
+    staff_news: StaffNews,
 }
 
 impl Default for SubLevelManager {
@@ -602,6 +629,8 @@ impl SubLevelManager {
             pending_bounds: FxHashSet::default(),
             riders: FxHashMap::default(),
             punch_cooldowns: FxHashMap::default(),
+            drags: FxHashMap::default(),
+            staff_news: StaffNews::default(),
         }
     }
 
@@ -909,7 +938,157 @@ impl SubLevelManager {
             return false;
         };
         self.levels.swap_remove(index);
+        // A physics staff lock goes with its sub-level.
+        if self.physics.is_locked(id) {
+            self.staff_news.locks = true;
+        }
         self.physics.remove(id)
+    }
+
+    /// The sub-level whose parked content holds the block at `position`.
+    pub fn sublevel_at(&self, position: &BlockPos) -> Option<u32> {
+        let plot = Self::plot_of_chunk(position.chunk_position())?;
+        self.levels
+            .iter()
+            .find(|level| level.ready && level.plot == plot)
+            .map(|level| level.id)
+    }
+
+    /// The players tracking the sub-level whose plot holds `chunk`.
+    pub fn tracking_players_of_chunk(&self, chunk: Vector2<i32>) -> Vec<Uuid> {
+        let Some(plot) = Self::plot_of_chunk(chunk) else {
+            return Vec::new();
+        };
+        self.levels
+            .iter()
+            .find(|level| level.plot == plot)
+            .map(|level| level.tracking.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    fn id_of(&self, uuid: Uuid) -> Option<u32> {
+        self.levels
+            .iter()
+            .find(|level| level.uuid == uuid)
+            .map(|level| level.id)
+    }
+
+    /// Simulated's `toggleLock`: locks sub-level `uuid` where it stands, or
+    /// lets it go. Whether it is locked now; `None` for no such sub-level.
+    pub fn toggle_lock(&mut self, uuid: Uuid) -> Option<bool> {
+        let locked = self.physics.toggle_lock(self.id_of(uuid)?)?;
+        self.staff_news.locks = true;
+        Some(locked)
+    }
+
+    /// The locked sub-levels by uuid: what `PhysicsStaffLocksPacket` lists.
+    pub fn locked(&self) -> Vec<Uuid> {
+        self.levels
+            .iter()
+            .filter(|level| self.physics.is_locked(level.id))
+            .map(|level| level.uuid)
+            .collect()
+    }
+
+    /// Simulated's `removeLock`: a lock on sub-level `id` gives way.
+    pub fn let_lock_go(&mut self, id: u32) {
+        if self.physics.is_locked(id) {
+            self.physics.let_go_id(id);
+            self.staff_news.locks = true;
+        }
+    }
+
+    /// Simulated's `drag`: `player` drags sub-level `uuid` by the point
+    /// `anchor`, in the plot's coordinates, towards the goal `goal` from
+    /// their eyes, which are at `eye`, turned to `orientation`. A session
+    /// keeps the sub-level it began with, and a lock gives way.
+    pub fn drag(
+        &mut self,
+        player: Uuid,
+        uuid: Uuid,
+        goal: Vector3<f64>,
+        anchor: Vector3<f64>,
+        orientation: [f32; 4],
+        eye: Vector3<f64>,
+    ) -> bool {
+        let Some(id) = self.id_of(uuid) else {
+            return false;
+        };
+        self.let_lock_go(id);
+        let fresh = !self.drags.contains_key(&player);
+        let sublevel = self.drags.get(&player).map_or(id, |drag| drag.sublevel);
+        self.drags.insert(
+            player,
+            Drag {
+                sublevel,
+                goal,
+                anchor,
+            },
+        );
+        self.staff_news.sessions |= fresh;
+        let Some(pivot) = self.pivot_of(sublevel) else {
+            return false;
+        };
+        // The body's own frame counts from the pivot.
+        let held = (anchor - pivot).to_f32_lossy();
+        let reach = (eye + goal).to_f32_lossy();
+        self.physics.drag(
+            sublevel,
+            [held.x, held.y, held.z],
+            [reach.x, reach.y, reach.z],
+            orientation,
+        )
+    }
+
+    /// Whether any player drags a sub-level.
+    #[must_use]
+    pub fn dragging(&self) -> bool {
+        !self.drags.is_empty()
+    }
+
+    /// Simulated's `stopDragging`.
+    pub fn stop_dragging(&mut self, player: Uuid) {
+        if self.drags.remove(&player).is_some() {
+            self.staff_news.sessions = true;
+        }
+    }
+
+    /// One tick of Simulated's drag sessions, before the physics: each
+    /// goal follows its player's eyes, which `eyes` gives for a player who
+    /// holds the staff. A session ends when its player is gone or holds
+    /// something else, or when its sub-level is.
+    pub fn step_drags(&mut self, mut eyes: impl FnMut(Uuid) -> Option<Vector3<f64>>) {
+        let mut ended = Vec::new();
+        for (player, drag) in &self.drags {
+            let follows = eyes(*player).is_some_and(|eye| {
+                let reach = (eye + drag.goal).to_f32_lossy();
+                self.physics
+                    .set_drag_goal(drag.sublevel, [reach.x, reach.y, reach.z])
+            });
+            if !follows {
+                ended.push(*player);
+            }
+        }
+        if !ended.is_empty() {
+            for player in ended {
+                self.drags.remove(&player);
+            }
+            self.staff_news.sessions = true;
+        }
+    }
+
+    /// The drag sessions as `PhysicsStaffDragSessionsPacket` lists them.
+    pub fn drag_sessions(&self) -> Vec<(Uuid, Vector3<f64>)> {
+        self.drags
+            .iter()
+            .map(|(player, drag)| (*player, drag.anchor))
+            .collect()
+    }
+
+    /// What the players have not heard of the physics staff; nothing until
+    /// it changes again.
+    pub fn take_staff_news(&mut self) -> StaffNews {
+        std::mem::take(&mut self.staff_news)
     }
 
     pub fn apply_velocity_change(&mut self, id: u32, delta: [f32; 3]) -> bool {
@@ -1744,6 +1923,18 @@ fn send_payload(player: &Player, channel: &str, data: &[u8]) {
     java.try_enqueue_packet(encode_payload(player, channel, data));
 }
 
+/// The same for a mod's channel, which only a client that announced it
+/// may be sent on.
+fn send_mod_payload(player: &Player, channel: &str, data: &[u8]) {
+    let Some(java) = player.client.java() else {
+        return;
+    };
+    if !java.has_mod_channel(channel) {
+        return;
+    }
+    java.try_enqueue_packet(encode_payload(player, channel, data));
+}
+
 /// Sable's full sync: start tracking, one chunk packet per content chunk,
 /// finalize, in a bundle; a sub-level split off another one comes with what
 /// Sable's recently split packet says about it.
@@ -1901,12 +2092,28 @@ impl World {
     /// sampled by [`World::load_sublevel_surroundings`], and what the bodies
     /// hit is dealt with by [`World::handle_impacts`].
     pub fn tick_sublevels(self: &Arc<Self>) {
-        let (dirty, requests, step) = {
+        let (dirty, requests, step, news) = {
             let mut manager = self.lock_sublevels();
             self.has_sublevels
                 .store(!manager.is_empty(), std::sync::atomic::Ordering::Relaxed);
+            if manager.dragging() {
+                let players = self.players.load();
+                manager.step_drags(|uuid| {
+                    players
+                        .iter()
+                        .find(|player| {
+                            player.gameprofile.id == uuid && physics_staff::holding(player)
+                        })
+                        .map(|player| player.eye_position())
+                });
+            }
             let (requests, step) = manager.step_physics();
-            (manager.take_dirty(), requests, step)
+            (
+                manager.take_dirty(),
+                requests,
+                step,
+                manager.take_staff_news(),
+            )
         };
         for id in dirty {
             self.rescan_sublevel(id);
@@ -1925,6 +2132,129 @@ impl World {
         self.handle_impacts(&step.impacts);
         self.lock_sublevels().sync(self, &step.bodies);
         self.step_disassemblies();
+        self.tell_staff_news(news);
+    }
+
+    /// Tells every player what changed about the physics staff: Simulated's
+    /// `sendLocksToClients` and `sendDragSessionsToClients`.
+    fn tell_staff_news(&self, news: StaffNews) {
+        if !news.locks && !news.sessions {
+            return;
+        }
+        let dimension = format!("minecraft:{}", self.dimension.minecraft_name);
+        let manager = self.lock_sublevels();
+        let (locks, sessions) = (
+            news.locks
+                .then(|| physics_staff::encode_locks(&dimension, &manager.locked())),
+            news.sessions
+                .then(|| physics_staff::encode_sessions(&dimension, &manager.drag_sessions())),
+        );
+        for player in self.players.load().iter() {
+            if let Some(locks) = &locks {
+                send_mod_payload(player, PHYSICS_STAFF_LOCKS, locks);
+            }
+            if let Some(sessions) = &sessions {
+                send_mod_payload(player, PHYSICS_STAFF_DRAG_SESSIONS, sessions);
+            }
+        }
+    }
+
+    /// Simulated's `PhysicsStaffServerHandler.sendAllData`, for a player
+    /// who joined: the locks and the drag sessions of this dimension.
+    pub fn send_staff_data(&self, player: &Player) {
+        let dimension = format!("minecraft:{}", self.dimension.minecraft_name);
+        let manager = self.lock_sublevels();
+        send_mod_payload(
+            player,
+            PHYSICS_STAFF_LOCKS,
+            &physics_staff::encode_locks(&dimension, &manager.locked()),
+        );
+        send_mod_payload(
+            player,
+            PHYSICS_STAFF_DRAG_SESSIONS,
+            &physics_staff::encode_sessions(&dimension, &manager.drag_sessions()),
+        );
+    }
+
+    /// Simulated's `PhysicsStaffServerHandler.drag`, as the staff's drag
+    /// packet has it.
+    pub fn staff_drag(
+        &self,
+        player: &Arc<Player>,
+        sub_level: Uuid,
+        goal: Vector3<f64>,
+        anchor: Vector3<f64>,
+        orientation: [f32; 4],
+    ) {
+        let news = {
+            let mut manager = self.lock_sublevels();
+            manager.drag(
+                player.gameprofile.id,
+                sub_level,
+                goal,
+                anchor,
+                orientation,
+                player.eye_position(),
+            );
+            manager.take_staff_news()
+        };
+        self.tell_staff_news(news);
+    }
+
+    /// Simulated's `PhysicsStaffActionPacket`: `Lock` locks or frees
+    /// `sub_level`, with a beam from the player's eyes to `location` for
+    /// the players watching, and `StopDrag` ends the player's drag.
+    pub fn staff_action(
+        &self,
+        player: &Arc<Player>,
+        action: Action,
+        sub_level: Uuid,
+        location: Vector3<f64>,
+    ) {
+        let news = {
+            let mut manager = self.lock_sublevels();
+            match action {
+                Action::Lock => {
+                    manager.toggle_lock(sub_level);
+                }
+                Action::StopDrag => manager.stop_dragging(player.gameprofile.id),
+                Action::StartDrag => {}
+            }
+            manager.take_staff_news()
+        };
+        if action == Action::Lock {
+            let beam =
+                physics_staff::encode_beam(player.gameprofile.id, player.eye_position(), location);
+            let beam = CCustomPayload::new(PHYSICS_STAFF_BEAM, &beam);
+            self.send_to_chunk_watchers_except(
+                BlockPos::floored_v(location).chunk_position(),
+                player.gameprofile.id,
+                &beam,
+            );
+        }
+        self.tell_staff_news(news);
+    }
+
+    /// Sends `packet` to the players watching the chunk `chunk`, all but
+    /// `except`. A plot's chunk reaches the players tracking its sub-level.
+    fn send_to_chunk_watchers_except(
+        &self,
+        chunk: Vector2<i32>,
+        except: Uuid,
+        packet: &CCustomPayload<'_>,
+    ) {
+        if SubLevelManager::is_plot_chunk(chunk) {
+            let players = self.players.load();
+            for uuid in self.lock_sublevels().tracking_players_of_chunk(chunk) {
+                if uuid != except
+                    && let Some(player) = find_player(&players, uuid)
+                {
+                    player.try_send_client_packet(packet);
+                }
+            }
+        } else {
+            self.broadcast_to_chunk_except(chunk, &[except], packet);
+        }
     }
 
     /// Called for every block set inside the plotyard, and for every block

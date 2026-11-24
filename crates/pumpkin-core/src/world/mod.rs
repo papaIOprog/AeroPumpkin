@@ -4661,6 +4661,7 @@ impl World {
         });
         self.entity_tracker
             .add_entity(&(player.clone() as Arc<dyn EntityBase>), self);
+        self.send_staff_data(player);
         Ok(())
     }
 

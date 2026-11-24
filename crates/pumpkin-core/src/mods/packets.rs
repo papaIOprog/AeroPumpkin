@@ -51,17 +51,6 @@ pub(crate) fn read_vector(data: &[u8], at: usize) -> Option<(Vector3<f64>, usize
     Some((Vector3::new(values[0], values[1], values[2]), next))
 }
 
-/// Sable's `SableBufferUtils.write(ByteBuf, Quaterniondc)`: `(x, y, z, w)`.
-pub(crate) fn write_quaternion(
-    buf: &mut Vec<u8>,
-    orientation: [f32; 4],
-) -> Result<(), WritingError> {
-    for value in orientation {
-        buf.write_f32(value)?;
-    }
-    Ok(())
-}
-
 /// A quaternion `(x, y, z, w)` read at `at`.
 pub(crate) fn read_quaternion(data: &[u8], at: usize) -> Option<[f32; 4]> {
     let mut values = [0.0; 4];
@@ -86,6 +75,7 @@ pub(crate) fn write_count(buf: &mut Vec<u8>, count: usize) -> Result<(), Writing
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pumpkin_protocol::ser::NetworkWriteExt;
 
     #[test]
     fn primitives_round_trip_in_the_codecs_order() -> Result<(), &'static str> {
@@ -95,7 +85,9 @@ mod tests {
         write_block_pos(&mut buf, position).map_err(|_| "pos")?;
         write_uuid(&mut buf, id);
         write_vector(&mut buf, Vector3::new(1.5, -2.25, 3.0)).map_err(|_| "vector")?;
-        write_quaternion(&mut buf, [0.0, 0.5, 0.25, 0.75]).map_err(|_| "quaternion")?;
+        for value in [0.0, 0.5, 0.25, 0.75] {
+            buf.write_f32(value).map_err(|_| "quaternion")?;
+        }
         write_location(&mut buf, "minecraft:overworld").map_err(|_| "location")?;
         write_count(&mut buf, 300).map_err(|_| "count")?;
 
