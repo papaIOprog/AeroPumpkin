@@ -460,30 +460,35 @@ pub fn drop_loot(
     params: &LootContextParameters,
 ) {
     let key = format!("minecraft:blocks/{}", block.name);
-    if let Some(loot_table) = world.get_loot_table(&key) {
-        let seed: i64 = rand::random();
-        let items = crate::world::loot::generate_loot_from_handle(&loot_table, seed, params);
-        if !items.is_empty() {
-            let mut event = crate::plugin::block::block_drop_item::BlockDropItemEvent {
-                block_pos: *pos,
-                world: world.clone(),
-                player: None,
-                items,
-                cancelled: false,
-            };
-            if let Some(server) = world.server.upgrade() {
-                server.plugin_manager.fire_blocking(&server, &mut event);
-            }
-            if !event.cancelled {
-                let block_entity = world.get_block_entity(pos);
-                for mut stack in event.items {
-                    if let Some(block_entity) = &block_entity
-                        && Block::from_item_id(stack.item.id) == Some(block)
-                    {
-                        block_entity.collect_item_components(&mut stack);
-                    }
-                    world.drop_stack(pos, stack);
+    // Vanilla's tables end where the mods' blocks begin: with no table of
+    // its own, a mod's block drops itself, as nearly all of them do.
+    let items = world.get_loot_table(&key).map_or_else(
+        || own_item_drop(block, params),
+        |loot_table| {
+            let seed: i64 = rand::random();
+            crate::world::loot::generate_loot_from_handle(&loot_table, seed, params)
+        },
+    );
+    if !items.is_empty() {
+        let mut event = crate::plugin::block::block_drop_item::BlockDropItemEvent {
+            block_pos: *pos,
+            world: world.clone(),
+            player: None,
+            items,
+            cancelled: false,
+        };
+        if let Some(server) = world.server.upgrade() {
+            server.plugin_manager.fire_blocking(&server, &mut event);
+        }
+        if !event.cancelled {
+            let block_entity = world.get_block_entity(pos);
+            for mut stack in event.items {
+                if let Some(block_entity) = &block_entity
+                    && Block::from_item_id(stack.item.id) == Some(block)
+                {
+                    block_entity.collect_item_components(&mut stack);
                 }
+                world.drop_stack(pos, stack);
             }
         }
     }
@@ -513,6 +518,25 @@ pub fn drop_loot(
             }
         }
     }
+}
+
+/// The block's own item, for a mod's block Pumpkin has no loot table for:
+/// what their tables nearly all give, once the block survives the
+/// explosion it was broken by.
+fn own_item_drop(block: &Block, params: &LootContextParameters) -> Vec<ItemStack> {
+    let modded = usize::from(block.id.as_u16()) >= pumpkin_data::BlockId::COUNT as usize;
+    if !modded
+        || block.item_id == u16::MAX
+        || params
+            .explosion_radius
+            .is_some_and(|radius| rand::random::<f32>() >= 1.0 / radius)
+    {
+        return Vec::new();
+    }
+    let Some(item) = pumpkin_data::item::Item::from_id(block.item_id) else {
+        return Vec::new();
+    };
+    vec![ItemStack::new(1, item)]
 }
 
 pub fn calc_block_breaking(player: &Player, state: &BlockState, block: &'static Block) -> f32 {
