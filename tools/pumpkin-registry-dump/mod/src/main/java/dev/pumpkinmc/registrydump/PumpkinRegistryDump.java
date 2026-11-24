@@ -35,11 +35,11 @@ import net.minecraft.world.level.block.state.properties.Property;
 import net.minecraft.world.level.material.PushReaction;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.shapes.VoxelShape;
-import net.neoforged.bus.api.IEventBus;
 import net.neoforged.fml.common.Mod;
 import net.neoforged.fml.config.ModConfig;
 import net.neoforged.fml.config.ModConfigs;
 import net.neoforged.fml.loading.FMLPaths;
+import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.event.server.ServerStartedEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -70,8 +70,9 @@ public final class PumpkinRegistryDump {
 
     private static boolean written;
 
-    public PumpkinRegistryDump(IEventBus modBus) {
-        modBus.addListener(PumpkinRegistryDump::serverStarted);
+    public PumpkinRegistryDump() {
+        // The server's life cycle lives on the game bus, not the mod bus.
+        NeoForge.EVENT_BUS.addListener(PumpkinRegistryDump::serverStarted);
     }
 
     private static void serverStarted(ServerStartedEvent event) {
@@ -134,11 +135,6 @@ public final class PumpkinRegistryDump {
 
         // Every block state, in state id order, under its block.
         IdMap<BlockState> states = Block.BLOCK_STATE_REGISTRY;
-        EmptyBlockGetter nothing = EmptyBlockGetter.INSTANCE;
-        BlockPos origin = BlockPos.ZERO;
-        Direction[] sides = {
-            Direction.DOWN, Direction.UP, Direction.NORTH, Direction.SOUTH, Direction.WEST, Direction.EAST
-        };
         for (int id = 0; id < states.size(); id++) {
             BlockState state = states.byId(id);
             Block block = state.getBlock();
@@ -153,54 +149,15 @@ public final class PumpkinRegistryDump {
                 blockFacts.add("states", new JsonArray());
                 blocks.add(name, blockFacts);
             }
-            JsonObject facts = new JsonObject();
-            JsonObject props = new JsonObject();
-            for (Map.Entry<Property<?>, Comparable<?>> value : state.getValues().entrySet()) {
-                props.addProperty(value.getKey().getName(), nameOf(value.getKey(), value.getValue()));
+            JsonObject facts;
+            try {
+                facts = facts(state);
+            } catch (Exception e) {
+                // One odd block must not cost the dump: its properties still go in.
+                LOG.warn("could not read every fact of {}", name, e);
+                facts = new JsonObject();
+                facts.add("props", properties(state));
             }
-            facts.add("props", props);
-            facts.add("shape", boxes(state.getCollisionShape(nothing, origin)));
-            facts.add("outline", boxes(state.getShape(nothing, origin)));
-            facts.addProperty("light", state.getLightEmission());
-            facts.addProperty("opacity", state.getLightBlock(nothing, origin));
-            facts.addProperty("sky", state.propagatesSkylightDown(nothing, origin));
-            facts.addProperty("solidRender", state.isSolidRender(nothing, origin));
-            facts.addProperty("solid", state.isSolid());
-            facts.addProperty("fullCube", state.isCollisionShapeFullBlock(nothing, origin));
-            facts.addProperty("canOcclude", state.canOcclude());
-            facts.addProperty("toolRequired", state.requiresCorrectToolForDrops());
-            facts.addProperty("analog", state.hasAnalogOutputSignal());
-            facts.add("centerSturdy", array(
-                state.isFaceSturdy(nothing, origin, Direction.DOWN, SupportType.CENTER),
-                state.isFaceSturdy(nothing, origin, Direction.UP, SupportType.CENTER)));
-            JsonArray sturdy = new JsonArray();
-            JsonArray skip = new JsonArray();
-            for (Direction side : sides) {
-                sturdy.add(state.isFaceSturdy(nothing, origin, side));
-                skip.add(state.skipRendering(state, side));
-            }
-            facts.add("sturdy", sturdy);
-            facts.add("skip", skip);
-            facts.addProperty("liquid", state.liquid());
-            facts.addProperty("air", state.isAir());
-            facts.addProperty("replaceable", state.canBeReplaced());
-            facts.addProperty("randomTick", state.isRandomlyTicking());
-            facts.addProperty("push", nameOf(state.getPistonPushReaction()));
-            facts.addProperty("hardness", state.getDestroySpeed(nothing, origin));
-            facts.addProperty("mapColor", state.getMapColor(nothing, origin).id);
-            facts.addProperty("friction", block.getFriction());
-            facts.addProperty("ignite", ((FireBlock) Blocks.FIRE).getIgniteOdds(state));
-            facts.addProperty("burn", ((FireBlock) Blocks.FIRE).getBurnOdds(state));
-            SoundType sound = state.getSoundType();
-            JsonObject soundFacts = new JsonObject();
-            soundFacts.addProperty("volume", sound.getVolume());
-            soundFacts.addProperty("pitch", sound.getPitch());
-            soundFacts.add("break", location(sound.getBreakSound()));
-            soundFacts.add("step", location(sound.getStepSound()));
-            soundFacts.add("place", location(sound.getPlaceSound()));
-            soundFacts.add("hit", location(sound.getHitSound()));
-            soundFacts.add("fall", location(sound.getFallSound()));
-            facts.add("sound", soundFacts);
             blockFacts.getAsJsonArray("states").add(facts);
         }
         dump.add("blocks", blocks);
@@ -234,17 +191,84 @@ public final class PumpkinRegistryDump {
         return list(entries);
     }
 
+    /** What the server asks of one block state; `nothing` answers for the world around it. */
+    private static JsonObject facts(BlockState state) {
+        EmptyBlockGetter nothing = EmptyBlockGetter.INSTANCE;
+        BlockPos origin = BlockPos.ZERO;
+        JsonObject facts = new JsonObject();
+        facts.add("props", properties(state));
+        Block block = state.getBlock();
+        Direction[] sides = {
+            Direction.DOWN, Direction.UP, Direction.NORTH, Direction.SOUTH, Direction.WEST, Direction.EAST
+        };
+        facts.add("shape", boxes(state.getCollisionShape(nothing, origin)));
+        facts.add("outline", boxes(state.getShape(nothing, origin)));
+        facts.addProperty("light", state.getLightEmission());
+        facts.addProperty("opacity", state.getLightBlock(nothing, origin));
+        facts.addProperty("sky", state.propagatesSkylightDown(nothing, origin));
+        facts.addProperty("solidRender", state.isSolidRender(nothing, origin));
+        facts.addProperty("solid", state.isSolid());
+        facts.addProperty("fullCube", state.isCollisionShapeFullBlock(nothing, origin));
+        facts.addProperty("canOcclude", state.canOcclude());
+        facts.addProperty("toolRequired", state.requiresCorrectToolForDrops());
+        facts.addProperty("analog", state.hasAnalogOutputSignal());
+        facts.add("centerSturdy", array(
+            state.isFaceSturdy(nothing, origin, Direction.DOWN, SupportType.CENTER),
+            state.isFaceSturdy(nothing, origin, Direction.UP, SupportType.CENTER)));
+        JsonArray sturdy = new JsonArray();
+        JsonArray skip = new JsonArray();
+        for (Direction side : sides) {
+            sturdy.add(state.isFaceSturdy(nothing, origin, side));
+            skip.add(state.skipRendering(state, side));
+        }
+        facts.add("sturdy", sturdy);
+        facts.add("skip", skip);
+        facts.addProperty("liquid", state.liquid());
+        facts.addProperty("air", state.isAir());
+        facts.addProperty("replaceable", state.canBeReplaced());
+        facts.addProperty("randomTick", state.isRandomlyTicking());
+        facts.addProperty("push", nameOf(state.getPistonPushReaction()));
+        facts.addProperty("hardness", state.getDestroySpeed(nothing, origin));
+        facts.addProperty("mapColor", state.getMapColor(nothing, origin).id);
+        facts.addProperty("friction", block.getFriction());
+        facts.addProperty("ignite", ((FireBlock) Blocks.FIRE).getIgniteOdds(state));
+        facts.addProperty("burn", ((FireBlock) Blocks.FIRE).getBurnOdds(state));
+        SoundType sound = state.getSoundType();
+        JsonObject soundFacts = new JsonObject();
+        soundFacts.addProperty("volume", sound.getVolume());
+        soundFacts.addProperty("pitch", sound.getPitch());
+        soundFacts.add("break", location(sound.getBreakSound()));
+        soundFacts.add("step", location(sound.getStepSound()));
+        soundFacts.add("place", location(sound.getPlaceSound()));
+        soundFacts.add("hit", location(sound.getHitSound()));
+        soundFacts.add("fall", location(sound.getFallSound()));
+        facts.add("sound", soundFacts);
+        return facts;
+    }
+
+    private static JsonObject properties(BlockState state) {
+        JsonObject props = new JsonObject();
+        for (Map.Entry<Property<?>, Comparable<?>> value : state.getValues().entrySet()) {
+            props.addProperty(value.getKey().getName(), nameOf(value.getKey(), value.getValue()));
+        }
+        return props;
+    }
+
     private static JsonElement blockEntity(Block block, BlockState state) {
         if (!(block instanceof EntityBlock entity)) {
             return JsonNull.INSTANCE;
         }
-        BlockEntity blockEntity = entity.newBlockEntity(BlockPos.ZERO, state);
-        if (blockEntity == null) {
+        try {
+            BlockEntity blockEntity = entity.newBlockEntity(BlockPos.ZERO, state);
+            if (blockEntity == null) {
+                return JsonNull.INSTANCE;
+            }
+            BlockEntityType<?> type = blockEntity.getType();
+            return location(BuiltInRegistries.BLOCK_ENTITY_TYPE.getKey(type));
+        } catch (Exception e) {
+            LOG.warn("could not tell the block entity of {}", BuiltInRegistries.BLOCK.getKey(block), e);
             return JsonNull.INSTANCE;
         }
-        BlockEntityType<?> type = blockEntity.getType();
-        ResourceLocation key = BuiltInRegistries.BLOCK_ENTITY_TYPE.getKey(type);
-        return location(key);
     }
 
     private static <T> JsonArray tags(Registry<T> registry) {
