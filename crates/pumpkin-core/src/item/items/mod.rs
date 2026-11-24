@@ -165,5 +165,8 @@ pub fn default_registry() -> Arc<ItemRegistry> {
     manager.register(ShieldItem);
     manager.register(DebugStickItem);
 
+    // The mods' items, as far as their ports are switched on.
+    crate::mods::register_items(&mut manager);
+
     Arc::new(manager)
 }

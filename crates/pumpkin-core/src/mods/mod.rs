@@ -5,7 +5,11 @@
 //! The switches in the configuration say which of Pumpkin's ports of those
 //! mods run; each port lives in its own module here.
 
+pub mod create;
+pub mod glue;
+pub mod packets;
 pub mod profile;
+pub mod simulated;
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -75,6 +79,13 @@ pub fn install(config: &ModsConfig) {
         config: config.clone(),
         server_configs: profile.server_configs,
     });
+}
+
+/// Registers the behaviours of the mods' items whose ports are switched on;
+/// called as the item registry is built.
+pub fn register_items(items: &mut crate::item::registry::ItemRegistry) {
+    create::register_items(items);
+    simulated::register_items(items);
 }
 
 /// Whether the installed profile shows content of the mod `namespace`.

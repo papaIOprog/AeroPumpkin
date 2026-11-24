@@ -18,6 +18,9 @@ pub const REGISTER_CHANNEL: &str = "minecraft:register";
 pub const UNREGISTER_CHANNEL: &str = "minecraft:unregister";
 const QUERY_CHANNEL: &str = "neoforge:register";
 const SETUP_CHANNEL: &str = "neoforge:network";
+/// Carries what an entity with complex spawn data writes for the client,
+/// after the entity's spawn packet.
+pub const ADVANCED_ADD_ENTITY: &str = "neoforge:advanced_add_entity";
 
 /// `ConnectionProtocol` ordinals on the wire.
 const PROTOCOL_PLAY: i32 = 1;

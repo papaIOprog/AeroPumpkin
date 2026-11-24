@@ -1635,7 +1635,18 @@ impl Player {
             // these are only used by non-player entities (e.g. horses).
             EquipmentSlot::Body(_) | EquipmentSlot::Saddle(_) => return false,
         };
+        self.damage_item_in_inventory_slot(slot_index, amount, slot)
+    }
 
+    /// The same for the item in the inventory slot `slot_index`. A break is
+    /// reported, and the item synced, as for `slot`: an item that is not
+    /// worn passes its owner's equipment slot.
+    pub fn damage_item_in_inventory_slot(
+        &self,
+        slot_index: usize,
+        amount: i32,
+        slot: &EquipmentSlot,
+    ) -> bool {
         let mut stack = self.inventory.get_slot(slot_index);
         let original_item = stack.item;
         let result = stack.damage_item(amount);

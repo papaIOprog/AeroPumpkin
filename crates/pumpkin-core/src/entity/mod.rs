@@ -440,6 +440,33 @@ pub trait EntityBase: Send + Sync + std::any::Any {
         }
     }
 
+    /// What a `NeoForge` client reads about the entity right after its
+    /// spawn packet, on `neoforge:advanced_add_entity`: what an entity
+    /// implementing `IEntityWithComplexSpawn` writes for the client, as
+    /// `AdvancedAddEntityPayload` carries it.
+    fn neoforge_spawn_data(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// `NeoForge`'s `advanced_add_entity`: what an entity implementing
+    /// `IEntityWithComplexSpawn` writes for the client, read right after the
+    /// entity's spawn packet.
+    fn send_neoforge_spawn_data(&self, client: &JavaClient) {
+        let Some(data) = self.neoforge_spawn_data() else {
+            return;
+        };
+        if !client.has_mod_channel(crate::net::java::neoforge::ADVANCED_ADD_ENTITY) {
+            return;
+        }
+        let packet = pumpkin_protocol::java::client::play::CCustomPayload::new(
+            crate::net::java::neoforge::ADVANCED_ADD_ENTITY,
+            &data,
+        );
+        if let Ok(bytes) = client.serialize_packet(&packet) {
+            client.try_enqueue_packet(bytes);
+        }
+    }
+
     fn send_java_spawn_packet(&self, client: &JavaClient) {
         let entity = self.get_entity();
         let metadata = self.java_spawn_metadata(CURRENT_MC_VERSION);
@@ -447,6 +474,7 @@ pub trait EntityBase: Send + Sync + std::any::Any {
         if let Ok(data) = client.serialize_packet(&spawn_packet) {
             client.try_enqueue_packet(data);
         }
+        self.send_neoforge_spawn_data(client);
         if let Some(meta) = metadata {
             let meta_packet = CSetEntityMetadata::new(entity.entity_id.into(), meta);
             if let Ok(meta_data) = client.serialize_packet(&meta_packet) {
@@ -4037,9 +4065,15 @@ impl Entity {
 impl Entity {
     pub fn write_nbt(&self, nbt: &mut NbtCompound) {
         let position = self.pos.load();
+        // A mod's entity type is named with its namespace already.
+        let id = self.entity_type.resource_name;
         nbt.put_string(
             "id",
-            format!("minecraft:{}", self.entity_type.resource_name),
+            if id.contains(':') {
+                id.to_owned()
+            } else {
+                format!("minecraft:{id}")
+            },
         );
         nbt.put_uuid("UUID", self.entity_uuid);
         nbt.put(

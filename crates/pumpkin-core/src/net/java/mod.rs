@@ -1094,6 +1094,14 @@ impl JavaClient {
                     }
                 } else if channel_str == crate::world::sublevel::sable::PUNCH {
                     player.world().punch_sublevel(player, payload.data);
+                } else if channel_str == crate::mods::create::GLUE_IN_AREA {
+                    crate::mods::create::super_glue::glue_in_area(player, payload.data);
+                } else if channel_str == crate::mods::create::GLUE_REMOVED {
+                    crate::mods::create::super_glue::glue_removed(player, payload.data);
+                } else if channel_str == crate::mods::simulated::HONEY_GLUE_SPAWN {
+                    crate::mods::simulated::honey_glue::spawn(player, payload.data);
+                } else if channel_str == crate::mods::simulated::HONEY_GLUE_CHANGE_BOUNDS {
+                    crate::mods::simulated::honey_glue::change_bounds(player, payload.data);
                 }
             }
             id if id == SRecipeBookChangeSettings::to_id(version) => {
