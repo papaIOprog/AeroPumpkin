@@ -20,7 +20,9 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use pumpkin_nbt::compound::NbtCompound;
 use pumpkin_protocol::codec::var_int::VarInt;
-use pumpkin_protocol::java::client::play::{CBundleDelimiter, CCustomPayload, CParticle};
+use pumpkin_protocol::java::client::play::{
+    CBlockUpdate, CBundleDelimiter, CCustomPayload, CParticle,
+};
 use pumpkin_protocol::ser::NetworkWriteExt;
 use pumpkin_protocol::{ClientPacket, MultiVersionJavaPacket};
 use pumpkin_sublevel::{
@@ -46,7 +48,7 @@ use pumpkin_data::block_properties::{HorizontalFacing, blocks_movement};
 use pumpkin_data::entity::EntityType;
 use pumpkin_data::sound::{Sound, SoundCategory};
 use pumpkin_data::tag::{self, Taggable};
-use pumpkin_data::{Block, BlockDirection};
+use pumpkin_data::{Block, BlockDirection, BlockStateId};
 use pumpkin_util::math::position::BlockPos;
 use pumpkin_world::chunk_system::ChunkLoading;
 use pumpkin_world::world::BlockFlags;
@@ -267,6 +269,9 @@ impl SoundFamily {
     }
 }
 
+/// Parked block changes per sub-level, waiting for its players.
+type PlotChanges = FxHashMap<u32, Vec<(BlockPos, BlockStateId)>>;
+
 /// Whether a block's aerodynamic role depends on the redstone reaching it.
 fn needs_signal(block: &Block) -> bool {
     block.has_tag(&tag::Block::MINECRAFT_CAMPFIRES)
@@ -286,6 +291,10 @@ pub struct SubLevelManager {
     dirty: FxHashSet<u32>,
     /// Blocks of sub-levels that sounded on their last knock, and when.
     recent_sounds: FxHashMap<(u32, [i32; 3]), i32>,
+    /// Parked blocks that changed since their sub-level's players last heard.
+    pending_updates: FxHashMap<u32, Vec<(BlockPos, BlockStateId)>>,
+    /// Sub-levels whose bounds changed since their players last heard.
+    pending_bounds: FxHashSet<u32>,
 }
 
 impl Default for SubLevelManager {
@@ -313,6 +322,8 @@ impl SubLevelManager {
             updating: FxHashSet::default(),
             dirty: FxHashSet::default(),
             recent_sounds: FxHashMap::default(),
+            pending_updates: FxHashMap::default(),
+            pending_bounds: FxHashSet::default(),
         }
     }
 
@@ -437,9 +448,12 @@ impl SubLevelManager {
     /// boxes do. Called once the copy finished, before the sub-level is
     /// networked.
     pub fn tighten_bounds(&mut self, id: u32, bounds: [i32; 6]) {
-        if let Some(level) = self.levels.iter_mut().find(|level| level.id == id) {
+        if let Some(level) = self.levels.iter_mut().find(|level| level.id == id)
+            && level.bounds != bounds
+        {
             level.chunks = content_chunks(&bounds);
             level.bounds = bounds;
+            self.pending_bounds.insert(id);
         }
     }
 
@@ -537,18 +551,40 @@ impl SubLevelManager {
             .map(|level| level.pivot - level.from_anchor)
     }
 
-    /// Schedules a rescan of every ready sub-level whose parked content
-    /// contains `pos`, after a block there was edited, and a new sample of
-    /// the world for every body whose surroundings contain it.
-    pub fn note_edit(&mut self, pos: &BlockPos) {
+    /// Notes that the block at `pos` is now `state`: a ready sub-level whose
+    /// parked content contains it is rescanned and its players told of the
+    /// block, and every body whose surroundings contain it gets a new sample
+    /// of the world.
+    pub fn note_edit(&mut self, pos: &BlockPos, state: BlockStateId) {
         let [x, y, z] = [pos.0.x, pos.0.y, pos.0.z];
         for level in &mut self.levels {
             let [x0, y0, z0, x1, y1, z1] = level.bounds;
             if level.ready && x >= x0 && x <= x1 && y >= y0 && y <= y1 && z >= z0 && z <= z1 {
                 self.dirty.insert(level.id);
+                self.pending_updates
+                    .entry(level.id)
+                    .or_default()
+                    .push((*pos, state));
             }
         }
         self.physics.note_edit([x, y, z]);
+    }
+
+    /// The parked block changes and bounds changes the players tracking each
+    /// sub-level have not been told of yet, by sub-level.
+    pub fn take_plot_changes(&mut self) -> (PlotChanges, Vec<(u32, [i32; 6])>) {
+        let bounds = self
+            .pending_bounds
+            .iter()
+            .filter_map(|id| {
+                self.levels
+                    .iter()
+                    .find(|level| level.id == *id)
+                    .map(|level| (*id, level.bounds))
+            })
+            .collect();
+        self.pending_bounds.clear();
+        (std::mem::take(&mut self.pending_updates), bounds)
     }
 
     pub const fn is_empty(&self) -> bool {
@@ -739,6 +775,42 @@ impl SubLevelManager {
         let players: Vec<Arc<Player>> = world.players.load().to_vec();
         self.update_tracking(world, bodies, &players);
         self.send_movement(bodies, &players, ms_since_last);
+        self.send_plot_changes(&players);
+    }
+
+    /// Tells the players tracking a sub-level of its parked blocks that
+    /// changed and, as Sable's `change_bounds_sublevel`, of its new bounds.
+    /// Nobody's view reaches the plotyard, so the usual block updates
+    /// never arrive there.
+    fn send_plot_changes(&mut self, players: &[Arc<Player>]) {
+        let (updates, bounds) = self.take_plot_changes();
+        for (id, changes) in updates {
+            let Some(level) = self.levels.iter().find(|level| level.id == id) else {
+                continue;
+            };
+            for uuid in &level.tracking {
+                let Some(player) = find_player(players, *uuid) else {
+                    continue;
+                };
+                for (pos, state) in &changes {
+                    send_packet(
+                        player,
+                        &CBlockUpdate::new(*pos, VarInt(i32::from(state.as_u16()))),
+                    );
+                }
+            }
+        }
+        for (id, bounds) in bounds {
+            let Some(level) = self.levels.iter().find(|level| level.id == id) else {
+                continue;
+            };
+            let payload = encode(sable::encode_change_bounds(level.plot_long(), bounds));
+            for uuid in &level.tracking {
+                if let Some(player) = find_player(players, *uuid) {
+                    send_payload(player, sable::CHANGE_BOUNDS, &payload);
+                }
+            }
+        }
     }
 
     fn note_send_time(&mut self) -> i32 {
@@ -1036,6 +1108,17 @@ fn send_bundle(player: &Player, members: &[Bytes]) {
     }
 }
 
+fn send_packet<P: ClientPacket + MultiVersionJavaPacket>(player: &Player, packet: &P) {
+    let Some(java) = player.client.java() else {
+        return;
+    };
+    if let Ok(bytes) =
+        JavaClient::serialize_packet_for_version(packet, player.client.java_version())
+    {
+        java.try_enqueue_packet(bytes);
+    }
+}
+
 fn send_payload(player: &Player, channel: &str, data: &[u8]) {
     let Some(java) = player.client.java() else {
         return;
@@ -1212,8 +1295,8 @@ impl World {
     /// Called for every block set inside the plotyard, and for every block
     /// set anywhere while sub-levels exist: their bodies collide with the
     /// world, so it has to follow its edits.
-    pub(crate) fn note_sublevel_edit(&self, pos: &BlockPos) {
-        self.lock_sublevels().note_edit(pos);
+    pub(crate) fn note_sublevel_edit(&self, pos: &BlockPos, state: BlockStateId) {
+        self.lock_sublevels().note_edit(pos, state);
     }
 
     /// Removes a sub-level, telling every client that tracked it.
@@ -1439,6 +1522,21 @@ impl World {
             self.remove_sublevel(id);
             return;
         }
+        // Sable keeps its bounds tight to the content: a block gone from an
+        // edge shrinks the client's render and collision box.
+        let mut tight = [i32::MAX; 6];
+        for voxel in &voxels {
+            let parked = [
+                anchor.x + voxel.position[0],
+                anchor.y + voxel.position[1],
+                anchor.z + voxel.position[2],
+            ];
+            for axis in 0..3 {
+                tight[axis] = tight[axis].min(parked[axis]);
+                tight[axis + 3] = tight[axis + 3].max(parked[axis]);
+            }
+        }
+        manager.tighten_bounds(id, tight);
         let pivot_offset = manager.from_anchor_of(id).map_or([0.0; 3], |offset| {
             [offset.x as f32, offset.y as f32, offset.z as f32]
         });

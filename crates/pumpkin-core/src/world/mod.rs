@@ -5186,7 +5186,7 @@ impl World {
                 .has_sublevels
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
-                self.note_sublevel_edit(position);
+                self.note_sublevel_edit(position, block_state_id);
             }
 
             if flags.contains(BlockFlags::NOTIFY_NEIGHBORS) {

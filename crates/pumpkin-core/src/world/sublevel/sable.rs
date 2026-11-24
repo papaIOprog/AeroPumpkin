@@ -15,6 +15,7 @@ pub const STOP_TRACKING: &str = "sable:stop_tracking_sub_level";
 pub const STOP_MOVING: &str = "sable:stop_moving_sub_level";
 pub const SNAPSHOT: &str = "sable:snapshot_packet";
 pub const SNAPSHOT_INFO: &str = "sable:snapshot_info_packet";
+pub const CHANGE_BOUNDS: &str = "sable:change_bounds_sublevel";
 
 /// Sable clients register this channel, so its presence identifies them
 /// during `NeoForge` network negotiation.
@@ -131,6 +132,16 @@ pub fn encode_start_tracking(
 pub fn encode_plot_ref(plot: i64) -> Result<Vec<u8>, WritingError> {
     let mut buf = Vec::with_capacity(8);
     buf.write_i64(plot)?;
+    Ok(buf)
+}
+
+/// `sable:change_bounds_sublevel`: the plot and its new bounds.
+pub fn encode_change_bounds(plot: i64, bounds: [i32; 6]) -> Result<Vec<u8>, WritingError> {
+    let mut buf = Vec::with_capacity(32);
+    buf.write_i64(plot)?;
+    for value in bounds {
+        buf.write_i32(value)?;
+    }
     Ok(buf)
 }
 
