@@ -1,0 +1,26 @@
+plugins {
+    id 'net.neoforged.moddev' version '2.0.78'
+}
+
+version = "1.0.0"
+group = 'dev.pumpkinmc'
+
+base {
+    archivesName = 'pumpkin_registry_dump'
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+neoForge {
+    version = '21.1.247'
+
+    mods {
+        pumpkin_registry_dump {
+            sourceSet(sourceSets.main)
+        }
+    }
+}
