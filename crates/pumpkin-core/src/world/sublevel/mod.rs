@@ -1016,20 +1016,26 @@ impl SubLevelManager {
     }
 
     /// Notes that the block at `pos` is now `state`: a ready sub-level whose
-    /// parked content contains it is rescanned and its players told of the
-    /// block, and every body whose surroundings contain it gets a new sample
-    /// of the world.
+    /// plot holds it is rescanned and its players told of the block, and
+    /// every body whose surroundings contain it gets a new sample of the
+    /// world.
     pub fn note_edit(&mut self, pos: &BlockPos, state: BlockStateId) {
         let [x, y, z] = [pos.0.x, pos.0.y, pos.0.z];
-        for level in &mut self.levels {
-            let [x0, y0, z0, x1, y1, z1] = level.bounds;
-            if level.ready && x >= x0 && x <= x1 && y >= y0 && y <= y1 && z >= z0 && z <= z1 {
-                self.dirty.insert(level.id);
-                self.pending_updates
-                    .entry(level.id)
-                    .or_default()
-                    .push((*pos, state));
-            }
+        // By plot, not by bounds: a block placed against the content lies
+        // outside them until the rescan, and a piece a split moves out must
+        // leave the clients' view although it no longer lies within them.
+        let chunk = Vector2::new(x.div_euclid(16), z.div_euclid(16));
+        if let Some(plot) = Self::plot_of_chunk(chunk)
+            && let Some(level) = self
+                .levels
+                .iter_mut()
+                .find(|level| level.ready && level.plot == plot)
+        {
+            self.dirty.insert(level.id);
+            self.pending_updates
+                .entry(level.id)
+                .or_default()
+                .push((*pos, state));
         }
         self.physics.note_edit([x, y, z]);
     }
@@ -1164,6 +1170,17 @@ impl SubLevelManager {
         }
     }
 
+    /// The plot a chunk of the plotyard belongs to, each plot being a
+    /// square of `1 << PLOT_LOG_SIZE` chunks.
+    fn plot_of_chunk(chunk: Vector2<i32>) -> Option<Vector2<i32>> {
+        Self::is_plot_chunk(chunk).then(|| {
+            Vector2::new(
+                (chunk.x >> PLOT_LOG_SIZE) - PLOTYARD_ORIGIN,
+                (chunk.y >> PLOT_LOG_SIZE) - PLOTYARD_ORIGIN,
+            )
+        })
+    }
+
     /// The sub-level whose parked content holds `block`, if any.
     #[must_use]
     pub fn containing(&self, block: &BlockPos) -> Option<u32> {
@@ -1229,13 +1246,7 @@ impl SubLevelManager {
             (position.x.floor() as i32).div_euclid(16),
             (position.z.floor() as i32).div_euclid(16),
         );
-        if !Self::is_plot_chunk(chunk) {
-            return None;
-        }
-        let plot = Vector2::new(
-            (chunk.x >> PLOT_LOG_SIZE) - PLOTYARD_ORIGIN,
-            (chunk.y >> PLOT_LOG_SIZE) - PLOTYARD_ORIGIN,
-        );
+        let plot = Self::plot_of_chunk(chunk)?;
         let level = self.levels.iter().find(|level| level.plot == plot)?;
         let pivot = level.pivot;
         let pose = &level.last_pose;
@@ -2266,9 +2277,12 @@ impl World {
     fn content_from_plot(&self, id: u32, anchor: Vector3<i32>) -> Option<Vec<Voxel>> {
         let bounds = self.lock_sublevels().bounds_of(id)?;
         let mut voxels = Vec::new();
-        for x in bounds[0]..=bounds[3] {
-            for y in bounds[1]..=bounds[4] {
-                for z in bounds[2]..=bounds[5] {
+        // A block placed against the content is the sub-level's next, so the
+        // read reaches one block past the bounds; they tighten to what is
+        // found.
+        for x in bounds[0] - 1..=bounds[3] + 1 {
+            for y in bounds[1] - 1..=bounds[4] + 1 {
+                for z in bounds[2] - 1..=bounds[5] + 1 {
                     let pos = BlockPos(Vector3::new(x, y, z));
                     let (block, state) = self.get_block_and_state(&pos);
                     if state.is_air() {
@@ -3735,6 +3749,35 @@ mod tests {
         );
         assert_eq!(manager.root_of(id), Some([2, 0, 0]));
         assert_eq!(manager.root_of(id + 1), None);
+    }
+
+    #[test]
+    fn a_block_changed_in_the_plot_reaches_the_sub_level_whatever_the_bounds() {
+        let mut manager = SubLevelManager::new();
+        let (id, chunk) = manager.spawn(Vector3::new(0.0, 64.0, 0.0), 16);
+        manager.mark_ready(id);
+        let centre = plot_center_block(chunk);
+        // In the plot, but above the slab: a block placed on it, or a piece a
+        // split has just moved out, once the bounds tightened.
+        let stone = Block::STONE.default_state.id;
+        let placed = BlockPos(centre + Vector3::new(0, 3, 0));
+        manager.note_edit(&placed, stone);
+        let (updates, _) = manager.take_plot_changes();
+        assert_eq!(
+            updates.get(&id).map(Vec::as_slice),
+            Some(&[(placed, stone)][..])
+        );
+        assert_eq!(manager.take_dirty(), vec![id]);
+        // Another plot's block is nobody's.
+        manager.note_edit(
+            &BlockPos(centre + Vector3::new(16 << PLOT_LOG_SIZE, 3, 0)),
+            stone,
+        );
+        assert_eq!(
+            manager.take_plot_changes(),
+            (PlotChanges::default(), Vec::new())
+        );
+        assert!(manager.take_dirty().is_empty());
     }
 
     #[test]
