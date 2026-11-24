@@ -181,6 +181,39 @@ impl CommandExecutor for AssembleExecutor {
     }
 }
 
+/// `/sublevel assemble <x> <y> <z>`: the contraption connected to a block.
+struct AssembleAtExecutor;
+
+impl CommandExecutor for AssembleAtExecutor {
+    fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
+        let x = IntegerArgumentType::get(context, "x1")?;
+        let y = IntegerArgumentType::get(context, "y1")?;
+        let z = IntegerArgumentType::get(context, "z1")?;
+        let Some(world) = world_of(context) else {
+            context
+                .source
+                .send_error(TextComponent::text("No worlds are loaded"));
+            return Ok(0);
+        };
+
+        match world.assemble_connected(Vector3::new(x, y, z)) {
+            Ok(id) => {
+                context.source.send_feedback(
+                    green(format!(
+                        "Assembling sub-level {id} from the contraption at ({x}, {y}, {z}); its plot chunks are generating"
+                    )),
+                    true,
+                );
+                Ok(1)
+            }
+            Err(error) => {
+                context.source.send_error(TextComponent::text(error));
+                Ok(0)
+            }
+        }
+    }
+}
+
 struct DisassembleExecutor;
 
 impl CommandExecutor for DisassembleExecutor {
@@ -197,7 +230,7 @@ impl CommandExecutor for DisassembleExecutor {
             Ok(id) => {
                 context.source.send_feedback(
                     green(format!(
-                        "Sub-level {id} is melting back into the world where it stands"
+                        "Sub-level {id} is turning to the nearest quarter turn to melt back into the world"
                     )),
                     true,
                 );
@@ -403,7 +436,7 @@ pub fn register(dispatcher: &mut CommandDispatcher, registry: &PermissionRegistr
         .then(literal("assemble").then(
             coordinate("x1").then(
                 coordinate("y1").then(
-                    coordinate("z1").then(
+                    coordinate("z1").executes(AssembleAtExecutor).then(
                         coordinate("x2").then(
                             coordinate("y2").then(coordinate("z2").executes(AssembleExecutor)),
                         ),

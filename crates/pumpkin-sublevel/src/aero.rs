@@ -878,9 +878,10 @@ pub fn apply_forces(
     air: Air,
     dt: f32,
 ) {
-    // Rapier keeps forces until they are cleared, so every substep starts
-    // from none and queues what works until the next one.
+    // Rapier keeps forces and torques until they are cleared, so every
+    // substep starts from none and queues what works until the next one.
     body.reset_forces(false);
+    body.reset_torques(false);
     for force in persistent {
         body.add_force_at_point(vector_of(force.force), point_of(force.point), true);
     }

@@ -14,6 +14,7 @@
 pub mod aero;
 pub mod sable;
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,7 +27,8 @@ use pumpkin_protocol::java::client::play::{
 use pumpkin_protocol::ser::NetworkWriteExt;
 use pumpkin_protocol::{ClientPacket, MultiVersionJavaPacket};
 use pumpkin_sublevel::{
-    AeroInfo, Air, BodySnapshot, Content, Impact, ImpactTarget, Step, SurroundingsRequest, Voxel,
+    AeroInfo, Air, Alignment, BodySnapshot, Content, Impact, ImpactTarget, Step,
+    SurroundingsRequest, Voxel,
 };
 use pumpkin_util::math::vector2::Vector2;
 use pumpkin_util::math::vector3::Vector3;
@@ -44,7 +46,10 @@ use crate::entity::player::Player;
 use crate::entity::tnt::TNTEntity;
 use crate::net::java::JavaClient;
 use crate::net::java::chunk_data::CChunkData;
-use pumpkin_data::block_properties::{HorizontalFacing, blocks_movement};
+use pumpkin_data::block_properties::{
+    Axis, ChainLikeProperties, HorizontalFacing, blocks_movement,
+};
+use pumpkin_data::block_rotation::Rotation;
 use pumpkin_data::entity::EntityType;
 use pumpkin_data::sound::{Sound, SoundCategory};
 use pumpkin_data::tag::{self, Taggable};
@@ -66,6 +71,12 @@ pub const TRACKING_RANGE: f64 = 320.0;
 /// small enough to copy in one pass.
 const MAX_ASSEMBLE_SPAN: i32 = 128;
 const MAX_ASSEMBLE_VOLUME: i64 = 65_536;
+/// Simulated's `maxBlocksMoved`: the most blocks an assembler takes.
+const MAX_ASSEMBLE_BLOCKS: usize = 128_000;
+/// Simulated's `disassemblyDegreeTolerance` in radians, and the distance in
+/// blocks within which a sub-level counts as placed.
+const MAX_ALIGN_ANGLE: f32 = 4.0 * std::f32::consts::PI / 180.0;
+const MAX_ALIGN_DISTANCE: f32 = 0.2;
 /// The pose origin sits at this y in plot space: (min + max build height) / 2.
 pub const PLOT_ORIGIN_Y: i32 = 128;
 /// How long a plot chunk may take to generate before the sub-level stays
@@ -103,6 +114,48 @@ struct SubLevel {
     /// while the copy runs: its blocks are still in the world but are this
     /// sub-level's already, so nothing may sample them as ground.
     source: Option<[[i32; 3]; 2]>,
+    /// Set while the sub-level is driven level and onto block centres to be
+    /// melted back into the world.
+    disassembling: Option<Disassembly>,
+}
+
+/// A block a sub-level hit this tick: the hardest speed it was hit at, a
+/// point it was hit from, and the sub-levels it belongs to.
+struct Hit {
+    speed: f32,
+    point: [f32; 3],
+    owners: FxHashSet<u32>,
+}
+
+impl Hit {
+    fn new(impact: &Impact) -> Self {
+        Self {
+            speed: impact.speed,
+            point: impact.point,
+            owners: FxHashSet::default(),
+        }
+    }
+
+    const fn harder(&mut self, speed: f32) {
+        self.speed = self.speed.max(speed);
+    }
+}
+
+/// A knock hard enough to be heard: the sub-level's block that hit, where,
+/// with how much force, and the lighter of the two masses involved.
+struct Knock {
+    sublevel: u32,
+    block: [i32; 3],
+    point: [f32; 3],
+    force: f32,
+    lighter: f32,
+}
+
+/// A sub-level on its way to being disassembled.
+struct Disassembly {
+    ticks: u32,
+    /// Ticks in a row the sub-level has held its alignment.
+    ready_ticks: u32,
 }
 
 impl SubLevel {
@@ -272,6 +325,110 @@ impl SoundFamily {
 /// Parked block changes per sub-level, waiting for its players.
 type PlotChanges = FxHashMap<u32, Vec<(BlockPos, BlockStateId)>>;
 
+/// The eighteen ways two blocks of a contraption touch: the six faces and
+/// the twelve edges. Corners never connect.
+const ASSEMBLY_NEIGHBOURS: [Vector3<i32>; 18] = [
+    Vector3::new(1, 0, 0),
+    Vector3::new(-1, 0, 0),
+    Vector3::new(0, 1, 0),
+    Vector3::new(0, -1, 0),
+    Vector3::new(0, 0, 1),
+    Vector3::new(0, 0, -1),
+    Vector3::new(1, 1, 0),
+    Vector3::new(1, -1, 0),
+    Vector3::new(-1, 1, 0),
+    Vector3::new(-1, -1, 0),
+    Vector3::new(1, 0, 1),
+    Vector3::new(1, 0, -1),
+    Vector3::new(-1, 0, 1),
+    Vector3::new(-1, 0, -1),
+    Vector3::new(0, 1, 1),
+    Vector3::new(0, 1, -1),
+    Vector3::new(0, -1, 1),
+    Vector3::new(0, -1, -1),
+];
+
+/// Whether a block cannot be moved at all, as an unbreakable block cannot.
+fn unmovable(block: &Block) -> bool {
+    block.hardness < 0.0
+}
+
+/// Whether two blocks are stuck together, as pistons know it: slime and
+/// honey stick to anything but each other.
+fn stuck(a: &Block, b: &Block) -> bool {
+    let slime = |block: &Block| *block == Block::SLIME_BLOCK;
+    let honey = |block: &Block| *block == Block::HONEY_BLOCK;
+    if (slime(a) && honey(b)) || (honey(a) && slime(b)) {
+        return false;
+    }
+    slime(a) || honey(a) || slime(b) || honey(b)
+}
+
+/// Whether a contraption reaching from block `from` takes the block `to`
+/// that touches it at `offset`: every face counts, except for a symmetric
+/// sail (a chain) reached across its axis; an edge counts only where slime
+/// or honey holds the two together.
+fn attached(
+    from: &Block,
+    _from_state: &pumpkin_data::BlockState,
+    to: &Block,
+    to_state: &pumpkin_data::BlockState,
+    offset: Vector3<i32>,
+) -> bool {
+    let face = offset.x.abs() + offset.y.abs() + offset.z.abs() == 1;
+    if !face {
+        return stuck(from, to);
+    }
+    if *to == Block::CHAIN {
+        let axis = ChainLikeProperties::from_state_id(to_state.id).r#axis;
+        return match axis {
+            Axis::X => offset.x != 0,
+            Axis::Y => offset.y != 0,
+            Axis::Z => offset.z != 0,
+        };
+    }
+    true
+}
+
+/// The quarter turn a pose is closest to: how many clockwise quarter turns
+/// it is from upright, from 0 to 3.
+struct QuarterTurn {
+    turns: u8,
+}
+
+impl QuarterTurn {
+    /// Vanilla's rotation that turns blocks the same way.
+    const fn rotation(self) -> Rotation {
+        Rotation::from_index(self.turns)
+    }
+
+    /// The upright orientation at this quarter turn, as the quaternion
+    /// `(x, y, z, w)` the physics steers to.
+    fn upright(self) -> [f32; 4] {
+        // A clockwise quarter turn seen from above is a right-handed turn
+        // the other way about the up axis.
+        let half = -f32::from(self.turns) * std::f32::consts::FRAC_PI_2;
+        [0.0, (half * 0.5).sin(), 0.0, (half * 0.5).cos()]
+    }
+}
+
+fn quarter_turn([_qx, qy, _qz, qw]: [f32; 4]) -> QuarterTurn {
+    let yaw = 2.0 * qy.atan2(qw);
+    let turns = (-yaw / std::f32::consts::FRAC_PI_2).round().rem_euclid(4.0) as u8;
+    QuarterTurn { turns }
+}
+
+/// Where a point of a sub-level's parked space lands once the sub-level is
+/// turned by `turns` clockwise quarter turns: the same map as
+/// [`Rotation::rotate_offset`].
+fn placed(local: [f64; 3], turns: u8) -> [f64; 3] {
+    let (mut x, mut z) = (local[0], local[2]);
+    for _ in 0..turns {
+        (x, z) = (-z, x);
+    }
+    [x, local[1], z]
+}
+
 /// Whether a block's aerodynamic role depends on the redstone reaching it.
 fn needs_signal(block: &Block) -> bool {
     block.has_tag(&tag::Block::MINECRAFT_CAMPFIRES)
@@ -374,6 +531,7 @@ impl SubLevelManager {
             tracking: FxHashSet::default(),
             surroundings_chunks: Vec::new(),
             source: None,
+            disassembling: None,
         });
         (id, center)
     }
@@ -422,8 +580,71 @@ impl SubLevelManager {
             tracking: FxHashSet::default(),
             surroundings_chunks: Vec::new(),
             source: Some(source),
+            disassembling: None,
         });
         id
+    }
+
+    /// Starts driving sub-level `id` to the alignment its disassembly
+    /// waits for.
+    pub fn start_disassembly(&mut self, id: u32) {
+        if let Some(level) = self.levels.iter_mut().find(|level| level.id == id) {
+            level.disassembling = Some(Disassembly {
+                ticks: 0,
+                ready_ticks: 0,
+            });
+        }
+    }
+
+    /// Stops a disassembly under way and the steering that went with it.
+    pub fn cancel_disassembly(&mut self, id: u32) {
+        if let Some(level) = self.levels.iter_mut().find(|level| level.id == id) {
+            level.disassembling = None;
+        }
+        self.physics.set_alignment(id, None);
+    }
+
+    /// The sub-levels being disassembled.
+    pub fn disassembling(&self) -> Vec<u32> {
+        self.levels
+            .iter()
+            .filter(|level| level.disassembling.is_some())
+            .map(|level| level.id)
+            .collect()
+    }
+
+    /// One tick of sub-level `id`'s disassembly: how many ticks it has
+    /// taken and how many it has held its alignment for.
+    pub fn disassembly_tick(&mut self, id: u32) -> Option<(u32, u32)> {
+        let level = self.levels.iter_mut().find(|level| level.id == id)?;
+        let disassembly = level.disassembling.as_mut()?;
+        disassembly.ticks += 1;
+        let aligned = self
+            .physics
+            .alignment_error(id)
+            .is_some_and(|(angle, distance)| {
+                angle <= MAX_ALIGN_ANGLE && distance <= MAX_ALIGN_DISTANCE
+            });
+        disassembly.ready_ticks = if aligned {
+            disassembly.ready_ticks + 1
+        } else {
+            0
+        };
+        Some((disassembly.ticks, disassembly.ready_ticks))
+    }
+
+    /// Steers sub-level `id` to `alignment` until told otherwise.
+    pub fn set_alignment(&mut self, id: u32, alignment: Option<Alignment>) -> bool {
+        self.physics.set_alignment(id, alignment)
+    }
+
+    /// Sub-level `id`'s body after the last step.
+    #[must_use]
+    pub fn snapshot_of(&self, id: u32) -> Option<BodySnapshot> {
+        self.physics
+            .snapshots()
+            .into_iter()
+            .find(|body| body.id == id)
     }
 
     /// Notes that sub-level `id`'s region is copied: its blocks are out of
@@ -597,12 +818,15 @@ impl SubLevelManager {
 
     /// Whether sub-level `id`'s block `block` may sound its knock on tick
     /// `tick`: not if it sounded within the last `quiet` ticks.
-    pub fn note_sound(&mut self, id: u32, block: [i32; 3], tick: i32, quiet: i32) -> bool {
-        self.recent_sounds
-            .retain(|_, sounded| tick - *sounded < quiet);
-        self.recent_sounds
-            .insert((id, block), tick)
-            .is_none_or(|sounded| tick - sounded >= quiet)
+    /// Forgets the blocks that sounded before `tick`.
+    pub fn forget_sounds_before(&mut self, tick: i32) {
+        self.recent_sounds.retain(|_, sounded| *sounded >= tick);
+    }
+
+    /// Whether sub-level `id`'s block `block` may sound its knock on tick
+    /// `tick`: not if it has not been forgotten since it last did.
+    pub fn note_sound(&mut self, block: (u32, [i32; 3]), tick: i32) -> bool {
+        self.recent_sounds.insert(block, tick).is_none()
     }
 
     /// The body pose of sub-level `id`, for mapping content back to the world.
@@ -1061,6 +1285,21 @@ const fn parked_bounds(center: Vector3<i32>, bounds: &[i32; 6]) -> [i32; 6] {
     ]
 }
 
+/// The absolute parked bounds of blocks counted from `anchor`: the lowest
+/// and highest block on each axis, inclusive.
+fn tight_bounds(anchor: Vector3<i32>, voxels: &[Voxel]) -> [i32; 6] {
+    let mut tight = [i32::MAX, i32::MAX, i32::MAX, i32::MIN, i32::MIN, i32::MIN];
+    let anchor = [anchor.x, anchor.y, anchor.z];
+    for voxel in voxels {
+        for axis in 0..3 {
+            let parked = anchor[axis] + voxel.position[axis];
+            tight[axis] = tight[axis].min(parked);
+            tight[axis + 3] = tight[axis + 3].max(parked);
+        }
+    }
+    tight
+}
+
 /// Every chunk the content with these absolute parked bounds occupies, as in
 /// Sable's full sync: one chunk packet per parked chunk.
 fn content_chunks(bounds: &[i32; 6]) -> Vec<Vector2<i32>> {
@@ -1288,8 +1527,12 @@ impl World {
             let world = Arc::clone(self);
             tokio::spawn(async move { world.load_sublevel_surroundings(id, request).await });
         }
+        for id in &step.recovered {
+            warn!("sublevel {id}: left the numbers; put back at rest where it last was");
+        }
         self.handle_impacts(&step.impacts);
         self.lock_sublevels().sync(self, &step.bodies);
+        self.step_disassemblies();
     }
 
     /// Called for every block set inside the plotyard, and for every block
@@ -1327,6 +1570,91 @@ impl World {
         min: Vector3<i32>,
         max: Vector3<i32>,
     ) -> Result<u32, String> {
+        self.assemble_region(min, max, None)
+    }
+
+    /// Freezes the contraption standing on the block at `start` into a new
+    /// sub-level, as Simulated's assembler does: every block connected to it
+    /// through faces and edges is taken, up to [`MAX_ASSEMBLE_BLOCKS`], and
+    /// unmovable blocks stop it. Returns the sub-level id.
+    pub fn assemble_connected(self: &Arc<Self>, start: Vector3<i32>) -> Result<u32, String> {
+        let blocks = self.connected_blocks(start)?;
+        let (mut min, mut max) = (blocks[0], blocks[0]);
+        for block in &blocks {
+            min.x = min.x.min(block.x);
+            min.y = min.y.min(block.y);
+            min.z = min.z.min(block.z);
+            max.x = max.x.max(block.x);
+            max.y = max.y.max(block.y);
+            max.z = max.z.max(block.z);
+        }
+        let include: FxHashSet<BlockPos> = blocks.iter().copied().map(BlockPos).collect();
+        self.assemble_region(min, max, Some(include))
+    }
+
+    /// Whether the chunk holding `pos` is loaded.
+    fn chunk_loaded(&self, pos: Vector3<i32>) -> bool {
+        self.level
+            .is_chunk_loaded(&Vector2::new(pos.x >> 4, pos.z >> 4))
+    }
+
+    /// The blocks of the contraption `start` belongs to.
+    fn connected_blocks(&self, start: Vector3<i32>) -> Result<Vec<Vector3<i32>>, String> {
+        let start_block = BlockPos(start);
+        if !self.is_in_build_limit(start_block) {
+            return Err("the block is outside the build limit".to_string());
+        }
+        if !self.chunk_loaded(start) {
+            return Err("the block's chunk is not loaded".to_string());
+        }
+        let (block, state) = self.get_block_and_state(&start_block);
+        if state.is_air() {
+            return Err("there is no block to assemble there".to_string());
+        }
+        if unmovable(block) {
+            return Err("that block cannot be moved".to_string());
+        }
+        let mut blocks = vec![start];
+        let mut seen: FxHashSet<BlockPos> = FxHashSet::from_iter([start_block]);
+        let mut frontier = VecDeque::from([start]);
+        while let Some(at) = frontier.pop_front() {
+            let (from, from_state) = self.get_block_and_state(&BlockPos(at));
+            for offset in ASSEMBLY_NEIGHBOURS {
+                let next = at + offset;
+                if seen.contains(&BlockPos(next)) {
+                    continue;
+                }
+                if !self.chunk_loaded(next) {
+                    return Err("the contraption reaches unloaded chunks".to_string());
+                }
+                let (block, state) = self.get_block_and_state(&BlockPos(next));
+                if state.is_air() || unmovable(block) {
+                    continue;
+                }
+                if !attached(from, from_state, block, state, offset) {
+                    continue;
+                }
+                seen.insert(BlockPos(next));
+                blocks.push(next);
+                if blocks.len() > MAX_ASSEMBLE_BLOCKS {
+                    return Err(format!(
+                        "the contraption is over {MAX_ASSEMBLE_BLOCKS} blocks"
+                    ));
+                }
+                frontier.push_back(next);
+            }
+        }
+        Ok(blocks)
+    }
+
+    /// Freezes a world region into a sub-level, or with `include` only the
+    /// listed blocks of it.
+    fn assemble_region(
+        self: &Arc<Self>,
+        min: Vector3<i32>,
+        max: Vector3<i32>,
+        include: Option<FxHashSet<BlockPos>>,
+    ) -> Result<u32, String> {
         let (min, max) = (
             Vector3::new(min.x.min(max.x), min.y.min(max.y), min.z.min(max.z)),
             Vector3::new(min.x.max(max.x), min.y.max(max.y), min.z.max(max.z)),
@@ -1334,7 +1662,8 @@ impl World {
         let size = max - min + Vector3::new(1, 1, 1);
         if size.x > MAX_ASSEMBLE_SPAN
             || size.z > MAX_ASSEMBLE_SPAN
-            || i64::from(size.x) * i64::from(size.y) * i64::from(size.z) > MAX_ASSEMBLE_VOLUME
+            || (include.is_none()
+                && i64::from(size.x) * i64::from(size.y) * i64::from(size.z) > MAX_ASSEMBLE_VOLUME)
         {
             return Err(format!(
                 "region is {}x{}x{} blocks; assembly stays within \
@@ -1378,13 +1707,21 @@ impl World {
             [[min.x, min.y, min.z], [max.x, max.y, max.z]],
         );
         let world = Arc::clone(self);
-        tokio::spawn(async move { world.copy_region_into_plot(id, min, max).await });
+        tokio::spawn(async move {
+            world.copy_region_into_plot(id, min, max, include).await;
+        });
         Ok(id)
     }
 
     /// Copies a region into a sub-level's parked chunks, parks its entities,
     /// clears the original, then networks the sub-level.
-    async fn copy_region_into_plot(self: Arc<Self>, id: u32, min: Vector3<i32>, max: Vector3<i32>) {
+    async fn copy_region_into_plot(
+        self: Arc<Self>,
+        id: u32,
+        min: Vector3<i32>,
+        max: Vector3<i32>,
+        include: Option<FxHashSet<BlockPos>>,
+    ) {
         let (chunks, anchor, center_chunk, from_anchor) = {
             let manager = self.lock_sublevels();
             let Some(chunks) = manager.chunks_of(id) else {
@@ -1425,7 +1762,13 @@ impl World {
             self.clear_parked_chunk(*chunk);
         }
         let center = plot_center_block(center_chunk);
-        let ParkedCopy { bounds } = match self.copy_blocks_into_plot(min, max, anchor, center) {
+        let ParkedCopy { bounds } = match self.copy_blocks_into_plot(
+            min,
+            max,
+            anchor,
+            center,
+            include.as_ref(),
+        ) {
             Ok(copied) => copied,
             Err(outside) => {
                 warn!(
@@ -1436,8 +1779,8 @@ impl World {
                 return;
             }
         };
-        self.park_entities_in_region(min, max, anchor, center);
-        self.clear_region(min, max);
+        self.park_entities_in_region(min, max, anchor, center, include.as_ref());
+        self.clear_region(min, max, include.as_ref());
         self.lock_sublevels().end_assembly(id);
 
         // Sable's bounds are tight to the content; empty margins of the
@@ -1524,19 +1867,7 @@ impl World {
         }
         // Sable keeps its bounds tight to the content: a block gone from an
         // edge shrinks the client's render and collision box.
-        let mut tight = [i32::MAX; 6];
-        for voxel in &voxels {
-            let parked = [
-                anchor.x + voxel.position[0],
-                anchor.y + voxel.position[1],
-                anchor.z + voxel.position[2],
-            ];
-            for axis in 0..3 {
-                tight[axis] = tight[axis].min(parked[axis]);
-                tight[axis + 3] = tight[axis + 3].max(parked[axis]);
-            }
-        }
-        manager.tighten_bounds(id, tight);
+        manager.tighten_bounds(id, tight_bounds(anchor, &voxels));
         let pivot_offset = manager.from_anchor_of(id).map_or([0.0; 3], |offset| {
             [offset.x as f32, offset.y as f32, offset.z as f32]
         });
@@ -1553,49 +1884,65 @@ impl World {
     /// TNT primes, bells ring, knocks hard for their mass sound, and the
     /// sub-levels that lost blocks are read again.
     fn handle_impacts(self: &Arc<Self>, impacts: &[Impact]) {
-        let mut rescans: FxHashSet<u32> = FxHashSet::default();
-        for impact in impacts {
-            // The sub-level's own block that hit, in its plot. Its lookup is
-            // a statement of its own: changing a parked block locks the
-            // manager again.
-            let own = self
-                .lock_sublevels()
-                .parked_block(impact.sublevel, impact.block);
-            if own.is_some_and(|pos| self.hit_block(&pos, impact)) {
-                rescans.insert(impact.sublevel);
-            }
-            match impact.target {
-                ImpactTarget::World([x, y, z]) => {
-                    let pos = BlockPos(Vector3::new(x, y, z));
-                    self.hit_block(&pos, impact);
+        // One entry per block hit this tick, with the hardest hit on it, a
+        // point that hit it and the sub-levels it belongs to: a platform
+        // settling on ground reports thousands of contacts a tick, and a
+        // block only needs breaking once. Parked blocks are looked up here
+        // in one go: a lookup is a statement of its own elsewhere, as
+        // changing a parked block locks the manager again.
+        let mut hits: FxHashMap<BlockPos, Hit> = FxHashMap::default();
+        let mut knocks = Vec::new();
+        {
+            let manager = self.lock_sublevels();
+            for impact in impacts {
+                if let Some(pos) = manager.parked_block(impact.sublevel, impact.block) {
+                    let hit = hits.entry(pos).or_insert_with(|| Hit::new(impact));
+                    hit.harder(impact.speed);
+                    hit.owners.insert(impact.sublevel);
                 }
-                ImpactTarget::SubLevel { id, block } => {
-                    let Some(pos) = self.lock_sublevels().parked_block(id, block) else {
-                        continue;
-                    };
-                    if self.hit_block(&pos, impact) {
-                        rescans.insert(id);
+                let target = match impact.target {
+                    ImpactTarget::World([x, y, z]) => Some(BlockPos(Vector3::new(x, y, z))),
+                    ImpactTarget::SubLevel { id, block } => manager.parked_block(id, block),
+                };
+                if let Some(pos) = target {
+                    let hit = hits.entry(pos).or_insert_with(|| Hit::new(impact));
+                    hit.harder(impact.speed);
+                    if let ImpactTarget::SubLevel { id, .. } = impact.target {
+                        hit.owners.insert(id);
                     }
                 }
+                if impact.impulse > 0.0 {
+                    knocks.push(Knock {
+                        sublevel: impact.sublevel,
+                        block: impact.block,
+                        point: impact.point,
+                        force: impact.impulse / pumpkin_sublevel::SUBSTEP_DT,
+                        lighter: impact.mass.min(impact.other_mass),
+                    });
+                }
+            }
+        }
+        let mut rescans: FxHashSet<u32> = FxHashSet::default();
+        for (pos, hit) in hits {
+            if self.hit_block(&pos, hit.speed, hit.point) {
+                rescans.extend(hit.owners);
             }
         }
         for id in rescans {
             self.rescan_sublevel(id);
         }
-        self.sound_impacts(impacts);
+        self.sound_impacts(&knocks);
     }
 
-    /// Lets a block take the consequences of being hit: fragile blocks break,
-    /// TNT primes, bells ring. Returns whether the block changed.
-    fn hit_block(self: &Arc<Self>, pos: &BlockPos, impact: &Impact) -> bool {
+    /// Lets a block take the consequences of being hit at `speed` on its
+    /// side towards `point`: fragile blocks break, TNT primes, bells ring.
+    /// Returns whether the block changed.
+    fn hit_block(self: &Arc<Self>, pos: &BlockPos, speed: f32, point: [f32; 3]) -> bool {
         /// Sable's `FragileBlockCallback` threshold, in blocks per second.
         const FRAGILE_SPEED: f32 = 4.0;
         /// Sable's `ExplosiveBlockCallback` threshold.
         const TNT_SPEED: f32 = 5.0;
-        /// Sable's `BellBlockCallback` threshold, inherited from fragile blocks.
-        const BELL_SPEED: f32 = FRAGILE_SPEED;
 
-        let speed = impact.speed;
         let (block, state) = self.get_block_and_state(pos);
         if *block == Block::TNT && speed >= TNT_SPEED {
             self.set_block_state(
@@ -1609,14 +1956,15 @@ impl World {
         if speed < FRAGILE_SPEED {
             return false;
         }
-        if *block == Block::BELL && speed >= BELL_SPEED {
+        // A bell's threshold is the fragile blocks' 4 m/s.
+        if *block == Block::BELL {
             // The bell swings from the side that was hit. One parked on a
             // sub-level is rung where it stands, but heard where it was hit.
             let centre = pos.to_centered_f64();
             let from = Vector3::new(
-                f64::from(impact.point[0]),
-                f64::from(impact.point[1]),
-                f64::from(impact.point[2]),
+                f64::from(point[0]),
+                f64::from(point[1]),
+                f64::from(point[2]),
             );
             let parked = SubLevelManager::is_plot_chunk(pos.chunk_and_chunk_relative_position().0);
             ring_bell(*pos, self, Some(hit_side(from - centre)), None);
@@ -1647,8 +1995,8 @@ impl World {
     /// Sounds the knocks that were hard for the lighter body's mass, as
     /// Sable's `processCollisionEffects` does: the hit block's particles and
     /// step, hit and place sounds at the contact, a block sounding once per
-    /// two ticks.
-    fn sound_impacts(self: &Arc<Self>, impacts: &[Impact]) {
+    /// two ticks, and so many collisions per tick at most.
+    fn sound_impacts(&self, knocks: &[Knock]) {
         /// Sable plays a contact's sounds when its force, the impulse over
         /// the substep, exceeds this multiple of the smaller mass.
         const FORCE_PER_MASS: f32 = 25.0;
@@ -1658,42 +2006,33 @@ impl World {
         const MAX_PER_TICK: usize = 100;
         const VOLUME: f32 = 0.08;
 
-        let tick = self.lock_sublevels().tick;
+        let mut manager = self.lock_sublevels();
+        let tick = manager.tick;
+        manager.forget_sounds_before(tick - QUIET_TICKS);
         let mut sounded = 0;
-        for impact in impacts {
-            if sounded >= MAX_PER_TICK || impact.impulse <= 0.0 {
+        for knock in knocks {
+            if sounded >= MAX_PER_TICK {
                 break;
             }
-            let lighter = impact.mass.min(impact.other_mass);
-            if impact.impulse / pumpkin_sublevel::SUBSTEP_DT <= FORCE_PER_MASS * lighter {
+            if knock.force <= FORCE_PER_MASS * knock.lighter {
                 continue;
             }
-            if !self
-                .lock_sublevels()
-                .note_sound(impact.sublevel, impact.block, tick, QUIET_TICKS)
-            {
+            if !manager.note_sound((knock.sublevel, knock.block), tick) {
                 continue;
             }
-            let state = match impact.target {
-                ImpactTarget::World([x, y, z]) => {
-                    self.get_block_state_id(&BlockPos(Vector3::new(x, y, z)))
-                }
-                ImpactTarget::SubLevel { id, block } => self
-                    .lock_sublevels()
-                    .parked_block(id, block)
-                    .map_or(Block::AIR.default_state.id, |pos| {
-                        self.get_block_state_id(&pos)
-                    }),
+            let Some(pos) = manager.parked_block(knock.sublevel, knock.block) else {
+                continue;
             };
+            let state = self.get_block_state_id(&pos);
             let block = Block::from_state_id(state);
             if *block == Block::AIR {
                 continue;
             }
             sounded += 1;
             let at = Vector3::new(
-                f64::from(impact.point[0]),
-                f64::from(impact.point[1]),
-                f64::from(impact.point[2]),
+                f64::from(knock.point[0]),
+                f64::from(knock.point[1]),
+                f64::from(knock.point[2]),
             );
             self.block_particles(state, at, 2);
             let family = SoundFamily::of(block);
@@ -1737,6 +2076,7 @@ impl World {
         max: Vector3<i32>,
         anchor: Vector3<i32>,
         center: Vector3<i32>,
+        include: Option<&FxHashSet<BlockPos>>,
     ) -> Result<ParkedCopy, Vector3<i32>> {
         let flags = BlockFlags::SKIP_BLOCK_ADDED_CALLBACK | BlockFlags::UPDATE_KNOWN_SHAPE;
         let mut tight: Option<[i32; 6]> = None;
@@ -1744,6 +2084,9 @@ impl World {
             for y in min.y..=max.y {
                 for z in min.z..=max.z {
                     let pos = BlockPos(Vector3::new(x, y, z));
+                    if include.is_some_and(|include| !include.contains(&pos)) {
+                        continue;
+                    }
                     let state = self.get_block_state_id(&pos);
                     if state == Block::AIR.default_state.id {
                         continue;
@@ -1777,7 +2120,12 @@ impl World {
 
     /// Empties a world region of the blocks an assembly copied out of it,
     /// leaving nothing behind: no drops, no spilled block entity contents.
-    fn clear_region(self: &Arc<Self>, min: Vector3<i32>, max: Vector3<i32>) {
+    fn clear_region(
+        self: &Arc<Self>,
+        min: Vector3<i32>,
+        max: Vector3<i32>,
+        include: Option<&FxHashSet<BlockPos>>,
+    ) {
         let flags = BlockFlags::NOTIFY_ALL
             | BlockFlags::SKIP_DROPS
             | BlockFlags::FORCE_STATE
@@ -1786,6 +2134,9 @@ impl World {
             for y in min.y..=max.y {
                 for z in min.z..=max.z {
                     let pos = BlockPos(Vector3::new(x, y, z));
+                    if include.is_some_and(|include| !include.contains(&pos)) {
+                        continue;
+                    }
                     if self.get_block_state_id(&pos) != Block::AIR.default_state.id {
                         self.set_block_state(&pos, Block::AIR.default_state.id, flags);
                     }
@@ -1809,13 +2160,15 @@ impl World {
     }
 
     /// Moves every entity standing in the region to its parked position.
-    /// Players stay: their position is client authoritative.
+    /// Players stay: their position is client authoritative. With `include`,
+    /// only entities on the contraption's own blocks go.
     fn park_entities_in_region(
         &self,
         min: Vector3<i32>,
         max: Vector3<i32>,
         anchor: Vector3<i32>,
         center: Vector3<i32>,
+        include: Option<&FxHashSet<BlockPos>>,
     ) {
         let center_f64 = Vector3::new(
             f64::from(center.x),
@@ -1841,6 +2194,12 @@ impl World {
                 || block.z < min.z
                 || block.z > max.z
             {
+                continue;
+            }
+            if include.is_some_and(|include| {
+                !include.contains(&BlockPos(block))
+                    && !include.contains(&BlockPos(block - Vector3::new(0, 1, 0)))
+            }) {
                 continue;
             }
             entity.set_pos(center_f64 + pos - anchor_f64);
@@ -1979,74 +2338,188 @@ impl World {
         }
     }
 
-    /// Melt a sub-level back into the world at its current position: the
-    /// parked blocks, block entities and entities return as real ones and
-    /// the sub-level is removed. Only an unrotated sub-level can return.
+    /// Melt a sub-level back into the world where it stands, as Simulated's
+    /// assembler does: not at once, but once the sub-level has been turned
+    /// to the nearest quarter turn and brought onto block centres, which it
+    /// is driven to over the next ticks. One drifting out of the world,
+    /// moving too fast or too far from the ground is refused.
     pub fn disassemble_sublevel(self: &Arc<Self>, id: u32) -> Result<u32, String> {
-        let manager = self.lock_sublevels();
-        let Some(bounds) = manager.bounds_of(id) else {
+        self.check_disassembly(id)?;
+        let Some(pose) = self.lock_sublevels().pose_of(id) else {
             return Err(format!("No sub-level {id}"));
         };
-        let Some(pose) = manager.pose_of(id) else {
-            return Err(format!("No sub-level {id}"));
-        };
-        let Some(chunks) = manager.chunks_of(id) else {
-            return Err(format!("No sub-level {id}"));
-        };
-        drop(manager);
-        // Blocks cannot be written back rotated; wait for the sub-level to
-        // come level again.
-        let [qx, qy, qz, qw] = pose.orientation;
-        if qx.abs() > 0.001 || qy.abs() > 0.001 || qz.abs() > 0.001 || (qw - 1.0).abs() > 0.001 {
-            return Err("sub-level is rotated; bring it level first".to_string());
-        }
-        // Rendered position = pose + (parked - rotation point), so the world
-        // target of the bounds is the pose moved by their offset from the
-        // pivot - the same mapping the client renders with.
-        let origin = Vector3::new(
-            pose.position[0] - pose.rotation_point[0],
-            pose.position[1] - pose.rotation_point[1],
-            pose.position[2] - pose.rotation_point[2],
+        let quarter = quarter_turn(pose.orientation);
+        // The pivot's place within its block, as it was at assembly, turned
+        // with the sub-level.
+        let pivot_offset = self
+            .lock_sublevels()
+            .from_anchor_of(id)
+            .map_or([0.5; 3], |offset| [offset.x, offset.y, offset.z]);
+        let turned = placed(pivot_offset, quarter.turns);
+        let offset = std::array::from_fn(|axis| (turned[axis] as f32).rem_euclid(1.0));
+        let mut manager = self.lock_sublevels();
+        manager.start_disassembly(id);
+        manager.set_alignment(
+            id,
+            Some(Alignment {
+                orientation: quarter.upright(),
+                offset,
+            }),
         );
-        let min = (origin
-            + Vector3::new(
-                f64::from(bounds[0]),
-                f64::from(bounds[1]),
-                f64::from(bounds[2]),
-            ))
-        .floor_to_i32();
-        let max = (origin
-            + Vector3::new(
-                f64::from(bounds[3]),
-                f64::from(bounds[4]),
-                f64::from(bounds[5]),
-            ))
-        .floor_to_i32();
-        if !self.is_in_build_limit(BlockPos(min)) || !self.is_in_build_limit(BlockPos(max)) {
-            return Err("sub-level has drifted outside the build limit".to_string());
-        }
-
-        let world = Arc::clone(self);
-        tokio::spawn(async move { world.copy_plot_into_region(id, chunks, min, max).await });
         Ok(id)
     }
 
-    /// The second half of [`World::disassemble_sublevel`], after the checks.
-    async fn copy_plot_into_region(
-        self: Arc<Self>,
-        id: u32,
-        chunks: Vec<Vector2<i32>>,
-        min: Vector3<i32>,
-        max: Vector3<i32>,
-    ) {
-        // Hold the target world chunks as well: without a player nearby the
-        // server unloads them, and the write-back would land nowhere.
-        let mut held = chunks.clone();
-        held.extend(region_chunks(min, max));
-        if !self.await_plot_chunks(&held).await {
+    /// Whether a sub-level may be disassembled where it is.
+    fn check_disassembly(&self, id: u32) -> Result<(), String> {
+        /// Simulated's `disassemblyMaxVelocity`, and its angular limit.
+        const MAX_SPEED: f32 = 5.0;
+        const MAX_ANGULAR_SPEED: f32 = std::f32::consts::FRAC_PI_2;
+
+        let manager = self.lock_sublevels();
+        let Some(pose) = manager.pose_of(id) else {
+            return Err(format!("No sub-level {id}"));
+        };
+        let Some(bounds) = manager.bounds_of(id) else {
+            return Err(format!("No sub-level {id}"));
+        };
+        let Some(body) = manager.snapshot_of(id) else {
+            return Err(format!("No sub-level {id}"));
+        };
+        drop(manager);
+        if body.linear_velocity.iter().map(|v| v * v).sum::<f32>() > MAX_SPEED * MAX_SPEED
+            || body.angular_velocity.iter().map(|v| v * v).sum::<f32>()
+                > MAX_ANGULAR_SPEED * MAX_ANGULAR_SPEED
+        {
+            return Err("sub-level is moving too fast to disassemble".to_string());
+        }
+        // The corners of the content once turned to the quarter turn it
+        // will be placed at.
+        let turns = quarter_turn(pose.orientation).turns;
+        let mut world: Option<[[f64; 3]; 2]> = None;
+        for corner in 0..8 {
+            let mut local = [0.0f64; 3];
+            for axis in 0..3 {
+                let edge = if corner & (1 << axis) == 0 {
+                    bounds[axis]
+                } else {
+                    bounds[axis + 3] + 1
+                };
+                local[axis] = f64::from(edge) - pose.rotation_point[axis];
+            }
+            let place = placed(local, turns);
+            let at = [
+                (pose.position[0] + place[0]).floor() as i32,
+                (pose.position[1] + place[1]).floor() as i32,
+                (pose.position[2] + place[2]).floor() as i32,
+            ];
+            if !self.is_in_build_limit(BlockPos(Vector3::new(at[0], at[1], at[2]))) {
+                return Err("sub-level has drifted outside the build limit".to_string());
+            }
+            world = Some(match world {
+                None => [at.map(f64::from), at.map(f64::from)],
+                Some([[x0, y0, z0], [x1, y1, z1]]) => [
+                    [
+                        x0.min(f64::from(at[0])),
+                        y0.min(f64::from(at[1])),
+                        z0.min(f64::from(at[2])),
+                    ],
+                    [
+                        x1.max(f64::from(at[0])),
+                        y1.max(f64::from(at[1])),
+                        z1.max(f64::from(at[2])),
+                    ],
+                ],
+            });
+        }
+        if let Some(world) = world
+            && !self.ground_near(world)
+        {
+            return Err("sub-level is too far from the ground to disassemble".to_string());
+        }
+        Ok(())
+    }
+
+    /// Whether any block stands within a section's margin of the world
+    /// region: Simulated's test against disassembly in mid-air. Read off
+    /// the chunk sections, which know whether they hold anything.
+    fn ground_near(&self, [[x0, y0, z0], [x1, y1, z1]]: [[f64; 3]; 2]) -> bool {
+        /// The margin around the region, in sections.
+        const MARGIN: i32 = 1;
+
+        let low = |value: f64| (value.floor() as i32 - MARGIN * 16).max(-30_000_000);
+        let high = |value: f64| (value.ceil() as i32 + MARGIN * 16).min(30_000_000);
+        let bottom = self.get_bottom_y();
+        let top = self.get_top_y();
+        for x in (low(x0) >> 4)..=(high(x1) >> 4) {
+            for z in (low(z0) >> 4)..=(high(z1) >> 4) {
+                let Some(chunk) = self.level.loaded_chunks.get(&Vector2::new(x, z)) else {
+                    continue;
+                };
+                let sections = chunk
+                    .section
+                    .block_sections
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let min_y = chunk.section.min_y;
+                for (index, section) in sections.iter().enumerate() {
+                    let base = min_y + index as i32 * 16;
+                    if base + 16 < low(y0).max(bottom) || base > high(y1).min(top) {
+                        continue;
+                    }
+                    if !section.is_empty() {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// One tick of every disassembly under way: a sub-level that has held
+    /// its alignment for a few ticks is placed; one that cannot reach it in
+    /// time is let go.
+    fn step_disassemblies(self: &Arc<Self>) {
+        /// Simulated's `maxDisassemblyTicks` times five, and the ticks a
+        /// sub-level must stay aligned before it is placed.
+        const MAX_TICKS: u32 = 100;
+        const READY_TICKS: u32 = 5;
+
+        // Its own statement: the loop body takes the lock again.
+        let disassembling = self.lock_sublevels().disassembling();
+        for id in disassembling {
+            let Some((ticks, ready)) = self.lock_sublevels().disassembly_tick(id) else {
+                continue;
+            };
+            if ticks > MAX_TICKS {
+                warn!("sublevel {id}: could not align to disassemble");
+                self.lock_sublevels().cancel_disassembly(id);
+            } else if ready > READY_TICKS {
+                self.place_into_world(id);
+            }
+        }
+    }
+
+    /// Ends a sub-level's alignment and melts it back into the world.
+    fn place_into_world(self: &Arc<Self>, id: u32) {
+        self.lock_sublevels().cancel_disassembly(id);
+        if let Err(error) = self.check_disassembly(id) {
+            warn!("sublevel {id}: {error}");
             return;
         }
-        let (bounds, pivot, pose_vec) = {
+        let Some(chunks) = self.lock_sublevels().chunks_of(id) else {
+            return;
+        };
+        let world = Arc::clone(self);
+        tokio::spawn(async move { world.copy_plot_into_region(id, chunks).await });
+    }
+
+    async fn copy_plot_into_region(self: Arc<Self>, id: u32, chunks: Vec<Vector2<i32>>) {
+        // Hold the target world chunks as well: without a player nearby the
+        // server unloads them, and the write-back would land nowhere.
+        if !self.await_plot_chunks(&chunks).await {
+            return;
+        }
+        let (bounds, pivot, pose, turns, rotation) = {
             let manager = self.lock_sublevels();
             let Some(bounds) = manager.bounds_of(id) else {
                 return;
@@ -2054,19 +2527,23 @@ impl World {
             let Some(pose) = manager.pose_of(id) else {
                 return;
             };
-            let pose_vec = Vector3::new(pose.position[0], pose.position[1], pose.position[2]);
-            let pivot = Vector3::new(
+            let quarter = quarter_turn(pose.orientation);
+            let pivot = [
                 pose.rotation_point[0],
                 pose.rotation_point[1],
                 pose.rotation_point[2],
-            );
-            (bounds, pivot, pose_vec)
+            ];
+            (
+                bounds,
+                pivot,
+                pose.position,
+                quarter.turns,
+                quarter.rotation(),
+            )
         };
 
-        // The bounds are absolute parked coordinates; the world target is the
-        // pose moved by their offset from the pivot - the mapping the client
-        // renders with.
-        let origin = pose_vec - pivot;
+        // A parked block lands where the client renders it: turned by the
+        // quarter turn and moved by the pose.
         let flags = BlockFlags::NOTIFY_ALL | BlockFlags::SKIP_DROPS;
         for bx in bounds[0]..=bounds[3] {
             for by in bounds[1]..=bounds[4] {
@@ -2076,12 +2553,21 @@ impl World {
                     if state == Block::AIR.default_state.id {
                         continue;
                     }
+                    let place = placed(
+                        [
+                            f64::from(bx) - pivot[0],
+                            f64::from(by) - pivot[1],
+                            f64::from(bz) - pivot[2],
+                        ],
+                        turns,
+                    );
                     let world_pos = BlockPos(Vector3::new(
-                        (origin.x + f64::from(parked.0.x)).floor() as i32,
-                        (origin.y + f64::from(parked.0.y)).floor() as i32,
-                        (origin.z + f64::from(parked.0.z)).floor() as i32,
+                        (pose[0] + place[0]).floor() as i32,
+                        (pose[1] + place[1]).floor() as i32,
+                        (pose[2] + place[2]).floor() as i32,
                     ));
-                    self.set_block_state(&world_pos, state, flags);
+                    let state = pumpkin_data::BlockState::from_id(state);
+                    self.set_block_state(&world_pos, state.rotate(rotation).id, flags);
                     if let Some(block_entity) = self.get_block_entity(&parked) {
                         self.restore_block_entity_at(&block_entity, world_pos);
                     }
@@ -2089,8 +2575,8 @@ impl World {
             }
         }
 
-        // Entities keep fractional positions; move them by the same offset
-        // the blocks took.
+        // Entities keep fractional positions; move them the way the blocks
+        // went.
         let parked_min = Vector3::new(bounds[0], bounds[1], bounds[2]);
         let parked_max = Vector3::new(bounds[3], bounds[4], bounds[5]);
         for entity in self.entities.load().iter() {
@@ -2106,7 +2592,15 @@ impl World {
             {
                 continue;
             }
-            entity.set_pos(pose_vec + pos - pivot);
+            let place = placed(
+                [pos.x - pivot[0], pos.y - pivot[1], pos.z - pivot[2]],
+                turns,
+            );
+            entity.set_pos(Vector3::new(
+                pose[0] + place[0],
+                pose[1] + place[1],
+                pose[2] + place[2],
+            ));
         }
 
         // Leave the plot empty for whoever reuses it.
@@ -2126,10 +2620,7 @@ impl World {
             }
         }
         if self.remove_sublevel(id) {
-            info!(
-                "sublevel {id} disassembled into region ({}, {}, {})..({}, {}, {})",
-                min.x, min.y, min.z, max.x, max.y, max.z
-            );
+            info!("sublevel {id} disassembled");
         }
     }
 
@@ -2352,5 +2843,87 @@ mod tests {
         // Outside the plotyard nothing is a sub-level.
         assert!(!manager.player_tracks_chunk(tracker, Vector2::new(0, 0)));
         assert!(!manager.player_tracks_chunk(Uuid::from_u128(2), chunk));
+    }
+
+    #[test]
+    fn tight_bounds_reach_from_the_lowest_to_the_highest_block() {
+        // Blocks scattered round the anchor: the bounds run from the lowest
+        // to the highest on each axis, whichever block each is on.
+        let voxels = [
+            Voxel::cube([3, -2, 0], 1.0),
+            Voxel::cube([-1, 4, 2], 1.0),
+            Voxel::cube([0, 0, -5], 1.0),
+        ];
+        assert_eq!(
+            tight_bounds(Vector3::new(100, 50, -7), &voxels),
+            [99, 48, -12, 103, 54, -5]
+        );
+        // Every chunk of a 33-block-wide region, three per axis.
+        assert_eq!(
+            content_chunks(&tight_bounds(
+                Vector3::new(0, 0, 0),
+                &[
+                    Voxel::cube([-16, 0, -16], 1.0),
+                    Voxel::cube([16, 0, 16], 1.0),
+                ]
+            ))
+            .len(),
+            9
+        );
+    }
+
+    #[test]
+    fn quarter_turns_match_vanilla_rotations() {
+        let half = std::f32::consts::FRAC_PI_4;
+        for (quaternion, turns) in [
+            ([0.0, 0.0, 0.0, 1.0], 0),
+            ([0.0, half.sin(), 0.0, half.cos()], 3),
+            ([0.0, 1.0, 0.0, 0.0], 2),
+            ([0.0, -half.sin(), 0.0, half.cos()], 1),
+        ] {
+            let quarter = quarter_turn(quaternion);
+            assert_eq!(quarter.turns, turns, "{quaternion:?}");
+            let (x, z) = Rotation::from_index(turns).rotate_offset(3, 5);
+            assert_eq!(
+                placed([3.0, 7.0, 5.0], turns),
+                [f64::from(x), 7.0, f64::from(z)]
+            );
+            // The upright orientation at that quarter turn is that quarter turn.
+            assert_eq!(quarter_turn(quarter.upright()).turns, turns);
+        }
+    }
+
+    #[test]
+    fn contraptions_connect_through_faces_and_sticky_edges() {
+        let state = |block: &Block| block.default_state;
+        let stone = &Block::STONE;
+        let slime = &Block::SLIME_BLOCK;
+        let honey = &Block::HONEY_BLOCK;
+        let side = Vector3::new(1, 0, 0);
+        let edge = Vector3::new(1, 1, 0);
+        assert!(attached(stone, state(stone), stone, state(stone), side));
+        assert!(!attached(stone, state(stone), stone, state(stone), edge));
+        assert!(attached(slime, state(slime), stone, state(stone), side));
+        // Over an edge, slime or honey on either side holds; slime and
+        // honey stick to each other neither way.
+        assert!(attached(stone, state(stone), slime, state(slime), edge));
+        assert!(attached(honey, state(honey), stone, state(stone), edge));
+        assert!(!attached(slime, state(slime), honey, state(honey), edge));
+        assert!(!attached(honey, state(honey), slime, state(slime), edge));
+        // A chain is a symmetric sail: it comes along when reached along its
+        // axis, and pulls whatever touches it.
+        let chain = &Block::CHAIN;
+        assert!(attached(
+            stone,
+            state(stone),
+            chain,
+            state(chain),
+            Vector3::new(0, 1, 0)
+        ));
+        assert!(!attached(stone, state(stone), chain, state(chain), side));
+        assert!(attached(chain, state(chain), stone, state(stone), side));
+        // Unbreakable blocks stay put.
+        assert!(unmovable(&Block::BEDROCK));
+        assert!(!unmovable(stone));
     }
 }

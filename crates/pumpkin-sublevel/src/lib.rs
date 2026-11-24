@@ -29,8 +29,10 @@ use aero::PersistentForce;
 pub use aero::{
     Air, Analysed, Content, GRAVITY, THRUSTER_AIRFLOW, THRUSTER_THRUST, UNIVERSAL_DRAG,
 };
+
 pub use voxel::{FloatingMaterial, Material, MaterialBox, Voxel, VoxelKind, VoxelShape};
 
+use rapier3d::na::{Matrix3, Quaternion, Vector3};
 use rapier3d::prelude::*;
 
 /// Sable gives sub-level colliders a friction of 0.525, which rapier
@@ -141,7 +143,49 @@ pub enum ImpactTarget {
 pub struct Step {
     pub bodies: Vec<BodySnapshot>,
     pub impacts: Vec<Impact>,
+    /// Sub-levels whose bodies lost their footing in the numbers this tick,
+    /// a pose or velocity that is not a number or far outside any world,
+    /// and were put back where they last were, at rest.
+    pub recovered: Vec<u32>,
 }
+
+/// Beyond this, in blocks or blocks per second, a body's place or motion is
+/// no world's: Sable drops sub-levels that leave its height limits.
+const SANITY_LIMIT: f32 = 1.0e6;
+
+fn sane(values: [f32; 3]) -> bool {
+    values
+        .iter()
+        .all(|value| value.is_finite() && value.abs() < SANITY_LIMIT)
+}
+
+/// Where a sub-level is being steered to, as Sable's disassembly drives
+/// it: turned to a given orientation and brought onto the blocks.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Alignment {
+    /// The orientation as a quaternion, `(x, y, z, w)`.
+    pub orientation: [f32; 4],
+    /// Where within its block the pivot comes to rest once there, per
+    /// axis: a pivot at a block's centre has `[0.5; 3]`, one at a corner
+    /// `[0.0; 3]`. The pivot is brought onto that place.
+    pub offset: [f32; 3],
+}
+
+/// How the alignment steers a sub-level: a damped spring of so many radians
+/// per second natural frequency, critically damped. Sable's own gains are
+/// joint-motor regularisation, which a free body cannot take over as they
+/// are; these settle within a few ticks, and a stiffer spring oscillates
+/// under the physics substep.
+const ALIGN_TURN_FREQUENCY: f32 = 20.0;
+const ALIGN_TURN_DAMPING: f32 = 1.0;
+const ALIGN_SHIFT_FREQUENCY: f32 = 20.0;
+const ALIGN_SHIFT_DAMPING: f32 = 1.0;
+/// The most the alignment's springs accelerate a sub-level towards where
+/// it should go, in radians per square second for the turn and blocks per
+/// square second for the shift. Sable's turn motors are stiff and its
+/// linear ones gentle; the damping is left alone, as it only ever calms.
+const MAX_ALIGN_TURN: f32 = 60.0;
+const MAX_ALIGN_SHIFT: f32 = 20.0;
 
 /// What a collider is: a box of a sub-level's content, or of the static
 /// surroundings sampled for one. Encoded in rapier's `user_data`.
@@ -187,6 +231,10 @@ struct SubLevel {
     refresh: bool,
     /// Forces working on the body for the whole tick, figured out once.
     persistent: Vec<PersistentForce>,
+    /// Set while the body is steered to an orientation and onto the blocks.
+    alignment: Option<Alignment>,
+    /// The body's pose at the start of the tick, to fall back on.
+    last_pose: (Isometry<f32>, bool),
     throttle: f32,
     /// The body feels gravity and air.
     active: bool,
@@ -372,6 +420,8 @@ impl SubLevelSystem {
             surroundings_pending: None,
             refresh: false,
             persistent: Vec::new(),
+            alignment: None,
+            last_pose: (Isometry::identity(), false),
             throttle: 1.0,
             active: false,
         });
@@ -627,6 +677,36 @@ impl SubLevelSystem {
         true
     }
 
+    /// Starts or stops steering sub-level `id` to `alignment`: turned to
+    /// the orientation and brought onto the blocks, a little every substep,
+    /// until it is cleared.
+    pub fn set_alignment(&mut self, id: u32, alignment: Option<Alignment>) -> bool {
+        let Some(sublevel) = self.sublevels.iter_mut().find(|s| s.id == id) else {
+            return false;
+        };
+        sublevel.alignment = alignment;
+        true
+    }
+
+    /// How far sub-level `id` still is from its alignment: the angle to
+    /// the orientation in radians, and the distance to the nearest place
+    /// the pivot may rest, in blocks.
+    #[must_use]
+    pub fn alignment_error(&self, id: u32) -> Option<(f32, f32)> {
+        let sublevel = self.sublevels.iter().find(|s| s.id == id)?;
+        let alignment = sublevel.alignment?;
+        let body = self.bodies.get(sublevel.body)?;
+        let [x, y, z, w] = alignment.orientation;
+        let target = rapier3d::na::UnitQuaternion::new_normalize(Quaternion::new(w, x, y, z));
+        let angle = body.rotation().angle_to(&target);
+        let position = body.translation();
+        let distance = (0..3)
+            .map(|axis| (position[axis] - alignment.offset[axis]).rem_euclid(1.0))
+            .map(|offset| offset.min(1.0 - offset))
+            .fold(0.0f32, f32::max);
+        Some((angle, distance))
+    }
+
     /// Scales how hard sub-level `id`'s propellers push, from 0 to 1 on top
     /// of their rpm; 1 by default.
     pub fn set_throttle(&mut self, id: u32, throttle: f32) -> bool {
@@ -670,6 +750,17 @@ impl SubLevelSystem {
                 content.advance(TICK_DT);
             }
         }
+        let mut recovered = Vec::new();
+        for sublevel in &mut self.sublevels {
+            if !sublevel.active {
+                continue;
+            }
+            if let Some(body) = self.bodies.get(sublevel.body)
+                && sane((*body.translation()).into())
+            {
+                sublevel.last_pose = (*body.position(), true);
+            }
+        }
         for _ in 0..SUBSTEPS {
             for sublevel in &mut self.sublevels {
                 if !sublevel.active {
@@ -699,6 +790,9 @@ impl SubLevelSystem {
                     air,
                     SUBSTEP_DT,
                 );
+                if let Some(alignment) = sublevel.alignment {
+                    steer_to_alignment(body, alignment);
+                }
             }
             // What the bodies bring to the substep, for gauging the hits in it.
             self.impacts.before.clear();
@@ -727,10 +821,32 @@ impl SubLevelSystem {
                 &(),
                 &self.impacts,
             );
+            // Checked between the substeps: a body that just left the
+            // numbers must not reach the next substep's broad phase, which
+            // sizes its grid from the bodies' extents.
+            for sublevel in &mut self.sublevels {
+                let (pose, known) = sublevel.last_pose;
+                let Some(body) = self.bodies.get_mut(sublevel.body) else {
+                    continue;
+                };
+                let rotation = body.rotation();
+                if sane((*body.translation()).into())
+                    && sane((*body.linvel()).into())
+                    && sane((*body.angvel()).into())
+                    && rotation.coords.iter().all(|value| value.is_finite())
+                {
+                    continue;
+                }
+                body.set_position(pose, known);
+                body.set_linvel(Vector::zeros(), known);
+                body.set_angvel(Vector::zeros(), known);
+                recovered.push(sublevel.id);
+            }
         }
         Step {
             bodies: self.snapshots(),
             impacts: self.collect_impacts(),
+            recovered,
         }
     }
 
@@ -1036,6 +1152,44 @@ pub struct AeroInfo {
     pub balloons: Vec<BalloonInfo>,
     pub thrusters: usize,
     pub surfaces: usize,
+}
+
+/// One substep of steering a body to `alignment`: turned to the
+/// orientation and brought onto block centres, each with its own damped
+/// spring.
+fn steer_to_alignment(body: &mut RigidBody, alignment: Alignment) {
+    let [x, y, z, w] = alignment.orientation;
+    let target = rapier3d::na::UnitQuaternion::new_normalize(Quaternion::new(w, x, y, z));
+    let properties = &body.mass_properties().local_mprops;
+    let frame = *properties
+        .principal_inertia_local_frame
+        .to_rotation_matrix()
+        .matrix();
+    let inertia =
+        frame * Matrix3::from_diagonal(&properties.principal_inertia()) * frame.transpose();
+    let rotation = *body.rotation().to_rotation_matrix().matrix();
+    let inertia_world = rotation * inertia * rotation.transpose();
+
+    // Turn towards the orientation. Sable's joint motors cannot pull harder
+    // than the solver lets them; the spring gives the same leeway by only
+    // ever seeing a bounded error, so a sub-level lying on its side comes
+    // round in a swing rather than in one step.
+    let turn_kp = ALIGN_TURN_FREQUENCY * ALIGN_TURN_FREQUENCY;
+    let turn_kd = 2.0 * ALIGN_TURN_DAMPING * ALIGN_TURN_FREQUENCY;
+    let error: Vector3<f32> = (target * body.rotation().inverse()).scaled_axis();
+    let spring = (error * turn_kp).cap_magnitude(MAX_ALIGN_TURN);
+    let angular_acceleration: Vector3<f32> = spring - *body.angvel() * turn_kd;
+    body.add_torque(inertia_world * angular_acceleration, true);
+
+    // Slide onto the blocks: the pivot to its place within them.
+    let shift_kp = ALIGN_SHIFT_FREQUENCY * ALIGN_SHIFT_FREQUENCY;
+    let shift_kd = 2.0 * ALIGN_SHIFT_DAMPING * ALIGN_SHIFT_FREQUENCY;
+    let position = body.translation();
+    let offset = Vector3::from(alignment.offset);
+    let goal = (position - offset).map(f32::round) + offset;
+    let spring = ((goal - position) * shift_kp).cap_magnitude(MAX_ALIGN_SHIFT);
+    let acceleration: Vector3<f32> = spring - *body.linvel() * shift_kd;
+    body.add_force(acceleration * body.mass(), true);
 }
 
 /// The sub-level's blocks in world coordinates: the lowest and highest
@@ -1901,6 +2055,54 @@ mod tests {
             "{:?}",
             stone.linear_velocity
         );
+        Ok(())
+    }
+
+    #[test]
+    fn alignment_turns_a_quarter_and_centres_the_pivot() -> Result<(), &'static str> {
+        // A slab resting off-centre, told to turn a quarter: it turns to
+        // within Sable's tolerance and settles with its pivot back on its
+        // block corner, while staying on the ground.
+        let mut system = SubLevelSystem::new(Air::default());
+        let id = system.spawn([10.3, 64.5, -7.2]);
+        land_on(&mut system, id, slab(4, 4), 64);
+        let half = std::f32::consts::FRAC_PI_4;
+        // The slab's pivot sits at a block corner.
+        assert!(system.set_alignment(
+            id,
+            Some(Alignment {
+                orientation: [0.0, half.sin(), 0.0, half.cos()],
+                offset: [0.0, 0.5, 0.0],
+            })
+        ));
+        let mut settled = 0;
+        for _ in 0..80 {
+            serve(&mut system, 64);
+            system.step();
+            let (angle, distance) = system.alignment_error(id).ok_or("aligning")?;
+            settled = if angle <= 0.07 && distance <= 0.2 {
+                settled + 1
+            } else {
+                0
+            };
+        }
+        assert!(settled >= 40, "held its alignment for only {settled} ticks");
+        let body = system.snapshots()[0];
+        assert_close(body.position[1], 64.5);
+        assert!(
+            (body.position[0] - 10.0).abs() < 0.2,
+            "{}",
+            body.position[0]
+        );
+        assert!(
+            (body.position[2] - -7.0).abs() < 0.2,
+            "{}",
+            body.position[2]
+        );
+
+        // Let go, the slab stays where it was put.
+        assert!(system.set_alignment(id, None));
+        assert!(system.alignment_error(id).is_none());
         Ok(())
     }
 
