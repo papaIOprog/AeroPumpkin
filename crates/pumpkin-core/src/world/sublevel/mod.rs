@@ -472,6 +472,26 @@ fn quarter_turn([_qx, qy, _qz, qw]: [f32; 4]) -> QuarterTurn {
     QuarterTurn { turns }
 }
 
+/// Where within its block the pivot comes to rest once the sub-level is
+/// turned by `turns` clockwise quarter turns, given where it sat at
+/// assembly: the pivot's offset from its anchor, turned with it, as a
+/// fraction of a block per axis.
+fn pivot_place(from_anchor: [f64; 3], turns: u8) -> [f32; 3] {
+    let turned = placed(from_anchor, turns);
+    std::array::from_fn(|axis| (turned[axis] as f32).rem_euclid(1.0))
+}
+
+/// Where the pivot of a sub-level at `position` is written back to the world
+/// once turned by `turns` clockwise quarter turns: on the block grid its
+/// alignment meant for, not where the body rests. Within the alignment's
+/// tolerance of a block boundary the live pose rounds a block off.
+fn placed_pivot(position: [f64; 3], from_anchor: Vector3<f64>, turns: u8) -> [f64; 3] {
+    let place = pivot_place([from_anchor.x, from_anchor.y, from_anchor.z], turns);
+    std::array::from_fn(|axis| {
+        (position[axis] - f64::from(place[axis])).round() + f64::from(place[axis])
+    })
+}
+
 /// Where a point of a sub-level's parked space lands once the sub-level is
 /// turned by `turns` clockwise quarter turns: the same map as
 /// [`Rotation::rotate_offset`].
@@ -2546,12 +2566,12 @@ impl World {
         let quarter = quarter_turn(pose.orientation);
         // The pivot's place within its block, as it was at assembly, turned
         // with the sub-level.
-        let pivot_offset = self
+        let offset = self
             .lock_sublevels()
             .from_anchor_of(id)
-            .map_or([0.5; 3], |offset| [offset.x, offset.y, offset.z]);
-        let turned = placed(pivot_offset, quarter.turns);
-        let offset = std::array::from_fn(|axis| (turned[axis] as f32).rem_euclid(1.0));
+            .map_or([0.5; 3], |offset| {
+                pivot_place([offset.x, offset.y, offset.z], quarter.turns)
+            });
         let mut manager = self.lock_sublevels();
         manager.start_disassembly(id);
         manager.set_alignment(
@@ -2722,19 +2742,17 @@ impl World {
             let Some(pose) = manager.pose_of(id) else {
                 return;
             };
+            let Some(from_anchor) = manager.from_anchor_of(id) else {
+                return;
+            };
             let quarter = quarter_turn(pose.orientation);
             let pivot = [
                 pose.rotation_point[0],
                 pose.rotation_point[1],
                 pose.rotation_point[2],
             ];
-            (
-                bounds,
-                pivot,
-                pose.position,
-                quarter.turns,
-                quarter.rotation(),
-            )
+            let placed = placed_pivot(pose.position, from_anchor, quarter.turns);
+            (bounds, pivot, placed, quarter.turns, quarter.rotation())
         };
 
         // A parked block lands where the client renders it: turned by the
