@@ -1102,6 +1102,8 @@ impl JavaClient {
                     crate::mods::simulated::honey_glue::spawn(player, payload.data);
                 } else if channel_str == crate::mods::simulated::HONEY_GLUE_CHANGE_BOUNDS {
                     crate::mods::simulated::honey_glue::change_bounds(player, payload.data);
+                } else if channel_str == crate::mods::simulated::ASSEMBLE {
+                    crate::mods::simulated::physics_assembler::assemble(player, payload.data);
                 } else if channel_str == crate::mods::simulated::PHYSICS_STAFF_DRAG
                     && let Some(drag) =
                         crate::mods::simulated::physics_staff::read_drag(payload.data)

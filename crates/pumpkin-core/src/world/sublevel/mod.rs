@@ -59,10 +59,13 @@ use pumpkin_world::world::BlockFlags;
 use rand::RngExt;
 
 use crate::entity::r#type::from_type;
-use crate::mods::glue::{GlueEntity, GlueKind, glue_boxes, with_glue_by_id};
+use crate::mods::glue::{GlueEntity, GlueKind, glue_boxes, play_named_sound, with_glue_by_id};
+use crate::mods::packets::write_block_pos;
+use crate::mods::simulated::physics_assembler;
 use crate::mods::simulated::physics_staff::{self, Action};
 use crate::mods::simulated::{
-    PHYSICS_STAFF_BEAM, PHYSICS_STAFF_DRAG_SESSIONS, PHYSICS_STAFF_LOCKS,
+    ASSEMBLER_FAILED, FLICK_ASSEMBLER_LEVER, PHYSICS_STAFF_BEAM, PHYSICS_STAFF_DRAG_SESSIONS,
+    PHYSICS_STAFF_LOCKS,
 };
 
 /// Each plot is `1 << PLOT_LOG_SIZE` chunks on a side, as in Sable.
@@ -297,6 +300,8 @@ struct Disassembly {
     ticks: u32,
     /// Ticks in a row the sub-level has held its alignment.
     ready_ticks: u32,
+    /// Where the assembler that melts it stands, for the sound it makes.
+    stop_sound: Option<Vector3<f64>>,
 }
 
 /// A player dragging a sub-level with Simulated's physics staff: its
@@ -816,14 +821,26 @@ impl SubLevelManager {
     }
 
     /// Starts driving sub-level `id` to the alignment its disassembly
-    /// waits for.
-    pub fn start_disassembly(&mut self, id: u32) {
+    /// waits for. The sound of its stopping, `stop_sound`, plays where it
+    /// is placed.
+    pub fn start_disassembly(&mut self, id: u32, stop_sound: Option<Vector3<f64>>) {
         if let Some(level) = self.levels.iter_mut().find(|level| level.id == id) {
             level.disassembling = Some(Disassembly {
                 ticks: 0,
                 ready_ticks: 0,
+                stop_sound,
             });
         }
+    }
+
+    /// Where the sound of sub-level `id`'s stopping is to play.
+    pub fn stop_sound_of(&self, id: u32) -> Option<Vector3<f64>> {
+        self.levels
+            .iter()
+            .find(|level| level.id == id)?
+            .disassembling
+            .as_ref()?
+            .stop_sound
     }
 
     /// Stops a disassembly under way and the steering that went with it.
@@ -2257,6 +2274,82 @@ impl World {
         }
     }
 
+    /// Simulated's `PhysicsAssemblerBlockEntity.assembleOrDisassemble`:
+    /// the assembler at `position`, in the world or parked in a sub-level,
+    /// takes the contraption its sticky side touches into a sub-level, or
+    /// gives its sub-level back to the world.
+    pub fn assembler_used(self: &Arc<Self>, position: &BlockPos) {
+        let inside = self.lock_sublevels().sublevel_at(position);
+        let state = self.get_block_state_id(position);
+        // The lever holds where it was put until the server says otherwise.
+        let mut flick = Vec::with_capacity(9);
+        let _ = write_block_pos(&mut flick, *position);
+        let _ = flick.write_bool(inside.is_none());
+        self.tell_assembler(position, FLICK_ASSEMBLER_LEVER, &flick);
+        let failed = inside.map_or_else(
+            || self.assembler_assemble(position, physics_assembler::sticky_facing(state)),
+            |id| self.assembler_disassemble(id, position),
+        );
+        if failed {
+            let mut failed = Vec::with_capacity(8);
+            let _ = write_block_pos(&mut failed, *position);
+            self.tell_assembler(position, ASSEMBLER_FAILED, &failed);
+        }
+    }
+
+    /// Tells the players watching the assembler at `position` `data` on
+    /// `channel`.
+    fn tell_assembler(&self, position: &BlockPos, channel: &str, data: &[u8]) {
+        let packet = CCustomPayload::new(channel, data);
+        self.send_to_chunk_watchers_except(position.chunk_position(), Uuid::nil(), &packet);
+    }
+
+    /// The assembler at `position` takes the contraption its sticky side
+    /// `sticky` touches. Whether it could not, as `assemblyFailed` says.
+    fn assembler_assemble(self: &Arc<Self>, position: &BlockPos, sticky: BlockDirection) -> bool {
+        let start = position.0 + sticky.to_offset();
+        // Simulated's `assembleFromSingleBlock`: with nothing there,
+        // nothing happens.
+        let (_, state) = self.get_block_and_state(&BlockPos(start));
+        if state.is_air() {
+            return false;
+        }
+        match self.assemble_connected(start) {
+            Ok(_) => {
+                play_named_sound(
+                    self,
+                    "simulated:block.physics_assembler.assemble",
+                    SoundCategory::Blocks,
+                    &position.to_centered_f64(),
+                    1.0,
+                    1.0,
+                    None,
+                );
+                false
+            }
+            Err(error) => {
+                debug!("sublevel: the assembler at {position:?} could not assemble: {error}");
+                true
+            }
+        }
+    }
+
+    /// The assembler at `position`, parked in sub-level `id`, gives the
+    /// sub-level back to the world. Whether it could not.
+    fn assembler_disassemble(self: &Arc<Self>, id: u32, position: &BlockPos) -> bool {
+        let news = {
+            let mut manager = self.lock_sublevels();
+            // Simulated's `startDisassembling`: a physics staff lock gives way.
+            manager.let_lock_go(id);
+            manager.take_staff_news()
+        };
+        self.tell_staff_news(news);
+        let stop_sound = self
+            .lock_sublevels()
+            .parked_to_world(position.to_centered_f64());
+        self.disassemble_sublevel(id, stop_sound).is_err()
+    }
+
     /// Called for every block set inside the plotyard, and for every block
     /// set anywhere while sub-levels exist: their bodies collide with the
     /// world, so it has to follow its edits.
@@ -3384,8 +3477,13 @@ impl World {
     /// assembler does: not at once, but once the sub-level has been turned
     /// to the nearest quarter turn and brought onto block centres, which it
     /// is driven to over the next ticks. One drifting out of the world,
-    /// moving too fast or too far from the ground is refused.
-    pub fn disassemble_sublevel(self: &Arc<Self>, id: u32) -> Result<u32, String> {
+    /// moving too fast or too far from the ground is refused. The sound of
+    /// its stopping plays at `stop_sound`.
+    pub fn disassemble_sublevel(
+        self: &Arc<Self>,
+        id: u32,
+        stop_sound: Option<Vector3<f64>>,
+    ) -> Result<u32, String> {
         self.check_disassembly(id)?;
         let Some(pose) = self.lock_sublevels().pose_of(id) else {
             return Err(format!("No sub-level {id}"));
@@ -3400,7 +3498,7 @@ impl World {
                 pivot_place([offset.x, offset.y, offset.z], quarter.turns)
             });
         let mut manager = self.lock_sublevels();
-        manager.start_disassembly(id);
+        manager.start_disassembly(id, stop_sound);
         manager.set_alignment(
             id,
             Some(Alignment {
@@ -3543,10 +3641,23 @@ impl World {
 
     /// Ends a sub-level's alignment and melts it back into the world.
     fn place_into_world(self: &Arc<Self>, id: u32) {
+        let stop_sound = self.lock_sublevels().stop_sound_of(id);
         self.lock_sublevels().cancel_disassembly(id);
         if let Err(error) = self.check_disassembly(id) {
             warn!("sublevel {id}: {error}");
             return;
+        }
+        if let Some(at) = stop_sound {
+            // Simulated's `disassembleSubLevel` sounds the contraption to a stop.
+            play_named_sound(
+                self,
+                "simulated:block.physics_assembler.disassemble",
+                SoundCategory::Blocks,
+                &at,
+                1.0,
+                1.0,
+                None,
+            );
         }
         let Some(chunks) = self.lock_sublevels().chunks_of(id) else {
             return;

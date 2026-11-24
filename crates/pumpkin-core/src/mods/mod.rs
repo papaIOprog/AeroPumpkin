@@ -81,6 +81,12 @@ pub fn install(config: &ModsConfig) {
     });
 }
 
+/// Registers the behaviours of the mods' blocks whose ports are
+/// switched on; called as the block registry is built.
+pub fn register_blocks(blocks: &mut crate::block::registry::BlockRegistry) {
+    simulated::register_blocks(blocks);
+}
+
 /// Registers the behaviours of the mods' items whose ports are switched on;
 /// called as the item registry is built.
 pub fn register_items(items: &mut crate::item::registry::ItemRegistry) {

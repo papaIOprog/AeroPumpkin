@@ -444,6 +444,9 @@ pub fn default_registry() -> Arc<BlockRegistry> {
     manager.register(PoweredRailBlock);
 
     // Fluids
+    // The mods' blocks, as far as their ports are switched on.
+    crate::mods::register_blocks(&mut manager);
+
     manager.register_fluid(FlowingWater);
     manager.register_fluid(FlowingLava);
     Arc::new(manager)

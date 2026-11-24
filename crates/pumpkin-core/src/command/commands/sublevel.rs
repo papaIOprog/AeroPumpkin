@@ -226,7 +226,7 @@ impl CommandExecutor for DisassembleExecutor {
             return Ok(0);
         };
 
-        match world.disassemble_sublevel(id) {
+        match world.disassemble_sublevel(id, None) {
             Ok(id) => {
                 context.source.send_feedback(
                     green(format!(

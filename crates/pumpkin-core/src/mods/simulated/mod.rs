@@ -5,6 +5,7 @@
 //! makes of it: real to the clients, inert here.
 
 pub mod honey_glue;
+pub mod physics_assembler;
 pub mod physics_staff;
 
 use crate::item::registry::ItemRegistry;
@@ -32,6 +33,11 @@ pub const HONEY_GLUE_SPAWN: &str = "simulated:honey_glue_spawn";
 pub const HONEY_GLUE_CHANGE_BOUNDS: &str = "simulated:honey_glue_change_bounds";
 /// `S:HoneyGlueSyncBoundsPacket`: where a honey glue is now.
 pub const HONEY_GLUE_SYNC: &str = "simulated:honey_glue_sync";
+
+/// Registers the behaviours of Simulated's blocks.
+pub fn register_blocks(blocks: &mut crate::block::registry::BlockRegistry) {
+    blocks.register(physics_assembler::PhysicsAssemblerBlock);
+}
 
 /// Registers the behaviours of Simulated's items.
 pub fn register_items(items: &mut ItemRegistry) {
