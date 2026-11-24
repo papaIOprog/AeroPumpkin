@@ -225,6 +225,7 @@ fn fill_blocks(
 
     world.queue_block_updates(&changed_positions);
     world.flush_block_updates();
+    world.note_sublevel_edits(&changed_positions);
 
     source.send_feedback(
         TextComponent::translate_cross(

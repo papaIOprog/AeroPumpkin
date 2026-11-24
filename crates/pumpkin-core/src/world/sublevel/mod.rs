@@ -1965,6 +1965,24 @@ impl World {
         self.lock_sublevels().note_edit(pos, state);
     }
 
+    /// The same for every block a command changed in one batch: `/fill`
+    /// writes its blocks without `set_block_state`.
+    pub fn note_sublevel_edits(&self, changes: &[(BlockPos, BlockStateId)]) {
+        let concerns = self
+            .has_sublevels
+            .load(std::sync::atomic::Ordering::Relaxed)
+            || changes.iter().any(|(pos, _)| {
+                SubLevelManager::is_plot_chunk(pos.chunk_and_chunk_relative_position().0)
+            });
+        if !concerns {
+            return;
+        }
+        let mut manager = self.lock_sublevels();
+        for (pos, state) in changes {
+            manager.note_edit(pos, *state);
+        }
+    }
+
     /// Removes a sub-level, telling every client that tracked it.
     pub fn remove_sublevel(&self, id: u32) -> bool {
         self.lock_sublevels().remove_and_notify(self, id)
