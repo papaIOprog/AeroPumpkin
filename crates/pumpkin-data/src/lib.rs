@@ -454,6 +454,9 @@ pub use block_state::{BlockState, BlockStateId};
 #[cfg(feature = "block")]
 pub use blocks::{Block, BlockId, SpawnFloorPredicate};
 
+/// What a client's mods add to the vanilla registries.
+pub mod mods;
+
 #[cfg(feature = "material_rule")]
 #[rustfmt::skip]
 #[path = "generated/material_rule.rs"]

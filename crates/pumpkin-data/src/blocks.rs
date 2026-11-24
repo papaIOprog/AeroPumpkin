@@ -322,32 +322,33 @@ impl BlockId {
     // depends on generated impl:
     // pub(crate) const BLOCK_COUNT: u16;
 
-    /// The total count of all registered blocks.
+    /// The count of the vanilla blocks; a client's mods add more.
     pub const COUNT: u16 = Self::BLOCK_COUNT;
 
-    // SAFETY: There must never be a BlockId where self.0 >= BlockId::BLOCK_COUNT
-
+    /// Every block id is valid: one past the known ones resolves to a
+    /// stand-in that keeps it.
     #[inline]
     #[must_use]
     pub const fn new(inner: u16) -> Option<Self> {
-        if inner < Self::BLOCK_COUNT {
-            return Some(Self(inner));
-        }
-        None
+        Some(Self(inner))
     }
 
     #[inline]
     #[must_use]
     pub const fn new_or_air(inner: u16) -> Self {
-        if inner < Self::BLOCK_COUNT {
-            return Self(inner);
-        }
-        Self::AIR
+        Self(inner)
+    }
+
+    /// A block id without a check; only for ids known to resolve.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn from_raw(inner: u16) -> Self {
+        Self(inner)
     }
 
     #[inline]
     #[must_use]
-    pub const fn to_block(self) -> &'static Block {
+    pub fn to_block(self) -> &'static Block {
         Block::from_id(self)
     }
 

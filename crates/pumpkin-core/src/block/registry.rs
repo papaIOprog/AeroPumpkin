@@ -477,7 +477,9 @@ impl BlockActionResult {
 const NO_BEHAVIOUR: u16 = u16::MAX;
 
 pub struct BlockRegistry {
-    block_indices: [u16; pumpkin_data::BlockId::COUNT as usize],
+    /// A behaviour's index for every block id the server knows, vanilla and
+    /// modded alike.
+    block_indices: Vec<u16>,
     behaviours: Vec<Arc<dyn BlockBehaviour>>,
     fluids: FxHashMap<u16, Arc<dyn FluidBehaviour>>,
 }
@@ -485,7 +487,7 @@ pub struct BlockRegistry {
 impl Default for BlockRegistry {
     fn default() -> Self {
         Self {
-            block_indices: [NO_BEHAVIOUR; pumpkin_data::BlockId::COUNT as usize],
+            block_indices: vec![NO_BEHAVIOUR; pumpkin_data::mods::block_count()],
             behaviours: Vec::new(),
             fluids: FxHashMap::default(),
         }
@@ -1347,7 +1349,12 @@ impl BlockRegistry {
     #[inline]
     #[must_use]
     pub fn get_pumpkin_block(&self, block: BlockId) -> Option<&Arc<dyn BlockBehaviour>> {
-        let idx = self.block_indices[block.as_u16() as usize];
+        // A block id past the table is one nobody registered a profile for.
+        let idx = self
+            .block_indices
+            .get(block.as_u16() as usize)
+            .copied()
+            .unwrap_or(NO_BEHAVIOUR);
         if idx == NO_BEHAVIOUR {
             None
         } else {

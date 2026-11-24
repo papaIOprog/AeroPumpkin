@@ -1732,6 +1732,9 @@ pub fn build() -> TokenStream {
     let mut type_from_raw_id_arms = TokenStream::new();
     let mut type_from_name = TokenStream::new();
 
+    // One past the last vanilla id; a client's mods add their items from there.
+    let item_count = items.values().map(|item| item.id).max().unwrap_or(0) + 1;
+
     let mut constants = TokenStream::new();
     let mut bedrock_constants = TokenStream::new();
     let mut mapping_constants = TokenStream::new();
@@ -1997,22 +2000,25 @@ pub fn build() -> TokenStream {
                 TextComponent::translate(name, &[])
             }
 
+            /// The count of the vanilla items; a client's mods add more.
+            pub const COUNT: u16 = #item_count;
+
             #[doc = "Try to parse an item from a resource location string."]
             #[must_use]
             pub fn from_registry_key(name: &str) -> Option<&'static Self> {
                 let name = name.strip_prefix("minecraft:").unwrap_or(name);
                 match name {
                     #type_from_name
-                    _ => None
+                    _ => crate::mods::item_by_name(name),
                 }
             }
 
             #[doc = "Try to parse an item from a raw id."]
             #[must_use]
-            pub const fn from_id(id: u16) -> Option<&'static Self> {
+            pub fn from_id(id: u16) -> Option<&'static Self> {
                 match id {
                     #type_from_raw_id_arms
-                    _ => None
+                    _ => crate::mods::item(id),
                 }
             }
         }

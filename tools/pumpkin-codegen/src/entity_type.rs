@@ -427,10 +427,10 @@ pub fn build() -> TokenStream {
 
             pub const ALL: &'static [&'static Self] = &[#all_variants];
 
-            pub const fn from_raw(id: u16) -> Option<&'static Self> {
+            pub fn from_raw(id: u16) -> Option<&'static Self> {
                 match id {
                     #type_from_raw_id_arms
-                    _ => None
+                    _ => crate::mods::entity(id),
                 }
             }
 
@@ -438,7 +438,7 @@ pub fn build() -> TokenStream {
                 let name = name.strip_prefix("minecraft:").unwrap_or(name);
                 match name {
                     #type_from_name
-                    _ => None
+                    _ => crate::mods::entity_by_name(name),
                 }
             }
 

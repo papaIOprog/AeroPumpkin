@@ -5502,7 +5502,7 @@ impl EntityType {
         &Self::ZOMBIE_VILLAGER,
         &Self::ZOMBIFIED_PIGLIN,
     ];
-    pub const fn from_raw(id: u16) -> Option<&'static Self> {
+    pub fn from_raw(id: u16) -> Option<&'static Self> {
         match id {
             0 => Some(&Self::ALLAY),
             1 => Some(&Self::AREA_EFFECT_CLOUD),
@@ -5634,7 +5634,7 @@ impl EntityType {
             125 => Some(&Self::ZOMBIE_HORSE),
             126 => Some(&Self::ZOMBIE_VILLAGER),
             127 => Some(&Self::ZOMBIFIED_PIGLIN),
-            _ => None,
+            _ => crate::mods::entity(id),
         }
     }
     pub fn from_name(name: &str) -> Option<&'static Self> {
@@ -5770,7 +5770,7 @@ impl EntityType {
             "zombie_horse" => Some(&Self::ZOMBIE_HORSE),
             "zombie_villager" => Some(&Self::ZOMBIE_VILLAGER),
             "zombified_piglin" => Some(&Self::ZOMBIFIED_PIGLIN),
-            _ => None,
+            _ => crate::mods::entity_by_name(name),
         }
     }
     #[must_use]

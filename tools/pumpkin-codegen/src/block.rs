@@ -1351,26 +1351,25 @@ pub fn build() -> TokenStream {
             ];
 
             /// Get a [`BlockState`] from a [`BlockStateId`].
+            /// A state id past the vanilla ones is a mod's, or resolves to a stand-in that keeps it.
             /// If you need access to the block use `BlockState::from_id_with_block` instead.
             #[inline]
             #[must_use]
-            pub const fn from_id(id: BlockStateId) -> &'static Self {
-                // Safety: We always check this condition when creating a BlockStateId.
-                // the u16 field is private and immutable. BlockStateId::STATE_COUNT is a const u16.
-                // If the condition held once, it will always hold.
-                unsafe { std::hint::assert_unchecked(id.as_u16() < BlockStateId::STATE_COUNT) }
-                // This hint guarantees that bound checks can be optimized away in release builds.
-                // Due to debug_assertions forcing -Zub_checks=yes (rust-lang/rust#123499)
-                // bound checks-panics are replaced with ub-checks on profile.dev
-                // https://doc.rust-lang.org/nightly/unstable-book/compiler-flags/ub-checks.html
-
-                mappings::STATE_FROM_STATE_ID[id.as_u16() as usize]
+            pub fn from_id(id: BlockStateId) -> &'static Self {
+                let index = id.as_u16();
+                if index < BlockStateId::STATE_COUNT {
+                    // Safety: checked just above.
+                    unsafe { std::hint::assert_unchecked(index < BlockStateId::STATE_COUNT) }
+                    mappings::STATE_FROM_STATE_ID[index as usize]
+                } else {
+                    crate::mods::block_state(index)
+                }
             }
 
             #[doc = r" Get a block state from a state id and the corresponding block."]
             #[inline]
             #[must_use]
-            pub const fn from_id_with_block(id: BlockStateId) -> (&'static Block, &'static Self) {
+            pub fn from_id_with_block(id: BlockStateId) -> (&'static Block, &'static Self) {
                 let block = Block::from_state_id(id);
                 let state = Self::from_id(id);
                 (block, state)
@@ -1378,16 +1377,13 @@ pub fn build() -> TokenStream {
 
             #[must_use]
             pub const fn to_be_network_id(id: BlockStateId) -> u32 {
-                // Safety: We always check this condition when creating a BlockStateId.
-                // the u16 field is private and immutable. BlockStateId::STATE_COUNT is a const u16.
-                // If the condition held once, it will always hold.
-                unsafe { std::hint::assert_unchecked(id.as_u16() < BlockStateId::STATE_COUNT) }
-                // This hint guarantees that bound checks can be optimized away in release builds.
-                // Due to debug_assertions forcing -Zub_checks=yes (rust-lang/rust#123499)
-                // bound checks-panics are replaced with ub-checks on profile.dev
-                // https://doc.rust-lang.org/nightly/unstable-book/compiler-flags/ub-checks.html
-
-                Self::STATE_ID_TO_BEDROCK[id.as_u16() as usize]
+                // A mod's block has no Bedrock state; Bedrock is out of scope here.
+                let last = Self::STATE_ID_TO_BEDROCK.len() - 1;
+                Self::STATE_ID_TO_BEDROCK[if id.as_u16() as usize > last {
+                    last
+                } else {
+                    id.as_u16() as usize
+                }]
             }
         }
 
@@ -1441,46 +1437,49 @@ pub fn build() -> TokenStream {
             #[inline]
             #[must_use]
             pub fn from_registry_key(name: &str) -> Option<&'static Self> {
-                mappings::BLOCK_FROM_NAME_MAP.get(name)
+                mappings::BLOCK_FROM_NAME_MAP
+                    .get(name)
+                    .or_else(|| crate::mods::block_by_name(name))
             }
 
             #[doc = r" Try to get a block from a namespace prefixed name."]
             #[must_use]
             pub fn from_name(name: &str) -> Option<&'static Self> {
                 let key = name.strip_prefix("minecraft:").unwrap_or(name);
-                mappings::BLOCK_FROM_NAME_MAP.get(key)
+                mappings::BLOCK_FROM_NAME_MAP
+                    .get(key)
+                    .or_else(|| crate::mods::block_by_name(key))
             }
 
-            /// Get a [`Block`] from a [`BlockId`]
+            /// Get a [`Block`] from a [`BlockId`]. An id past the vanilla
+            /// ones is a mod's, or resolves to a stand-in that keeps it.
             #[inline]
             #[must_use]
-            pub const fn from_id(id: BlockId) -> &'static Self {
-                // Safety: We always check this condition when creating a BlockId.
-                // the u16 field is private and immutable. BlockId::BLOCK_COUNT is a const u16.
-                // If the condition held once, it will always hold.
-                unsafe { std::hint::assert_unchecked(id.as_u16() < BlockId::BLOCK_COUNT) }
-                // This hint guarantees that bound checks can be optimized away in release builds.
-                // Due to debug_assertions forcing -Zub_checks=yes (rust-lang/rust#123499)
-                // bound checks-panics are replaced with ub-checks on profile.dev
-                // https://doc.rust-lang.org/nightly/unstable-book/compiler-flags/ub-checks.html
-
-                mappings::TYPE_FROM_RAW_ID[id.as_u16() as usize]
+            pub fn from_id(id: BlockId) -> &'static Self {
+                let index = id.as_u16();
+                if index < BlockId::BLOCK_COUNT {
+                    // Safety: checked just above.
+                    unsafe { std::hint::assert_unchecked(index < BlockId::BLOCK_COUNT) }
+                    mappings::TYPE_FROM_RAW_ID[index as usize]
+                } else {
+                    crate::mods::block_from_id(index)
+                }
             }
 
             /// Get a [`Block`] from a state id
             #[inline]
             #[must_use]
-            pub const fn from_state_id(id: BlockStateId) -> &'static Self {
+            pub fn from_state_id(id: BlockStateId) -> &'static Self {
                 Self::from_id(BlockId::from_state_id(id))
             }
 
             #[doc = r" Try to parse a block from an item id."]
             #[must_use]
-            pub const fn from_item_id(id: u16) -> Option<&'static Self> {
+            pub fn from_item_id(id: u16) -> Option<&'static Self> {
                 #[allow(unreachable_patterns)]
                 match id {
                     #(#block_from_item_id_arms)*
-                    _ => None
+                    _ => crate::mods::block_by_item(id),
                 }
             }
 
@@ -1511,17 +1510,15 @@ pub fn build() -> TokenStream {
             /// Get a [`BlockId`] from a [`BlockStateId`]
             #[inline]
             #[must_use]
-            pub const fn from_state_id(id: BlockStateId) -> BlockId {
-                // Safety: We always check this condition when creating a BlockStateId.
-                // the u16 field is private and immutable. BlockStateId::STATE_COUNT is a const u16.
-                // If the condition held once, it will always hold.
-                unsafe { std::hint::assert_unchecked(id.as_u16() < BlockStateId::STATE_COUNT) }
-                // This hint guarantees that bound checks can be optimized away in release builds.
-                // Due to debug_assertions forcing -Zub_checks=yes (rust-lang/rust#123499)
-                // bound checks-panics are replaced with ub-checks on profile.dev
-                // https://doc.rust-lang.org/nightly/unstable-book/compiler-flags/ub-checks.html
-
-                mappings::BLOCK_ID_FROM_STATE_ID[id.as_u16() as usize]
+            pub fn from_state_id(id: BlockStateId) -> BlockId {
+                let index = id.as_u16();
+                if index < BlockStateId::STATE_COUNT {
+                    // Safety: checked just above.
+                    unsafe { std::hint::assert_unchecked(index < BlockStateId::STATE_COUNT) }
+                    mappings::BLOCK_ID_FROM_STATE_ID[index as usize]
+                } else {
+                    crate::mods::block_from_state(index)
+                }
             }
         }
 
