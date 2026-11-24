@@ -50,6 +50,12 @@ pub fn install(config: &ModsConfig) {
     };
     let blocks = profile.modded.blocks.by_id.len();
     let states = profile.modded.blocks.states.len();
+    if profile.unfitted > 0 {
+        warn!(
+            "Mods: {} blocks of the profile have more states than a world can hold ({} in all) and stay unknown to the server",
+            profile.unfitted, states
+        );
+    }
     let items = profile.modded.items.by_id.iter().flatten().count();
     let entities = profile.modded.entities.by_id.iter().flatten().count();
     let switched: Vec<&str> = profile

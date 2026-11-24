@@ -41,7 +41,7 @@ struct Dump {
     /// The tags of blocks and entity types, by registry: each tag's id and
     /// the ids of its entries. Vanilla's own tags are left out.
     #[serde(default)]
-    tags: HashMap<String, Vec<(String, Vec<u16>)>>,
+    tags: HashMap<String, Vec<(String, Vec<u32>)>>,
     /// The SERVER config files of the pack, by file name.
     #[serde(default, rename = "serverConfigs")]
     server_configs: Vec<String>,
@@ -55,18 +55,19 @@ struct Game {
 
 #[derive(Deserialize)]
 struct Registry {
-    /// Every entry as `[id, "namespace:path"]`.
-    entries: Vec<(u16, String)>,
+    /// Every entry as `[id, "namespace:path"]`. Ids are as wide as the
+    /// game's: registries the server does not read may count past 65535.
+    entries: Vec<(u32, String)>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DumpBlock {
     /// The first of the block's state ids; the rest follow.
-    base: u16,
+    base: u32,
     /// The state a fresh placement has.
     #[serde(default)]
-    default: Option<u16>,
+    default: Option<u32>,
     /// The block entity type the block holds, if any.
     #[serde(default)]
     block_entity: Option<String>,
@@ -171,6 +172,21 @@ pub(crate) struct Profile {
     pub modded: Modded,
     pub namespaces: Box<[String]>,
     pub server_configs: Box<[String]>,
+    /// How many of the dump's blocks have more states than a world can
+    /// hold; those stay unknown to the server.
+    pub unfitted: usize,
+}
+
+/// The last block state id a world can hold.
+const LAST_STATE: u32 = u16::MAX as u32;
+
+/// An id the server can hold, or `None` past the last one.
+const fn fitted(id: u32) -> Option<u16> {
+    if id <= LAST_STATE {
+        Some(id as u16)
+    } else {
+        None
+    }
 }
 
 /// Reads the dump at `path`. The dump's vanilla ids must agree with the
@@ -190,32 +206,34 @@ pub(crate) fn load(path: &Path) -> Result<Profile, String> {
     let block_ids = ids_of(&dump, "minecraft:block")?;
     let types = ids_of(&dump, "minecraft:block_entity_type")?;
     let namespaces = namespaces(&dump);
+    let (fitted_blocks, unfitted) = modded_blocks(&dump, &block_ids)?;
     let modded = Modded {
-        blocks: blocks(&dump, &block_ids, &types)?,
+        blocks: blocks(&dump, &block_ids, &types, &fitted_blocks)?,
         block_entity_types: BlockEntityTypes {
-            by_id: block_entity_types(&dump, &block_ids, &types)?,
+            by_id: block_entity_types(&types, &fitted_blocks)?,
         },
         items: items(&dump)?,
         entities: entities(&dump)?,
-        block_tags: tags(&dump, "block", BlockId::new_or_air)?,
-        entity_tags: tags(&dump, "entity_type", |id| id)?,
+        block_tags: tags(&dump, "block", BlockId::new_or_air, BlockId::COUNT)?,
+        entity_tags: tags(&dump, "entity_type", |id| id, EntityType::ALL.len() as u16)?,
     };
     Ok(Profile {
         modded,
         namespaces,
         server_configs: dump.server_configs.into_boxed_slice(),
+        unfitted,
     })
 }
 
 /// The dump's registry `name`, as id and name pairs.
-fn entries<'a>(dump: &'a Dump, name: &str) -> Result<&'a [(u16, String)], String> {
+fn entries<'a>(dump: &'a Dump, name: &str) -> Result<&'a [(u32, String)], String> {
     dump.registries
         .get(name)
         .map(|registry| registry.entries.as_slice())
         .ok_or_else(|| format!("dump has no {name} registry"))
 }
 
-fn ids_of<'a>(dump: &'a Dump, name: &str) -> Result<HashMap<&'a str, u16>, String> {
+fn ids_of<'a>(dump: &'a Dump, name: &str) -> Result<HashMap<&'a str, u32>, String> {
     Ok(entries(dump, name)?
         .iter()
         .map(|(id, name)| (name.as_str(), *id))
@@ -257,8 +275,10 @@ fn bare(name: &str) -> &str {
 fn check_vanilla(dump: &Dump) -> Result<(), String> {
     let mut wrong: Vec<String> = Vec::new();
     for (id, name) in entries(dump, "minecraft:block")? {
-        if usize::from(*id) < BlockId::COUNT as usize {
-            let known = Block::from_id(BlockId::new_or_air(*id));
+        if let Some(id) = fitted(*id)
+            && usize::from(id) < BlockId::COUNT as usize
+        {
+            let known = Block::from_id(BlockId::new_or_air(id));
             if known.name != bare(name) {
                 wrong.push(format!(
                     "block {id} is {name} there and {} here",
@@ -268,7 +288,7 @@ fn check_vanilla(dump: &Dump) -> Result<(), String> {
         }
     }
     for (id, name) in entries(dump, "minecraft:item")? {
-        if let Some(known) = Item::from_id(*id)
+        if let Some(known) = fitted(*id).and_then(Item::from_id)
             && known.registry_key != bare(name)
         {
             wrong.push(format!(
@@ -278,7 +298,7 @@ fn check_vanilla(dump: &Dump) -> Result<(), String> {
         }
     }
     for (id, name) in entries(dump, "minecraft:entity_type")? {
-        if let Some(known) = EntityType::from_raw(*id)
+        if let Some(known) = fitted(*id).and_then(EntityType::from_raw)
             && known.resource_name != bare(name)
         {
             wrong.push(format!(
@@ -300,17 +320,22 @@ fn check_vanilla(dump: &Dump) -> Result<(), String> {
 }
 
 /// The dump's blocks past the vanilla ones, by their first state id.
+type DumpBlocks<'a> = Vec<(&'a str, &'a DumpBlock)>;
+
+/// The dump's blocks past the vanilla ones, by their first state id, and
+/// how many come after them: the ones whose states would run past the last
+/// state a world can hold, which stay unknown.
 fn modded_blocks<'a>(
     dump: &'a Dump,
-    block_ids: &HashMap<&str, u16>,
-) -> Result<Vec<(&'a str, &'a DumpBlock)>, String> {
-    let mut found: Vec<(&str, &DumpBlock)> = dump
+    block_ids: &HashMap<&str, u32>,
+) -> Result<(DumpBlocks<'a>, usize), String> {
+    let mut found: DumpBlocks<'_> = dump
         .blocks
         .iter()
         .filter(|(name, _)| {
             block_ids
                 .get(name.as_str())
-                .is_none_or(|id| usize::from(*id) >= BlockId::COUNT as usize)
+                .is_none_or(|id| *id >= u32::from(BlockId::COUNT))
         })
         .map(|(name, block)| (name.as_str(), block))
         .collect();
@@ -318,57 +343,64 @@ fn modded_blocks<'a>(
     // The mods' ids follow the vanilla ones without a gap, in the dump's
     // tables as in the client's registries.
     let vanilla_blocks = BlockId::COUNT as usize;
-    let mut next_state = usize::from(BlockStateId::COUNT);
+    let mut next_state = u32::from(BlockStateId::COUNT);
     for (index, (name, block)) in found.iter().enumerate() {
-        if usize::from(block.base) != next_state {
+        if block.base != next_state {
             return Err(format!(
                 "the states of {name} start at {} where {next_state} was expected",
                 block.base
             ));
         }
-        next_state += block.states.len();
+        let Some(last) = block
+            .base
+            .checked_add(block.states.len() as u32)
+            .filter(|last| *last <= LAST_STATE + 1)
+        else {
+            let unfitted = found.len() - index;
+            let _rest = found.split_off(index);
+            return Ok((found, unfitted));
+        };
+        next_state = last;
         let id = block_ids[name];
         let next_block = vanilla_blocks + index;
-        if usize::from(id) != next_block {
+        if id as usize != next_block {
             return Err(format!(
                 "block {name} has id {id} where {next_block} was expected"
             ));
         }
     }
-    Ok(found)
+    Ok((found, 0))
 }
 
 fn blocks(
     dump: &Dump,
-    block_ids: &HashMap<&str, u16>,
-    types: &HashMap<&str, u16>,
+    block_ids: &HashMap<&str, u32>,
+    types: &HashMap<&str, u32>,
+    found: &DumpBlocks<'_>,
 ) -> Result<Blocks, String> {
-    let found = modded_blocks(dump, block_ids)?;
     let item_ids = ids_of(dump, "minecraft:item")?;
     let mut shapes = Shapes::default();
     let mut built: Vec<&'static Block> = Vec::with_capacity(found.len());
     let mut states = Vec::new();
     let mut state_blocks = Vec::new();
     let mut props = Vec::new();
-    for (name, dumped) in &found {
-        let id = block_ids[name];
+    for (name, dumped) in found {
+        let id = fitted(block_ids[name]).unwrap_or(u16::MAX);
         if dumped.states.is_empty() {
             return Err(format!("block {name} has no states"));
         }
         let kind = dumped
             .block_entity
             .as_deref()
-            .and_then(|kind| types.get(kind))
-            .copied()
+            .and_then(|kind| types.get(kind).copied())
+            .and_then(fitted)
             .unwrap_or(u16::MAX);
         let values: Vec<BlockState> = dumped
             .states
             .iter()
             .enumerate()
             .map(|(offset, state)| {
-                let id = BlockStateId::new_or_air(
-                    dumped.base + u16::try_from(offset).unwrap_or(u16::MAX),
-                );
+                let id = BlockStateId::new_or_air(fitted(dumped.base + offset as u32).unwrap_or(0));
                 state_of(id, state, kind, &mut shapes)
             })
             .collect();
@@ -395,7 +427,7 @@ fn blocks(
             .default
             .and_then(|default| {
                 owned
-                    .get(usize::from(default).saturating_sub(usize::from(dumped.base)))
+                    .get(usize::try_from(default.saturating_sub(dumped.base)).unwrap_or(usize::MAX))
                     .copied()
             })
             .unwrap_or(owned[0]);
@@ -409,7 +441,11 @@ fn blocks(
             slipperiness: first.friction,
             velocity_multiplier: 1.0,
             jump_velocity_multiplier: 1.0,
-            item_id: item_ids.get(*name).copied().unwrap_or(u16::MAX),
+            item_id: item_ids
+                .get(*name)
+                .copied()
+                .and_then(fitted)
+                .unwrap_or(u16::MAX),
             default_state: default,
             states: states_of,
             flammable: (first.ignite > 0 || first.burn > 0).then_some(Flammable {
@@ -438,12 +474,14 @@ fn blocks(
 }
 
 /// The dump's tags of the registry `registry` (`block` or `entity_type`):
-/// each tag's id and the ids of the blocks, or entity types, in it, each
-/// id through `of`.
+/// each tag's id and the entries in it, each id through `of`. Vanilla's own
+/// tags are the server's already, except for the mods' entries in them:
+/// those are kept, with the vanilla ids `vanilla` and below left out.
 fn tags<T>(
     dump: &Dump,
     registry: &str,
     of: impl Fn(u16) -> T,
+    vanilla: u16,
 ) -> Result<HashMap<&'static str, Box<[T]>>, String> {
     let Some(dumped) = dump.tags.get(registry) else {
         return Ok(HashMap::new());
@@ -451,13 +489,27 @@ fn tags<T>(
     let mut known: HashSet<&str> = HashSet::new();
     let mut tags = HashMap::with_capacity(dumped.len());
     for (tag, entries) in dumped {
-        if tag.starts_with("minecraft:") {
-            continue;
-        }
         if !known.insert(tag.as_str()) {
             return Err(format!("dump lists the tag {tag} twice"));
         }
-        tags.insert(leaked(tag), entries.iter().map(|id| of(*id)).collect());
+        let modded = |id: u32| id >= u32::from(vanilla);
+        let kept: Box<[T]> = if tag.starts_with("minecraft:") {
+            entries
+                .iter()
+                .filter(|id| modded(**id))
+                .filter_map(|id| fitted(*id))
+                .map(&of)
+                .collect()
+        } else {
+            entries
+                .iter()
+                .filter_map(|id| fitted(*id))
+                .map(&of)
+                .collect()
+        };
+        if !kept.is_empty() {
+            tags.insert(leaked(tag), kept);
+        }
     }
     Ok(tags)
 }
@@ -542,14 +594,13 @@ fn state_of(
 
 /// The block entity types the mods add, named by their id past the vanilla
 /// ones; empty where the dump has no type for an id.
-fn block_entity_types<'a>(
-    dump: &'a Dump,
-    block_ids: &HashMap<&str, u16>,
-    types: &HashMap<&'a str, u16>,
+fn block_entity_types(
+    types: &HashMap<&str, u32>,
+    blocks: &DumpBlocks<'_>,
 ) -> Result<Vec<&'static str>, String> {
     let vanilla = BLOCK_ENTITY_TYPES.len();
     let mut named: Vec<&'static str> = Vec::new();
-    for (_, block) in modded_blocks(dump, block_ids)? {
+    for (_, block) in blocks {
         let Some(kind) = block.block_entity.as_deref() else {
             continue;
         };
@@ -557,7 +608,8 @@ fn block_entity_types<'a>(
             .get(kind)
             .copied()
             .ok_or_else(|| format!("dump has no block entity type {kind}"))?;
-        let index = usize::from(id)
+        let index = usize::try_from(id)
+            .unwrap_or(usize::MAX)
             .checked_sub(vanilla)
             .ok_or_else(|| format!("block entity type {kind} is a vanilla one here"))?;
         while named.len() <= index {
@@ -575,9 +627,9 @@ fn items(dump: &Dump) -> Result<Items, String> {
     let mut by_id: Vec<Option<&'static Item>> = Vec::new();
     let mut by_name = HashMap::new();
     for (id, name) in entries(dump, "minecraft:item")? {
-        if usize::from(*id) < vanilla {
+        let Some(id) = fitted(*id).filter(|id| usize::from(*id) >= vanilla) else {
             continue;
-        }
+        };
         let Some(dumped) = dump.items.get(name) else {
             return Err(format!("dump has no data for item {name}"));
         };
@@ -600,14 +652,14 @@ fn items(dump: &Dump) -> Result<Items, String> {
             ));
         }
         let item: &'static Item = &*Box::leak(Box::new(Item {
-            id: *id,
+            id,
             registry_key: leaked(name),
             components: Box::leak(components.into_boxed_slice()),
         }));
-        while by_id.len() < usize::from(*id) - vanilla + 1 {
+        while by_id.len() < usize::from(id) - vanilla + 1 {
             by_id.push(None);
         }
-        by_id[usize::from(*id) - vanilla] = Some(item);
+        by_id[usize::from(id) - vanilla] = Some(item);
         by_name.insert(item.registry_key, item);
     }
     Ok(Items { by_id, by_name })
@@ -618,12 +670,12 @@ fn entities(dump: &Dump) -> Result<Entities, String> {
     let mut by_id: Vec<Option<&'static EntityType>> = Vec::new();
     let mut by_name = HashMap::new();
     for (id, name) in entries(dump, "minecraft:entity_type")? {
-        if usize::from(*id) < vanilla {
+        let Some(id) = fitted(*id).filter(|id| usize::from(*id) >= vanilla) else {
             continue;
-        }
+        };
         let dumped = dump.entities.get(name).cloned().unwrap_or_default();
         let entity: &'static EntityType = &*Box::leak(Box::new(EntityType {
-            id: *id,
+            id,
             attributes: &[],
             experience_reward: 0,
             hurt_sound: None,
@@ -659,10 +711,10 @@ fn entities(dump: &Dump) -> Result<Entities, String> {
             },
             resource_name: leaked(name),
         }));
-        while by_id.len() < usize::from(*id) - vanilla + 1 {
+        while by_id.len() < usize::from(id) - vanilla + 1 {
             by_id.push(None);
         }
-        by_id[usize::from(*id) - vanilla] = Some(entity);
+        by_id[usize::from(id) - vanilla] = Some(entity);
         by_name.insert(entity.resource_name, entity);
     }
     Ok(Entities { by_id, by_name })
@@ -720,6 +772,7 @@ const fn key(shape: BoundingBox) -> [u64; 6] {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use pumpkin_data::tag::Taggable;
     use std::sync::OnceLock;
 
     /// The states of a block, each by its properties.
@@ -729,7 +782,7 @@ pub(crate) mod tests {
     /// by the names the mods give them, each state by its properties.
     const AERO_BLOCKS: &[(&str, AeroStates)] = &[
         ("aeronautics:white_envelope", &[&[]]),
-        ("aeronautics:hot_air_burner", &[&[]]),
+        ("aeronautics:adjustable_burner", &[&[]]),
         ("aeronautics:steam_vent", &[&[]]),
         ("aeronautics:levitite", &[&[]]),
         (
@@ -784,9 +837,11 @@ pub(crate) mod tests {
                 ]
             }),
         );
+        // Vanilla ids in a vanilla tag are the server's own; only the mod's
+        // block in `mineable/pickaxe` is news.
         let mut block_tags = vec![
             serde_json::json!(["test:sticky", [block]]),
-            serde_json::json!(["minecraft:mineable/pickaxe", [block]]),
+            serde_json::json!(["minecraft:mineable/pickaxe", [0, block]]),
         ];
         if aero {
             let mut base = state + 2;
@@ -918,10 +973,30 @@ pub(crate) mod tests {
             Some(half.id)
         );
         assert!(pumpkin_data::mods::block_has_tag(slab, "test:sticky"));
-        assert!(!pumpkin_data::mods::block_has_tag(
+        // The mod's block sits in a vanilla tag; vanilla's own entries of it
+        // are not repeated, nor is the block in another vanilla tag.
+        assert!(pumpkin_data::mods::block_has_tag(
             slab,
             "minecraft:mineable/pickaxe"
         ));
+        assert!(!pumpkin_data::mods::block_has_tag(
+            &Block::STONE,
+            "minecraft:mineable/pickaxe"
+        ));
+        assert!(!pumpkin_data::mods::block_has_tag(slab, "minecraft:doors"));
+        // The tool rules ask a block by tag, in any spelling.
+        assert_eq!(
+            slab.is_tagged_with("minecraft:mineable/pickaxe"),
+            Some(true)
+        );
+        assert_eq!(
+            slab.is_tagged_with("#minecraft:mineable/pickaxe"),
+            Some(true)
+        );
+        assert_eq!(slab.is_tagged_with("mineable/pickaxe"), Some(true));
+        assert_eq!(slab.is_tagged_with("test:sticky"), Some(true));
+        assert_eq!(Block::STONE.is_tagged_with("mineable/pickaxe"), Some(true));
+        assert_eq!(slab.is_tagged_with("test:none"), Some(false));
         assert!(pumpkin_data::mods::entity_has_tag(glue, "test:keeps"));
         // A turn moves a mod's block by its properties, as vanilla's does;
         // with no state for the turned properties, it stays as it is.
@@ -948,6 +1023,7 @@ pub(crate) mod tests {
             modded,
             namespaces,
             server_configs,
+            unfitted: _,
         } = profile;
         assert_eq!(
             namespaces.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -998,6 +1074,7 @@ pub(crate) mod tests {
                 "aeronautics:airtight",
                 "aeronautics:envelope",
                 "aeronautics:levitite",
+                "minecraft:mineable/pickaxe",
                 "sable:bouncy",
                 "sable:super_light",
                 "simulated:symmetric_sails",
