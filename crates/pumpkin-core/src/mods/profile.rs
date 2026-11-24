@@ -718,51 +718,142 @@ const fn key(shape: BoundingBox) -> [u64; 6] {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::sync::OnceLock;
+
+    /// The states of a block, each by its properties.
+    type AeroStates = &'static [&'static [(&'static str, &'static str)]];
+
+    /// What the aerodynamics need from the mods, after `test:slab`: blocks
+    /// by the names the mods give them, each state by its properties.
+    const AERO_BLOCKS: &[(&str, AeroStates)] = &[
+        ("aeronautics:white_envelope", &[&[]]),
+        ("aeronautics:hot_air_burner", &[&[]]),
+        ("aeronautics:steam_vent", &[&[]]),
+        ("aeronautics:levitite", &[&[]]),
+        (
+            "simulated:symmetric_sail",
+            &[&[("axis", "x")], &[("axis", "y")], &[("axis", "z")]],
+        ),
+        (
+            "create:white_sail",
+            &[
+                &[("facing", "north")],
+                &[("facing", "south")],
+                &[("facing", "west")],
+                &[("facing", "east")],
+                &[("facing", "up")],
+                &[("facing", "down")],
+            ],
+        ),
+    ];
 
     /// A dump of one modded block, item and entity type over a stub of
-    /// vanilla, with `state_offset` applied to the block's first state id.
-    fn dump(state_offset: u16, vanilla_first_block: &str) -> serde_json::Value {
+    /// vanilla, with `state_offset` applied to the block's first state id,
+    /// and with `aero` the blocks of [`AERO_BLOCKS`] after them.
+    fn dump(state_offset: u16, vanilla_first_block: &str, aero: bool) -> serde_json::Value {
         let block = BlockId::COUNT;
         let state = BlockStateId::COUNT + state_offset;
         let item = Item::COUNT;
         let entity = EntityType::ALL.len() as u16;
+        let mut block_entries = vec![
+            serde_json::json!([0, vanilla_first_block]),
+            serde_json::json!([block, "test:slab"]),
+        ];
+        let mut blocks = serde_json::Map::new();
+        blocks.insert(
+            "minecraft:air".to_owned(),
+            serde_json::json!({ "base": 0, "default": 0, "resistance": 0.0, "states": [ { "air": true } ] }),
+        );
+        blocks.insert(
+            "test:slab".to_owned(),
+            serde_json::json!({
+                "base": state,
+                "default": state,
+                "blockEntity": "test:holder",
+                "resistance": 3.5,
+                "states": [
+                    { "shape": [[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]], "solid": true, "solidRender": true,
+                      "fullCube": true, "canOcclude": true, "sturdy": [true, true, true, true, true, true],
+                      "light": 3, "opacity": 15, "push": "normal", "hardness": 1.5, "mapColor": 8,
+                      "friction": 0.6, "burn": 20, "ignite": 5, "props": { "facing": "north", "half": "top" } },
+                    { "shape": [[0.0, 0.0, 0.0, 1.0, 0.5, 1.0]], "outline": [[0.1, 0.2, 0.3, 0.9, 0.7, 0.9]],
+                      "solid": true, "fullCube": false, "sturdy": [true, false, true, true, true, true],
+                      "opacity": 0, "push": "destroy", "hardness": 0.5, "toolRequired": true, "props": { "facing": "south", "half": "top" } }
+                ]
+            }),
+        );
+        let mut block_tags = vec![
+            serde_json::json!(["test:sticky", [block]]),
+            serde_json::json!(["minecraft:mineable/pickaxe", [block]]),
+        ];
+        if aero {
+            let mut base = state + 2;
+            for (index, (name, states)) in AERO_BLOCKS.iter().enumerate() {
+                let id = block + 1 + index as u16;
+                block_entries.push(serde_json::json!([id, name]));
+                let states: Vec<_> = states
+                    .iter()
+                    .map(|props| {
+                        serde_json::json!({
+                            "shape": [[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]], "solid": true, "fullCube": true,
+                            "hardness": 1.0, "push": "normal", "props": props.iter().map(|(key, value)| ((*key).to_owned(), serde_json::json!(value))).collect::<serde_json::Map<String, serde_json::Value>>()
+                        })
+                    })
+                    .collect();
+                blocks.insert(
+                    (*name).to_owned(),
+                    serde_json::json!({ "base": base, "default": base, "resistance": 1.0, "states": states }),
+                );
+                base += states.len() as u16;
+            }
+            for (tag, of) in [
+                ("aeronautics:envelope", 0),
+                ("aeronautics:airtight", 0),
+                ("sable:super_light", 0),
+                ("sable:bouncy", 0),
+                ("aeronautics:levitite", 3),
+                ("simulated:symmetric_sails", 4),
+            ] {
+                block_tags.push(serde_json::json!([tag, [block + 1 + of]]));
+            }
+        }
         serde_json::json!({
             "format": 2,
             "game": { "version": "test" },
             "registries": {
-                "minecraft:block": { "sync": true, "entries": [[0, vanilla_first_block], [block, "test:slab"]] },
+                "minecraft:block": { "sync": true, "entries": block_entries },
                 "minecraft:item": { "sync": true, "entries": [[0, "minecraft:air"], [item, "test:slab"]] },
                 "minecraft:entity_type": { "sync": true, "entries": [[0, "minecraft:allay"], [entity, "test:glue"]] },
                 "minecraft:block_entity_type": { "sync": true, "entries": [[BLOCK_ENTITY_TYPES.len() as u16 + 3, "test:holder"]] },
             },
-            "blocks": {
-                "minecraft:air": { "base": 0, "default": 0, "resistance": 0.0, "states": [ { "air": true } ] },
-                "test:slab": {
-                    "base": state,
-                    "default": state,
-                    "blockEntity": "test:holder",
-                    "resistance": 3.5,
-                    "states": [
-                        { "shape": [[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]], "solid": true, "solidRender": true,
-                          "fullCube": true, "canOcclude": true, "sturdy": [true, true, true, true, true, true],
-                          "light": 3, "opacity": 15, "push": "normal", "hardness": 1.5, "mapColor": 8,
-                          "friction": 0.6, "burn": 20, "ignite": 5, "props": { "facing": "north", "half": "top" } },
-                        { "shape": [[0.0, 0.0, 0.0, 1.0, 0.5, 1.0]], "outline": [[0.1, 0.2, 0.3, 0.9, 0.7, 0.9]],
-                          "solid": true, "fullCube": false, "sturdy": [true, false, true, true, true, true],
-                          "opacity": 0, "push": "destroy", "hardness": 0.5, "toolRequired": true, "props": { "facing": "south", "half": "top" } }
-                    ]
-                }
-            },
+            "blocks": blocks,
             "items": { "test:slab": { "maxStack": 16, "maxDamage": 250 } },
             "entities": { "test:glue": { "width": 0.5, "height": 0.5, "eye": 0.25, "tracking": 10, "interval": 2147483647u32, "summon": true } },
             "tags": {
-                "block": [["test:sticky", [block]], ["minecraft:mineable/pickaxe", [block]]],
+                "block": block_tags,
                 "entity_type": [["test:keeps", [entity]]]
             },
             "serverConfigs": ["test-server.toml", "sable-server.toml"]
         })
+    }
+
+    /// The dump with the mods' blocks, written once.
+    fn test_profile_path() -> &'static std::path::Path {
+        static PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
+        PATH.get_or_init(|| write(&dump(0, "minecraft:air", true), "pumpkin-profile-test.json"))
+    }
+
+    /// Installs the test dump into the global tables, once per test
+    /// process. A test that looks the mods' blocks up calls this first.
+    pub fn install_test_profile() {
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            if let Ok(profile) = load(test_profile_path()) {
+                let _ = pumpkin_data::mods::install(profile.modded);
+            }
+        });
     }
 
     fn write(dump: &serde_json::Value, name: &str) -> std::path::PathBuf {
@@ -850,11 +941,9 @@ mod tests {
 
     #[test]
     fn a_dump_becomes_the_modded_registries() -> Result<(), &'static str> {
-        let path = write(&dump(0, "minecraft:air"), "pumpkin-profile-ok.json");
-        let profile = load(&path).map_err(|error| -> &'static str {
-            let _ = std::fs::remove_file(&path);
-            Box::leak(error.into_boxed_str())
-        })?;
+        install_test_profile();
+        let profile = load(test_profile_path())
+            .map_err(|error| -> &'static str { Box::leak(error.into_boxed_str()) })?;
         let Profile {
             modded,
             namespaces,
@@ -862,7 +951,7 @@ mod tests {
         } = profile;
         assert_eq!(
             namespaces.iter().map(String::as_str).collect::<Vec<_>>(),
-            ["test"]
+            ["test", "aeronautics", "simulated", "create"]
         );
         assert_eq!(
             server_configs
@@ -900,10 +989,20 @@ mod tests {
         assert_eq!(slab.states.len(), 2);
         let flammable = slab.flammable.as_ref().ok_or("flammable")?;
         assert_eq!((flammable.spread_chance, flammable.burn_chance), (5, 20));
-        // The mod's tags, without vanilla's own.
+        // The mods' tags, without vanilla's own.
+        let mut tags: Vec<&str> = modded.block_tags.keys().copied().collect();
+        tags.sort_unstable();
         assert_eq!(
-            modded.block_tags.keys().copied().collect::<Vec<_>>(),
-            ["test:sticky"]
+            tags,
+            [
+                "aeronautics:airtight",
+                "aeronautics:envelope",
+                "aeronautics:levitite",
+                "sable:bouncy",
+                "sable:super_light",
+                "simulated:symmetric_sails",
+                "test:sticky"
+            ]
         );
         let item = modded.items.by_id[0].ok_or("item")?;
         assert_eq!(item.registry_key, "test:slab");
@@ -915,7 +1014,7 @@ mod tests {
         );
         assert!(glue.summonable && glue.client_tracking_range == 10);
 
-        pumpkin_data::mods::install(modded).map_err(|_| "installed twice")?;
+        drop(modded);
         every_way_in_resolves(slab, first, half, item, glue, entity_type);
         properties_and_tags_resolve(slab, first, half, glue);
         Ok(())
@@ -923,7 +1022,10 @@ mod tests {
 
     #[test]
     fn a_dump_of_another_game_version_is_refused() {
-        let path = write(&dump(0, "minecraft:stone"), "pumpkin-profile-wrong.json");
+        let path = write(
+            &dump(0, "minecraft:stone", false),
+            "pumpkin-profile-wrong.json",
+        );
         let error = load(&path).err().unwrap_or_default();
         let _ = std::fs::remove_file(&path);
         assert!(error.contains("another version"), "{error}");
@@ -931,7 +1033,7 @@ mod tests {
 
     #[test]
     fn states_that_leave_a_gap_are_refused() {
-        let path = write(&dump(1, "minecraft:air"), "pumpkin-profile-gap.json");
+        let path = write(&dump(1, "minecraft:air", false), "pumpkin-profile-gap.json");
         let error = load(&path).err().unwrap_or_default();
         let _ = std::fs::remove_file(&path);
         assert!(error.contains("was expected"), "{error}");

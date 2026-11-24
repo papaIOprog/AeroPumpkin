@@ -109,6 +109,14 @@ pub(crate) fn attached_towards(
                 BlockDirection::Down
             };
     }
+    // Simulated's symmetric sails hold onto what lies beside them, across
+    // their normal, and a spring onto the block it is fastened to.
+    if mods::block_has_tag(block, "simulated:symmetric_sails") {
+        return mods::state_prop(state.id, "axis") != Some(axis_of(direction));
+    }
+    if block.name == "simulated:spring" {
+        return mods::state_prop(state.id, "facing") == Some(direction_name(direction.opposite()));
+    }
     let facing = || LadderLikeProperties::from_state_id(state.id).r#facing;
     let hangs_from = |towards: HorizontalFacing| opposite_horizontal(direction) == Some(towards);
     match block.id {
@@ -191,6 +199,27 @@ fn mounted_face(state: BlockStateId) -> Option<(AttachFace, HorizontalFacing)> {
         _ => return None,
     };
     Some((face, facing))
+}
+
+/// A direction as a `facing` property names it.
+const fn direction_name(direction: BlockDirection) -> &'static str {
+    match direction {
+        BlockDirection::Up => "up",
+        BlockDirection::Down => "down",
+        BlockDirection::North => "north",
+        BlockDirection::South => "south",
+        BlockDirection::West => "west",
+        BlockDirection::East => "east",
+    }
+}
+
+/// The `axis` property a direction lies along.
+const fn axis_of(direction: BlockDirection) -> &'static str {
+    match direction {
+        BlockDirection::Up | BlockDirection::Down => "y",
+        BlockDirection::North | BlockDirection::South => "z",
+        BlockDirection::West | BlockDirection::East => "x",
+    }
 }
 
 fn attached_by_face(face: AttachFace, facing: HorizontalFacing, direction: BlockDirection) -> bool {
@@ -426,6 +455,32 @@ mod tests {
             chest_half(&Block::CHEST, pumpkin_data::BlockState::from_id(single)),
             None
         );
+    }
+
+    #[test]
+    fn sails_hold_what_lies_beside_them_and_springs_what_they_are_fastened_to()
+    -> Result<(), &'static str> {
+        crate::mods::profile::tests::install_test_profile();
+        let sail = Block::from_registry_key("simulated:symmetric_sail").ok_or("sail")?;
+        let sail = mods::state_with(sail, &[("axis", "y")]).ok_or("sail state")?;
+        let stone = state(&Block::STONE);
+        // A sail with an upright normal takes the block beside it, not the
+        // one in front of or behind it.
+        assert!(takes(
+            &Block::STONE,
+            stone,
+            Block::from_registry_key("simulated:symmetric_sail").ok_or("sail")?,
+            sail,
+            Vector3::new(1, 0, 0)
+        ));
+        assert!(!takes(
+            &Block::STONE,
+            stone,
+            Block::from_registry_key("simulated:symmetric_sail").ok_or("sail")?,
+            sail,
+            Vector3::new(0, 1, 0)
+        ));
+        Ok(())
     }
 
     #[test]

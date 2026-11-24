@@ -1,22 +1,15 @@
 //! What blocks do to a sub-level, in the physics' terms.
 //!
-//! Sable and Create: Aeronautics describe that with data files for their own
-//! blocks. Pumpkin has none of those blocks, so ordinary ones stand in for
-//! them: wool seals a balloon (airtight in Aeronautics too), a lit campfire
-//! fed a redstone signal is a hot air burner and a soul campfire a steam
-//! vent, a piston powered by redstone is a propeller that pushes the way it
-//! faces (a sticky piston pushes the other way), a carpet is a sail and a
-//! chain is a symmetric sail, and froglights are levitite. End stone keeps
-//! the floating material Sable gives it. Masses, volumes, friction and
-//! fragility follow Sable's shipped definitions for vanilla blocks, so
-//! builds handle alike.
+//! Sable and the mods on it describe that with tags: Sable's own for mass,
+//! volume and material, Aeronautics' and Simulated's for what a block does
+//! to the air. Pumpkin knows vanilla's tags from its generated tables and
+//! the mods' from the installed profile, `pumpkin_data::mods`; where a mod
+//! names a block instead of tagging it, the block is named here.
 
-use pumpkin_data::block_properties::{
-    Axis, CampfireLikeProperties, ChainLikeProperties, SlabProperties, SlabType,
-    StickyPistonLikeProperties,
-};
+use pumpkin_data::block_properties::{SlabProperties, SlabType, StickyPistonLikeProperties};
+use pumpkin_data::mods;
 use pumpkin_data::tag::{self, Taggable};
-use pumpkin_data::{Block, BlockDirection, BlockState, FacingExt};
+use pumpkin_data::{Block, BlockDirection, BlockState};
 use pumpkin_sublevel::{FloatingMaterial, Material, Voxel, VoxelKind, VoxelShape};
 use pumpkin_util::math::position::BlockPos;
 
@@ -31,18 +24,24 @@ const SUPER_HEAVY_MASS: f32 = 4.0;
 /// Sable makes bedrock absurdly heavy so it can never be lifted.
 const BEDROCK_MASS: f32 = 1000.0;
 
-/// Lifting gas a hot air burner, or a steam vent, feeds its balloon at full
-/// signal, in cubic metres, as in Aeronautics.
+/// Aeronautics' `hot_air_burner_max` and `steam_vent_hot_air_amount`: the
+/// lifting gas a hot air burner, or a steam vent, feeds its balloon at full
+/// signal, in cubic metres.
 const BURNER_OUTPUT: f32 = 500.0;
 const STEAM_VENT_OUTPUT: f32 = 5000.0;
-/// A propeller at full signal turns at Create's top speed.
-const FULL_SIGNAL_RPM: f32 = 256.0;
 /// Sable's lift scalars for a sail (Create's) and a symmetric sail.
 const SAIL_PARALLEL_DRAG: f32 = 0.75;
 const SAIL_LIFT: f32 = 0.475;
 const SYMMETRIC_SAIL_PARALLEL_DRAG: f32 = 1.75;
 
-/// Stone in its many forms weighs twice what its size suggests.
+/// Aeronautics' hot air burner: heats the balloon above it in proportion
+/// to the redstone signal reaching it.
+pub const HOT_AIR_BURNER: &str = "aeronautics:hot_air_burner";
+/// Aeronautics' steam vent: the same, with ten times the gas.
+pub const STEAM_VENT: &str = "aeronautics:steam_vent";
+
+/// Stone in its many forms weighs twice what its size suggests: Sable's
+/// `#sable:heavy`, for vanilla.
 const HEAVY: &[Block] = &[
     Block::STONE,
     Block::COBBLESTONE,
@@ -75,7 +74,8 @@ const HEAVY: &[Block] = &[
     Block::CALCITE,
 ];
 
-/// Blocks of stored material, and anvils, weigh four times as much.
+/// Blocks of stored material, and anvils, weigh four times as much: Sable's
+/// `#sable:super_heavy`, for vanilla.
 const SUPER_HEAVY: &[Block] = &[
     Block::COAL_BLOCK,
     Block::RAW_IRON_BLOCK,
@@ -95,7 +95,8 @@ const SUPER_HEAVY: &[Block] = &[
     Block::DAMAGED_ANVIL,
 ];
 
-/// Blocks a quarter of a block thick: Sable's `quarter_volume` list.
+/// Blocks a quarter of a block thick: Sable's `quarter_volume` list, for
+/// vanilla.
 const QUARTER_VOLUME: &[Block] = &[
     Block::LADDER,
     Block::IRON_BARS,
@@ -114,15 +115,8 @@ const QUARTER_VOLUME: &[Block] = &[
     Block::OBSERVER,
 ];
 
-/// Levitite, Aeronautics' lifting block: the froglights stand in for it.
-const LEVITITE: &[Block] = &[
-    Block::OCHRE_FROGLIGHT,
-    Block::VERDANT_FROGLIGHT,
-    Block::PEARLESCENT_FROGLIGHT,
-];
-
 /// Sable's `#sable:end_stones`, which carry its `end_stone` floating
-/// material; the slab at half strength.
+/// material; the slab at half strength. For vanilla.
 const END_STONE: &[Block] = &[
     Block::END_STONE,
     Block::END_STONE_BRICKS,
@@ -131,7 +125,8 @@ const END_STONE: &[Block] = &[
     Block::END_STONE_BRICK_WALL,
 ];
 
-/// Sable's `fragile` tag: these break when a sub-level hits something.
+/// Sable's `fragile` tag: these break when a sub-level hits something. For
+/// vanilla.
 const FRAGILE: &[Block] = &[
     Block::BAMBOO,
     Block::MELON,
@@ -142,7 +137,7 @@ const FRAGILE: &[Block] = &[
     Block::LILY_PAD,
 ];
 
-/// Sable's `frictive` tag, plus its grindstone and mud exceptions.
+/// Sable's `frictive` tag, for vanilla.
 const STICKY: &[Block] = &[
     Block::SOUL_SAND,
     Block::SOUL_SOIL,
@@ -150,13 +145,39 @@ const STICKY: &[Block] = &[
     Block::CACTUS,
 ];
 
+/// Whether the installed profile puts `block` in the tag `tag`
+/// (`namespace:path`). Vanilla's own tags are the generated ones.
+fn tagged(block: &Block, tag: &str) -> bool {
+    mods::block_has_tag(block, tag)
+}
+
 fn fragile(block: &Block) -> bool {
-    block.has_tag(&tag::Block::MINECRAFT_LEAVES) || FRAGILE.contains(block)
+    block.has_tag(&tag::Block::MINECRAFT_LEAVES)
+        || FRAGILE.contains(block)
+        || tagged(block, "sable:fragile")
+}
+
+/// Whether `block` in `state` is a slab, and a double one at that: Sable
+/// doubles what a double slab weighs, displaces and lifts.
+fn double_slab(block: &Block, state: &BlockState) -> Option<bool> {
+    if block.has_tag(&tag::Block::MINECRAFT_SLABS) {
+        return Some(SlabProperties::from_state_id(state.id).r#type == SlabType::Double);
+    }
+    // A mod's slab has the same `type` property.
+    mods::state_prop(state.id, "type").map(|kind| kind == "double")
+}
+
+/// Whether a piston in `state` is extended: Sable lets it weigh half.
+fn extended(block: &Block, state: &BlockState) -> bool {
+    if *block == Block::PISTON || *block == Block::STICKY_PISTON {
+        return StickyPistonLikeProperties::from_state_id(state.id).extended;
+    }
+    mods::state_prop(state.id, "extended") == Some("true")
 }
 
 /// Describes the block at `position` for the physics: its shape, mass,
 /// volume, material, and any aerodynamic role. `signal` is the redstone
-/// signal reaching it, which drives burners and propellers.
+/// signal reaching it, which drives burners.
 #[must_use]
 pub fn block_voxel(position: [i32; 3], block: &Block, state: &BlockState, signal: u8) -> Voxel {
     if state.is_liquid() {
@@ -176,7 +197,8 @@ pub fn block_voxel(position: [i32; 3], block: &Block, state: &BlockState, signal
         shape,
         material: Material {
             friction: friction(block),
-            restitution: if *block == Block::SLIME_BLOCK {
+            // Sable's `#sable:bouncy`, the slime block among vanilla.
+            restitution: if tagged(block, "sable:bouncy") || *block == Block::SLIME_BLOCK {
                 0.5
             } else {
                 0.0
@@ -214,62 +236,52 @@ pub fn collision_shape(state: &BlockState) -> VoxelShape {
 /// What `block` in `state` does besides weighing something.
 #[must_use]
 pub fn aerodynamic_kind(block: &Block, state: &BlockState, signal: u8) -> VoxelKind {
-    if block.has_tag(&tag::Block::MINECRAFT_WOOL) {
+    // Aeronautics' `#aeronautics:airtight`: its envelopes, and wool.
+    if tagged(block, "aeronautics:airtight") || block.has_tag(&tag::Block::MINECRAFT_WOOL) {
         return VoxelKind::Envelope;
     }
-    if block.has_tag(&tag::Block::MINECRAFT_CAMPFIRES) {
-        // A burner heats in proportion to its signal; an unlit campfire
-        // is just a grill. A soul campfire's blue flame is a steam vent.
-        if !CampfireLikeProperties::from_state_id(state.id).lit {
-            return VoxelKind::Solid;
-        }
-        let output = if *block == Block::SOUL_CAMPFIRE {
-            STEAM_VENT_OUTPUT
-        } else {
-            BURNER_OUTPUT
-        };
+    // A burner heats in proportion to the signal reaching it.
+    let output = match block.name {
+        HOT_AIR_BURNER => BURNER_OUTPUT,
+        STEAM_VENT => STEAM_VENT_OUTPUT,
+        _ => 0.0,
+    };
+    if output > 0.0 {
         return VoxelKind::Heater {
             output: output * f32::from(signal) / 15.0,
         };
     }
-    if LEVITITE.contains(block) {
+    if tagged(block, "aeronautics:levitite") {
         return levitite();
     }
-    if END_STONE.contains(block) {
-        return end_stone(block, state);
-    }
-    if *block == Block::PISTON || *block == Block::STICKY_PISTON {
-        let facing = StickyPistonLikeProperties::from_state_id(state.id).facing;
-        let offset = facing.to_block_direction().to_offset();
-        let rpm = FULL_SIGNAL_RPM * f32::from(signal) / 15.0;
-        return VoxelKind::Thruster {
-            direction: [offset.x as f32, offset.y as f32, offset.z as f32],
-            // A sticky piston is a reversed propeller.
-            rpm: if *block == Block::STICKY_PISTON {
-                -rpm
+    if tagged(block, "sable:end_stones") || END_STONE.contains(block) {
+        return VoxelKind::Floating {
+            material: FloatingMaterial::END_STONE,
+            scale: if double_slab(block, state) == Some(false) {
+                0.5
             } else {
-                rpm
+                1.0
             },
         };
     }
-    if block.has_tag(&tag::Block::MINECRAFT_WOOL_CARPETS) {
-        return VoxelKind::LiftSurface {
-            normal: [0.0, 1.0, 0.0],
-            parallel_drag: SAIL_PARALLEL_DRAG,
-            lift: SAIL_LIFT,
-        };
-    }
-    if *block == Block::CHAIN {
-        let axis = ChainLikeProperties::from_state_id(state.id).r#axis;
-        let normal = match axis {
-            Axis::X => [1.0, 0.0, 0.0],
-            Axis::Y => [0.0, 1.0, 0.0],
-            Axis::Z => [0.0, 0.0, 1.0],
-        };
+    if tagged(block, "simulated:symmetric_sails")
+        && let Some(normal) = axis_normal(state)
+    {
         return VoxelKind::LiftSurface {
             normal,
             parallel_drag: SYMMETRIC_SAIL_PARALLEL_DRAG,
             lift: 0.0,
+        };
+    }
+    // Create's sails, `create:<colour>_sail`, face the way they were placed;
+    // Sable gives them their lift off the back.
+    if is_create_sail(block)
+        && let Some(normal) = facing_opposite(state)
+    {
+        return VoxelKind::LiftSurface {
+            normal,
+            parallel_drag: SAIL_PARALLEL_DRAG,
+            lift: SAIL_LIFT,
         };
     }
     VoxelKind::Solid
@@ -283,14 +295,40 @@ const fn levitite() -> VoxelKind {
     }
 }
 
-/// A block of Sable's `end_stone` floating material: a slab at half.
-fn end_stone(block: &Block, state: &BlockState) -> VoxelKind {
-    let slab = *block == Block::END_STONE_BRICK_SLAB;
-    let double = slab && SlabProperties::from_state_id(state.id).r#type == SlabType::Double;
-    VoxelKind::Floating {
-        material: FloatingMaterial::END_STONE,
-        scale: if slab && !double { 0.5 } else { 1.0 },
-    }
+/// The positive direction of a block's `axis` property: a symmetric sail's
+/// normal, Simulated's `sable$getNormal`.
+fn axis_normal(state: &BlockState) -> Option<[f32; 3]> {
+    Some(match mods::state_prop(state.id, "axis")? {
+        "x" => [1.0, 0.0, 0.0],
+        "y" => [0.0, 1.0, 0.0],
+        "z" => [0.0, 0.0, 1.0],
+        _ => return None,
+    })
+}
+
+fn is_create_sail(block: &Block) -> bool {
+    block.name.starts_with("create:") && block.name.ends_with("_sail")
+}
+
+/// The direction opposite to the one a block's `facing` property names:
+/// the normal Sable gives Create's sails.
+fn facing_opposite(state: &BlockState) -> Option<[f32; 3]> {
+    Some(match mods::state_prop(state.id, "facing")? {
+        "north" => [0.0, 0.0, 1.0],
+        "south" => [0.0, 0.0, -1.0],
+        "west" => [1.0, 0.0, 0.0],
+        "east" => [-1.0, 0.0, 0.0],
+        "up" => [0.0, -1.0, 0.0],
+        "down" => [0.0, 1.0, 0.0],
+        _ => return None,
+    })
+}
+
+/// Whether `block` heats a balloon: its output follows the redstone signal
+/// reaching it.
+#[must_use]
+pub fn heater(block: &Block) -> bool {
+    matches!(block.name, HOT_AIR_BURNER | STEAM_VENT)
 }
 
 /// The strongest redstone signal any neighbour feeds into `pos`, 0 to 15.
@@ -313,15 +351,10 @@ pub fn block_mass(block: &Block, state: &BlockState) -> f32 {
     if *block == Block::BEDROCK {
         return BEDROCK_MASS;
     }
-    let double = block.has_tag(&tag::Block::MINECRAFT_SLABS)
-        && SlabProperties::from_state_id(state.id).r#type == SlabType::Double;
-    if *block == Block::PISTON || *block == Block::STICKY_PISTON {
-        // Sable: an extended piston weighs half.
-        return if StickyPistonLikeProperties::from_state_id(state.id).extended {
-            0.5
-        } else {
-            NORMAL_MASS
-        };
+    let double = double_slab(block, state) == Some(true);
+    // Sable: an extended piston weighs half.
+    if tagged(block, "sable:pistons") && extended(block, state) {
+        return 0.5;
     }
     let super_light = block.has_tag(&tag::Block::MINECRAFT_WOOL)
         || block.has_tag(&tag::Block::MINECRAFT_WOOL_CARPETS)
@@ -332,18 +365,23 @@ pub fn block_mass(block: &Block, state: &BlockState) -> f32 {
         || block.has_tag(&tag::Block::MINECRAFT_FENCE_GATES)
         || block.has_tag(&tag::Block::MINECRAFT_CANDLES)
         || block.has_tag(&tag::Block::MINECRAFT_SAPLINGS)
-        || QUARTER_VOLUME.contains(block);
+        || QUARTER_VOLUME.contains(block)
+        || tagged(block, "sable:super_light");
     let light = block.has_tag(&tag::Block::MINECRAFT_PLANKS)
         || block.has_tag(&tag::Block::MINECRAFT_LOGS)
         || block.has_tag(&tag::Block::MINECRAFT_SLABS)
-        || block.has_tag(&tag::Block::MINECRAFT_STAIRS);
-    let mass = if super_light {
+        || block.has_tag(&tag::Block::MINECRAFT_STAIRS)
+        || tagged(block, "sable:light");
+    // Sable's mass tags, the lighter winning.
+    let mass = if tagged(block, "sable:weightless") {
+        0.0
+    } else if super_light {
         SUPER_LIGHT_MASS
     } else if light {
         LIGHT_MASS
-    } else if HEAVY.contains(block) {
+    } else if HEAVY.contains(block) || tagged(block, "sable:heavy") {
         HEAVY_MASS
-    } else if SUPER_HEAVY.contains(block) {
+    } else if SUPER_HEAVY.contains(block) || tagged(block, "sable:super_heavy") {
         SUPER_HEAVY_MASS
     } else {
         NORMAL_MASS
@@ -354,8 +392,7 @@ pub fn block_mass(block: &Block, state: &BlockState) -> f32 {
 /// How much of a full block `block` displaces in a liquid.
 #[must_use]
 pub fn volume(block: &Block, state: &BlockState) -> f32 {
-    let double = block.has_tag(&tag::Block::MINECRAFT_SLABS)
-        && SlabProperties::from_state_id(state.id).r#type == SlabType::Double;
+    let double = double_slab(block, state) == Some(true);
     if QUARTER_VOLUME.contains(block)
         || block.has_tag(&tag::Block::MINECRAFT_FENCES)
         || block.has_tag(&tag::Block::MINECRAFT_FENCE_GATES)
@@ -363,10 +400,14 @@ pub fn volume(block: &Block, state: &BlockState) -> f32 {
         || block.has_tag(&tag::Block::MINECRAFT_DOORS)
         || block.has_tag(&tag::Block::MINECRAFT_WOOL_CARPETS)
         || block.has_tag(&tag::Block::MINECRAFT_CANDLES)
+        || tagged(block, "sable:quarter_volume")
     {
         return if double { 0.5 } else { 0.25 };
     }
-    if block.has_tag(&tag::Block::MINECRAFT_SLABS) || block.has_tag(&tag::Block::MINECRAFT_STAIRS) {
+    if block.has_tag(&tag::Block::MINECRAFT_SLABS)
+        || block.has_tag(&tag::Block::MINECRAFT_STAIRS)
+        || tagged(block, "sable:half_volume")
+    {
         return if double { 1.0 } else { 0.5 };
     }
     1.0
@@ -374,9 +415,9 @@ pub fn volume(block: &Block, state: &BlockState) -> f32 {
 
 /// Sable's friction block properties.
 fn friction(block: &Block) -> f32 {
-    if block.has_tag(&tag::Block::MINECRAFT_ICE) {
+    if block.has_tag(&tag::Block::MINECRAFT_ICE) || tagged(block, "sable:slippery") {
         0.0
-    } else if STICKY.contains(block) {
+    } else if STICKY.contains(block) || tagged(block, "sable:frictive") {
         1.65
     } else if *block == Block::GRINDSTONE {
         0.05
@@ -396,12 +437,83 @@ mod tests {
         (voxel.kind, voxel.mass, voxel.volume, voxel.material)
     }
 
-    fn thrust(direction: [f32; 3], rpm: f32) -> VoxelKind {
-        VoxelKind::Thruster { direction, rpm }
+    /// A block of the test profile in the state with the properties `props`.
+    fn modded(
+        name: &str,
+        props: &[(&str, &str)],
+    ) -> Result<(&'static Block, &'static BlockState), &'static str> {
+        crate::mods::profile::tests::install_test_profile();
+        let block = Block::from_registry_key(name).ok_or("no such block in the profile")?;
+        let state = mods::state_with(block, props).ok_or("no such state in the profile")?;
+        Ok((block, state))
     }
 
     #[test]
-    fn stand_in_blocks_take_their_roles() {
+    fn the_mods_blocks_take_their_roles() -> Result<(), &'static str> {
+        let (envelope, state) = modded("aeronautics:white_envelope", &[])?;
+        assert_eq!(aerodynamic_kind(envelope, state, 0), VoxelKind::Envelope);
+        // Sable's `#sable:super_light`: a quarter of a block mass, and bouncy.
+        assert_eq!(voxel(envelope, state, 0).1, 0.25);
+        assert_eq!(voxel(envelope, state, 0).3.restitution, 0.5);
+
+        // A burner heats in proportion to the signal reaching it.
+        let (burner, state) = modded(HOT_AIR_BURNER, &[])?;
+        assert_eq!(
+            aerodynamic_kind(burner, state, 0),
+            VoxelKind::Heater { output: 0.0 }
+        );
+        assert_eq!(
+            aerodynamic_kind(burner, state, 7),
+            VoxelKind::Heater {
+                output: 500.0 * 7.0 / 15.0
+            }
+        );
+        // A steam vent: ten times a burner's gas.
+        let (vent, state) = modded(STEAM_VENT, &[])?;
+        assert_eq!(
+            aerodynamic_kind(vent, state, 15),
+            VoxelKind::Heater { output: 5000.0 }
+        );
+
+        let (levitite, state) = modded("aeronautics:levitite", &[])?;
+        assert_eq!(
+            aerodynamic_kind(levitite, state, 0),
+            VoxelKind::Floating {
+                material: FloatingMaterial::LEVITITE,
+                scale: 1.0
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sails_take_the_air_off_their_broad_sides() -> Result<(), &'static str> {
+        // A symmetric sail's normal is the positive direction of its axis,
+        // and it only drags.
+        let (sail, state) = modded("simulated:symmetric_sail", &[("axis", "z")])?;
+        assert_eq!(
+            aerodynamic_kind(sail, state, 0),
+            VoxelKind::LiftSurface {
+                normal: [0.0, 0.0, 1.0],
+                parallel_drag: 1.75,
+                lift: 0.0
+            }
+        );
+        // A Create sail faces the way it was placed and lifts off the back.
+        let (sail, state) = modded("create:white_sail", &[("facing", "east")])?;
+        assert_eq!(
+            aerodynamic_kind(sail, state, 0),
+            VoxelKind::LiftSurface {
+                normal: [-1.0, 0.0, 0.0],
+                parallel_drag: 0.75,
+                lift: 0.475
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn vanilla_blocks_keep_sables_properties() {
         assert_eq!(
             voxel(&Block::WHITE_WOOL, Block::WHITE_WOOL.default_state, 0).0,
             VoxelKind::Envelope
@@ -426,55 +538,7 @@ mod tests {
             collision_shape(Block::TORCH.default_state),
             VoxelShape::None
         );
-
-        // A campfire heats only when lit and fed a signal, in proportion.
-        assert_eq!(
-            voxel(&Block::CAMPFIRE, Block::CAMPFIRE.default_state, 0).0,
-            VoxelKind::Heater { output: 0.0 }
-        );
-        assert_eq!(
-            voxel(&Block::CAMPFIRE, Block::CAMPFIRE.default_state, 7).0,
-            VoxelKind::Heater {
-                output: 500.0 * 7.0 / 15.0
-            }
-        );
-        let mut campfire = CampfireLikeProperties::from_state_id(Block::CAMPFIRE.default_state.id);
-        campfire.lit = false;
-        let quenched = BlockState::from_id(campfire.to_state_id(&Block::CAMPFIRE));
-        assert_eq!(voxel(&Block::CAMPFIRE, quenched, 15).0, VoxelKind::Solid);
-
-        // A piston at full signal is a 256 rpm propeller along its facing
-        // (north by default); a sticky one runs reversed.
-        assert_eq!(
-            voxel(&Block::PISTON, Block::PISTON.default_state, 15).0,
-            thrust([0.0, 0.0, -1.0], 256.0)
-        );
-        assert_eq!(
-            voxel(
-                &Block::STICKY_PISTON,
-                Block::STICKY_PISTON.default_state,
-                15
-            )
-            .0,
-            thrust([0.0, 0.0, -1.0], -256.0)
-        );
-        assert_eq!(voxel(&Block::PISTON, Block::PISTON.default_state, 0).1, 1.0);
-    }
-
-    #[test]
-    fn floating_blocks_come_in_two_materials() {
-        assert_eq!(
-            voxel(
-                &Block::OCHRE_FROGLIGHT,
-                Block::OCHRE_FROGLIGHT.default_state,
-                0
-            )
-            .0,
-            VoxelKind::Floating {
-                material: FloatingMaterial::LEVITITE,
-                scale: 1.0
-            }
-        );
+        // End stone keeps its floating material, a slab at half strength.
         assert_eq!(
             voxel(&Block::END_STONE, Block::END_STONE.default_state, 0).0,
             VoxelKind::Floating {
@@ -482,7 +546,6 @@ mod tests {
                 scale: 1.0
             }
         );
-        // The end stone brick slab floats at half strength, unless double.
         let single = Block::END_STONE_BRICK_SLAB.default_state;
         assert_eq!(
             voxel(&Block::END_STONE_BRICK_SLAB, single, 0).0,
@@ -501,38 +564,28 @@ mod tests {
                 scale: 1.0
             }
         );
-        // A soul campfire is a steam vent: ten times a burner's gas.
+        // An extended piston weighs half.
+        assert_eq!(voxel(&Block::PISTON, Block::PISTON.default_state, 0).1, 1.0);
         assert_eq!(
-            voxel(
-                &Block::SOUL_CAMPFIRE,
-                Block::SOUL_CAMPFIRE.default_state,
-                15
-            )
-            .0,
-            VoxelKind::Heater { output: 5000.0 }
+            voxel(&Block::PISTON, Block::PISTON.default_state, 0).0,
+            VoxelKind::Solid
         );
-    }
-
-    #[test]
-    fn sails_come_in_two_kinds() {
-        assert_eq!(
-            voxel(&Block::WHITE_CARPET, Block::WHITE_CARPET.default_state, 0).0,
-            VoxelKind::LiftSurface {
-                normal: [0.0, 1.0, 0.0],
-                parallel_drag: 0.75,
-                lift: 0.475
-            }
-        );
-        assert_eq!(
-            voxel(&Block::CHAIN, Block::CHAIN.default_state, 0).0,
-            VoxelKind::LiftSurface {
-                normal: [0.0, 1.0, 0.0],
-                parallel_drag: 1.75,
-                lift: 0.0
-            }
-        );
-        // Chains are thin: a quarter of a block in volume.
-        assert_eq!(voxel(&Block::CHAIN, Block::CHAIN.default_state, 0).2, 0.25);
+        // Nothing else heats, lifts or floats: those are the mods' blocks.
+        for block in [
+            Block::CAMPFIRE,
+            Block::SOUL_CAMPFIRE,
+            Block::STICKY_PISTON,
+            Block::WHITE_CARPET,
+            Block::CHAIN,
+            Block::OCHRE_FROGLIGHT,
+        ] {
+            assert_eq!(
+                voxel(&block, block.default_state, 15).0,
+                VoxelKind::Solid,
+                "{}",
+                block.name
+            );
+        }
     }
 
     #[test]

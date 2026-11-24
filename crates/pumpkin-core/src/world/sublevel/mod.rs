@@ -573,13 +573,6 @@ fn placed(local: [f64; 3], turns: u8) -> [f64; 3] {
     [x, local[1], z]
 }
 
-/// Whether a block's aerodynamic role depends on the redstone reaching it.
-fn needs_signal(block: &Block) -> bool {
-    block.has_tag(&tag::Block::MINECRAFT_CAMPFIRES)
-        || *block == Block::PISTON
-        || *block == Block::STICKY_PISTON
-}
-
 pub struct SubLevelManager {
     physics: pumpkin_sublevel::SubLevelSystem,
     levels: Vec<SubLevel>,
@@ -2723,7 +2716,7 @@ impl World {
                     if state.is_air() {
                         continue;
                     }
-                    let signal = if needs_signal(block) {
+                    let signal = if aero::heater(block) {
                         aero::signal_at(self, pos)
                     } else {
                         0
