@@ -1994,22 +1994,26 @@ impl World {
                 return;
             }
         };
+        // Another assembly of the same region may have taken its blocks
+        // first: with nothing to carry, the sub-level goes.
+        let Some(bounds) = bounds else {
+            warn!("sublevel {id}: assembled nothing; the region was already taken");
+            self.lock_sublevels().end_assembly(id);
+            self.remove_sublevel(id);
+            return;
+        };
         self.park_entities_in_region(min, max, anchor, center, include.as_ref());
         self.clear_region(min, max, include.as_ref());
         self.lock_sublevels().end_assembly(id);
 
         // Sable's bounds are tight to the content; empty margins of the
         // region must not widen the client's render or collision box.
-        let mut manager = self.lock_sublevels();
-        if let Some(bounds) = bounds {
-            manager.tighten_bounds(id, bounds);
-        }
+        self.lock_sublevels().tighten_bounds(id, bounds);
         let pivot_offset = [
             from_anchor.x as f32,
             from_anchor.y as f32,
             from_anchor.z as f32,
         ];
-        drop(manager);
         // The content is read back from the plot, where redstone signals
         // are the ones the burners and propellers will actually see. Its
         // grid counts from the parked anchor, the plot centre block.
