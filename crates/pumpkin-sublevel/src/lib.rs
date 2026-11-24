@@ -59,6 +59,10 @@ const SURROUNDINGS_LOOKAHEAD_CAP: f32 = 20.0;
 /// Surroundings stay valid until the sub-level's blocks leave the inner
 /// half of the margin.
 const SURROUNDINGS_REFRESH: f32 = SURROUNDINGS_MARGIN / 2.0;
+/// Sable's `sub_level_remove_min` and `sub_level_remove_max`: a sub-level
+/// whose blocks pass either height is removed.
+const REMOVE_MIN_Y: f32 = -10_000.0;
+const REMOVE_MAX_Y: f32 = 100_000.0;
 /// Contacts slower than this, in blocks per second, are resting rather than
 /// hits, and go unreported.
 const IMPACT_MIN_SPEED: f32 = 0.5;
@@ -147,6 +151,9 @@ pub struct Step {
     /// a pose or velocity that is not a number or far outside any world,
     /// and were put back where they last were, at rest.
     pub recovered: Vec<u32>,
+    /// Sub-levels whose blocks left the heights Sable lets sub-levels exist
+    /// at.
+    pub gone: Vec<u32>,
 }
 
 /// Beyond this, in blocks or blocks per second, a body's place or motion is
@@ -950,10 +957,22 @@ impl SubLevelSystem {
                 recovered.push(sublevel.id);
             }
         }
+        let mut gone = Vec::new();
+        for sublevel in &self.sublevels {
+            let (Some(analysed), Some(body)) = (&sublevel.content, self.bodies.get(sublevel.body))
+            else {
+                continue;
+            };
+            let blocks = world_bounds(body, analysed, sublevel.pivot_offset);
+            if blocks.0[1] < REMOVE_MIN_Y || blocks.1[1] > REMOVE_MAX_Y {
+                gone.push(sublevel.id);
+            }
+        }
         Step {
             bodies: self.snapshots(),
             impacts: self.collect_impacts(),
             recovered,
+            gone,
         }
     }
 
@@ -1501,6 +1520,18 @@ mod tests {
             body.position[1] > 58.0 && body.position[1] < 59.5,
             "{body:?}"
         );
+    }
+
+    #[test]
+    fn a_sub_level_past_sable_height_limits_is_reported_gone() -> Result<(), &'static str> {
+        let mut system = SubLevelSystem::new(Air::default());
+        let id = system.spawn([0.0, 64.0, 0.0]);
+        assert!(system.set_content(id, slab(4, 4)));
+        assert!(system.step().gone.is_empty());
+        assert!(system.set_body_pose(id, [0.0, -20_000.5, 0.0], [0.0, 0.0, 0.0, 1.0]));
+        let gone = system.step().gone;
+        assert_eq!(gone.first(), Some(&id));
+        Ok(())
     }
 
     #[test]

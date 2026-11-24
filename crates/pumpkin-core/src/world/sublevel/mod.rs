@@ -1949,6 +1949,10 @@ impl World {
         for id in &step.recovered {
             warn!("sublevel {id}: left the numbers; put back at rest where it last was");
         }
+        for id in &step.gone {
+            warn!("sublevel {id}: left the heights sub-levels may exist at; removed");
+            self.remove_sublevel(*id);
+        }
         self.handle_impacts(&step.impacts);
         self.lock_sublevels().sync(self, &step.bodies);
         self.step_disassemblies();
