@@ -7,10 +7,12 @@ use std::sync::{Arc, Mutex};
 use pumpkin_data::damage::DamageType;
 use pumpkin_data::entity::EntityType;
 use pumpkin_data::item::Item;
+use pumpkin_data::item_stack::ItemStack;
 use pumpkin_data::particle::Particle;
 use pumpkin_data::sound::SoundCategory;
 use pumpkin_nbt::compound::NbtCompound;
 use pumpkin_nbt::tag::NbtTag;
+use pumpkin_protocol::codec::item_stack_seralizer::ItemStackSerializer;
 use pumpkin_protocol::codec::var_int::VarInt;
 use pumpkin_protocol::java::client::play::{CParticle, CSoundEffect};
 use pumpkin_protocol::ser::NetworkWriteExt;
@@ -166,7 +168,7 @@ impl GlueEntity {
         ];
         let (particle, data): (Particle, Vec<u8>) = match self.kind {
             GlueKind::Super => (Particle::ItemSlime, Vec::new()),
-            GlueKind::Honey => (Particle::Item, honey_block_item()),
+            GlueKind::Honey => (Particle::Item, honey_block_stack()),
         };
         for axis in 0..3 {
             let (second, third) = ((axis + 1) % 3, (axis + 2) % 3);
@@ -209,15 +211,13 @@ impl GlueEntity {
     }
 }
 
-/// The `item` particle's data, an item stack: `ItemStack.OPTIONAL_STREAM_CODEC`
-/// of a honey block, with no components.
-fn honey_block_item() -> Vec<u8> {
+/// The `item` particle's data: a single honey block, as Simulated's
+/// `spawnParticles` shows.
+fn honey_block_stack() -> Vec<u8> {
     let mut data = Vec::new();
-    let _ = data.write_var_int(&VarInt(1));
-    if let Some(item) = Item::from_registry_key("minecraft:honey_block") {
-        let _ = data.write_var_int(&VarInt(i32::from(item.id)));
-    }
-    let _ = data.write_var_int(&VarInt(0));
+    ItemStackSerializer::from(ItemStack::new(1, &Item::HONEY_BLOCK))
+        .write(&mut data)
+        .ok();
     data
 }
 
@@ -452,5 +452,12 @@ mod tests {
             BlockPos(Vector3::new(2, 3, 4)),
             BlockPos(Vector3::new(3, 3, 4))
         ));
+    }
+
+    #[test]
+    fn the_honey_glue_shows_one_honey_block_as_vanilla_writes_a_stack() {
+        // Count, the honey block's id 665, then no component set and none
+        // removed: `DataComponentPatch` sends two counts, also when empty.
+        assert_eq!(honey_block_stack(), [1, 0x99, 0x05, 0, 0]);
     }
 }
