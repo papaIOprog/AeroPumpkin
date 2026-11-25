@@ -162,6 +162,17 @@ strip = false
 [profile.dev]
 debug = false
 
+# Unoptimized, rapier takes about 20 ms per sub-step for a single sub-level standing on terrain,
+# which overruns the tick once a few exist. The server's own crates stay debug builds.
+[profile.dev.package.rapier3d]
+opt-level = 3
+
+[profile.dev.package.parry3d]
+opt-level = 3
+
+[profile.dev.package.nalgebra]
+opt-level = 3
+
 [workspace.dependencies]
 tokio = { version = "1.53", default-features = false }
 syn = { version = "3.0", default-features = false, features = ["full", "parsing", "printing", "proc-macro", "clone-impls", "derive"] }
