@@ -1056,9 +1056,11 @@ impl SubLevelManager {
         !self.drags.is_empty()
     }
 
-    /// Simulated's `stopDragging`.
+    /// Simulated's `stopDragging`: the staff's hold on the sub-level ends,
+    /// and it keeps the motion it has.
     pub fn stop_dragging(&mut self, player: Uuid) {
-        if self.drags.remove(&player).is_some() {
+        if let Some(drag) = self.drags.remove(&player) {
+            self.physics.end_drag(drag.sublevel);
             self.staff_news.sessions = true;
         }
     }
@@ -1066,7 +1068,7 @@ impl SubLevelManager {
     /// One tick of Simulated's drag sessions, before the physics: each
     /// goal follows its player's eyes, which `eyes` gives for a player who
     /// holds the staff. A session ends when its player is gone or holds
-    /// something else, or when its sub-level is.
+    /// something else, or when its sub-level is, and lets its sub-level go.
     pub fn step_drags(&mut self, mut eyes: impl FnMut(Uuid) -> Option<Vector3<f64>>) {
         let mut ended = Vec::new();
         for (player, drag) in &self.drags {
@@ -1081,7 +1083,9 @@ impl SubLevelManager {
         }
         if !ended.is_empty() {
             for player in ended {
-                self.drags.remove(&player);
+                if let Some(drag) = self.drags.remove(&player) {
+                    self.physics.end_drag(drag.sublevel);
+                }
             }
             self.staff_news.sessions = true;
         }

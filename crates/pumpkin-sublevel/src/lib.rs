@@ -881,6 +881,21 @@ impl SubLevelSystem {
         true
     }
 
+    /// Ends the drag of sub-level `id`, as Simulated's `DragSession` ends:
+    /// the staff's constraint goes and the body keeps the motion it has,
+    /// while a lock put on since stays.
+    pub fn end_drag(&mut self, id: u32) -> bool {
+        let Some(index) = self
+            .sublevels
+            .iter()
+            .position(|s| s.id == id && matches!(s.hold, Some(Hold::Dragged { .. })))
+        else {
+            return false;
+        };
+        self.let_go(index);
+        true
+    }
+
     /// What the staff does to every sub-level, with the sub-level's id.
     pub fn holds(&self) -> impl Iterator<Item = (u32, Hold)> + '_ {
         self.sublevels.iter().filter_map(|s| Some((s.id, s.hold?)))
@@ -1800,6 +1815,24 @@ mod tests {
         assert!(system.let_go_id(id));
         settle(&mut system, id, 40);
         assert!(system.snapshots()[0].position[1] < goal[1] - 5.0);
+    }
+
+    #[test]
+    fn the_end_of_a_drag_takes_the_staffs_hold_and_leaves_a_lock() {
+        // Dragged, then locked: the lock took the drag's place, and ending
+        // the drag takes nothing, so the body stays where it was locked.
+        let mut system = SubLevelSystem::new(Air::default());
+        let id = airborne(&mut system, slab(4, 4), [0.0, 64.5, 0.0]);
+        assert!(system.drag(id, [0.0; 3], [0.0, 64.5, 0.0], [0.0, 0.0, 0.0, 1.0]));
+        settle(&mut system, id, 2);
+        assert_eq!(system.toggle_lock(id), Some(true));
+        assert!(!system.end_drag(id));
+        assert!(system.is_locked(id));
+        // Dragged again: ending the drag lets go of the body.
+        assert_eq!(system.toggle_lock(id), Some(false));
+        assert!(system.drag(id, [0.0; 3], [0.0, 64.5, 0.0], [0.0, 0.0, 0.0, 1.0]));
+        assert!(system.end_drag(id));
+        assert!(system.holds().next().is_none());
     }
 
     #[test]
