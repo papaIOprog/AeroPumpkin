@@ -17,7 +17,7 @@ use crate::{
     tick::{OrderedTick, ScheduledTick, TickPriority},
     world::WorldPortalExt,
 };
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use crossbeam::queue::SegQueue;
 use dashmap::{DashMap, Entry};
 use pumpkin_config::{chunk::ChunkConfig, lighting::LightingEngineConfig, world::LevelConfig};
@@ -98,6 +98,10 @@ pub struct Level {
     entity_saver: Arc<EntitySaver>,
 
     pub world_gen: ArcSwap<WorldGenerator>,
+
+    /// The square of chunks, lower and upper corner, that load empty
+    /// instead of being generated.
+    void_chunks: ArcSwapOption<(Vector2<i32>, Vector2<i32>)>,
 
     /// Handles runtime lighting updates
     pub light_engine: DynamicLightEngine,
@@ -270,6 +274,7 @@ impl Level {
             seed,
             world_portal: ArcSwap::new(Arc::new(None)),
             world_gen: ArcSwap::new(world_gen),
+            void_chunks: ArcSwapOption::empty(),
             level_folder,
             lighting_config: level_config.lighting,
             light_engine: DynamicLightEngine::new(dim_min_y, dim_min_y + dim_height),
@@ -313,6 +318,21 @@ impl Level {
 
     pub fn set_world_gen(&self, generator: Arc<WorldGenerator>) {
         self.world_gen.store(generator);
+    }
+
+    /// Makes the chunks from `min` to `max`, corners included, load empty
+    /// instead of being generated.
+    pub fn set_void_chunks(&self, min: Vector2<i32>, max: Vector2<i32>) {
+        self.void_chunks.store(Some(Arc::new((min, max))));
+    }
+
+    /// Whether the chunk at `chunk` loads empty.
+    #[must_use]
+    pub fn is_void_chunk(&self, chunk: Vector2<i32>) -> bool {
+        self.void_chunks.load_full().is_some_and(|corners| {
+            (corners.0.x..=corners.1.x).contains(&chunk.x)
+                && (corners.0.y..=corners.1.y).contains(&chunk.y)
+        })
     }
 
     #[must_use]

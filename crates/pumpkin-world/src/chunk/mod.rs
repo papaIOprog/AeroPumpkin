@@ -1,4 +1,5 @@
 use crate::chunk::format::LightContainer;
+use crate::chunk::io::Dirtiable;
 use crate::tick::scheduler::ChunkTickScheduler;
 use palette::{BiomePalette, BlockPalette, has_random_ticking_fluid};
 use pumpkin_data::block_properties::{blocks_movement, has_random_ticks, is_air};
@@ -648,6 +649,64 @@ impl ChunkData {
     #[must_use]
     pub fn empty_sync(x: i32, z: i32) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self::empty(x, z))
+    }
+
+    /// Empties the chunk the way a chunk of a void region loads: air to the
+    /// top of the world under an open sky, with no block light and nothing
+    /// waiting to become a block entity. What it held is gone without a trace.
+    pub fn reset_to_void(&self) {
+        let fresh = ChunkSections::new(self.section.count, self.section.min_y);
+        let ChunkSections {
+            count: _,
+            block_sections,
+            random_tick_sections,
+            randomly_ticking_mask,
+            biome_sections: _,
+            min_y: _,
+        } = fresh;
+        let mut blocks = self
+            .section
+            .block_sections
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *blocks = block_sections
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut ticks = self
+            .section
+            .random_tick_sections
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *ticks = random_tick_sections
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.section.randomly_ticking_mask.store(
+            randomly_ticking_mask.load(std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        *self
+            .heightmap
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = ChunkHeightmaps::default();
+        self.pending_block_entities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        let sections = self.section.count;
+        *self
+            .light_engine
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = ChunkLight {
+            sky_light: (0..sections)
+                .map(|_| LightContainer::new_empty(15))
+                .collect(),
+            block_light: (0..sections)
+                .map(|_| LightContainer::new_empty(0))
+                .collect(),
+        };
+        self.light_populated
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.mark_dirty(true);
     }
 
     /// Returns the replaced block state ID

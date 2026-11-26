@@ -58,6 +58,20 @@ fn load_proto_chunk(chunk: &crate::chunk::ChunkData, level: &Level) -> ProtoChun
     ProtoChunk::from_chunk_data(chunk, &level.world_gen.load())
 }
 
+/// A chunk of a void region, as the chunk of a world without any terrain
+/// would be: air to the top of the world, under an open sky.
+fn void_chunk(pos: ChunkPos, level: &Level) -> Chunk {
+    let generator = level.world_gen.load();
+    let mut proto = ProtoChunk::new(pos.x, pos.y, &generator);
+    proto.light.sky_light = (0..proto.light.sky_light.len())
+        .map(|_| LightContainer::new_empty(15))
+        .collect();
+    proto.stage = StagedChunkEnum::Full;
+    let mut chunk = Chunk::Proto(Box::new(proto));
+    chunk.upgrade_to_level_chunk(generator.dimension(), &level.lighting_config);
+    chunk
+}
+
 fn process_loaded_chunk(chunk: Arc<crate::chunk::ChunkData>, level: &Level) -> Chunk {
     let pos = ChunkPos::new(chunk.x, chunk.z);
     if chunk.status == ChunkStatus::Full {
@@ -156,17 +170,16 @@ pub async fn io_read_work(
                     }
                 }
                 LoadedData::Missing(pos) | LoadedData::Error((pos, _)) => {
-                    if send
-                        .send((
-                            pos,
-                            RecvChunk::IO(Chunk::Proto(Box::new(ProtoChunk::new(
-                                pos.x,
-                                pos.y,
-                                &level.world_gen.load(),
-                            )))),
-                        ))
-                        .is_err()
-                    {
+                    let chunk = if level.is_void_chunk(pos) {
+                        void_chunk(pos, &level)
+                    } else {
+                        Chunk::Proto(Box::new(ProtoChunk::new(
+                            pos.x,
+                            pos.y,
+                            &level.world_gen.load(),
+                        )))
+                    };
+                    if send.send((pos, RecvChunk::IO(chunk))).is_err() {
                         break;
                     }
                 }
