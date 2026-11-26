@@ -222,6 +222,27 @@ const STAFF_LINEAR_DAMPING: f32 = 125.0;
 const STAFF_ANGULAR_STIFFNESS: f32 = 10_000.0;
 const STAFF_ANGULAR_DAMPING: f32 = 850.0;
 
+/// A handle's pull on a sub-level, as Simulated's `HandleConstraint` sets
+/// it every physics tick: the point `anchor` of the content, in the body's
+/// own coordinates, is drawn to `goal` in the world.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Pull {
+    pub sublevel: u32,
+    pub anchor: [f32; 3],
+    pub goal: [f32; 3],
+}
+
+/// Simulated's `HandleConstraint.CONSTRAINT_STIFFNESS` and
+/// `CONSTRAINT_DAMPING`: the gains of the motors that pull a sub-level
+/// held by a handle.
+const PULL_STIFFNESS: f32 = 240.0;
+const PULL_DAMPING: f32 = 30.0;
+/// How a handle's pull damps turning, for which it has no stiffness.
+const PULL_ANGULAR_DAMPING: f32 = 4.5;
+/// Simulated's `handleMaxForce`: the most any of a handle's motors pulls
+/// with, whatever the sub-level weighs.
+const PULL_MAX_FORCE: f32 = 120.0;
+
 /// What a collider is: a box of a sub-level's content, or of the static
 /// surroundings sampled for one. Encoded in rapier's `user_data`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -391,6 +412,8 @@ pub struct SubLevelSystem {
     air: Air,
     /// The fixed body the staff's constraints tie a sub-level to.
     ground: RigidBodyHandle,
+    /// The joints of the handles' pulls, which the host replaces every tick.
+    pulls: Vec<ImpulseJointHandle>,
     sublevels: Vec<SubLevel>,
     next_id: u32,
     impacts: ImpactCollector,
@@ -427,6 +450,7 @@ impl SubLevelSystem {
             air,
             sublevels: Vec::new(),
             ground: RigidBodyHandle::invalid(),
+            pulls: Vec::new(),
             next_id: 1,
             impacts: ImpactCollector::default(),
         };
@@ -968,6 +992,54 @@ impl SubLevelSystem {
             _ => return false,
         }
         true
+    }
+
+    /// Replaces the pulls on the sub-levels, which last until the next
+    /// call: a handle's, as Simulated's `HandleConstraint` sets them every
+    /// physics tick. A pull on a sub-level that is not carrying anything
+    /// yet goes.
+    pub fn set_pulls(&mut self, pulls: &[Pull]) {
+        for joint in self.pulls.drain(..) {
+            self.impulse_joints.remove(joint, false);
+        }
+        for pull in pulls {
+            let Some(sublevel) = self
+                .sublevels
+                .iter()
+                .find(|sublevel| sublevel.id == pull.sublevel && sublevel.active)
+            else {
+                continue;
+            };
+            let [x, y, z] = pull.anchor;
+            let joint = GenericJointBuilder::new(JointAxesMask::empty())
+                .local_frame1(Isometry::translation(
+                    pull.goal[0],
+                    pull.goal[1],
+                    pull.goal[2],
+                ))
+                .local_frame2(Isometry::translation(x, y, z))
+                .build();
+            let handle = self
+                .impulse_joints
+                .insert(self.ground, sublevel.body, joint, true);
+            self.pulls.push(handle);
+            let Some(joint) = self.impulse_joints.get_mut(handle, false) else {
+                continue;
+            };
+            for axis in [JointAxis::LinX, JointAxis::LinY, JointAxis::LinZ] {
+                joint
+                    .data
+                    .set_motor_position(axis, 0.0, PULL_STIFFNESS, PULL_DAMPING);
+                joint.data.set_motor_max_force(axis, PULL_MAX_FORCE);
+            }
+            for axis in [JointAxis::AngX, JointAxis::AngY, JointAxis::AngZ] {
+                // No spring towards any turn: only turning is damped.
+                joint
+                    .data
+                    .set_motor_position(axis, 0.0, 0.0, PULL_ANGULAR_DAMPING);
+                joint.data.set_motor_max_force(axis, PULL_MAX_FORCE);
+            }
+        }
     }
 
     /// Re-ties every dragged sub-level for this substep.
@@ -1827,6 +1899,45 @@ mod tests {
         assert!(system.drag(id, [0.0; 3], [0.0, 64.5, 0.0], [0.0, 0.0, 0.0, 1.0]));
         assert!(system.end_drag(id));
         assert!(system.holds().next().is_none());
+    }
+
+    #[test]
+    fn a_pull_draws_a_light_sub_level_to_its_goal_and_cannot_lift_a_heavy_one() {
+        // A handle's pull brings a slab of four blocks up to its goal,
+        // hanging a little below it under its weight. The same pull on a
+        // slab past what its force can lift leaves that one falling:
+        // `handleMaxForce` is the most a handle pulls with, whatever the
+        // sub-level weighs.
+        let mut system = SubLevelSystem::new(Air::default());
+        let light = airborne(&mut system, slab(2, 2), [0.0, 64.0, 0.0]);
+        let heavy = airborne(&mut system, slab(40, 40), [100.0, 64.0, 0.0]);
+        let goal = [3.0, 67.0, -2.0];
+        for _ in 0..60 {
+            system.set_pulls(&[
+                Pull {
+                    sublevel: light,
+                    anchor: [0.0; 3],
+                    goal,
+                },
+                Pull {
+                    sublevel: heavy,
+                    anchor: [0.0; 3],
+                    goal,
+                },
+            ]);
+            system.step();
+        }
+        let light_at = system.snapshots()[0].position;
+        for axis in 0..3 {
+            assert!((light_at[axis] - goal[axis]).abs() < 0.3, "{light_at:?}");
+        }
+        assert!(system.snapshots()[1].position[1] < 50.0);
+        // Let go, the light one falls too.
+        system.set_pulls(&[]);
+        for _ in 0..40 {
+            system.step();
+        }
+        assert!(system.snapshots()[0].position[1] < light_at[1] - 5.0);
     }
 
     #[test]
