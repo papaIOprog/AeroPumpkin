@@ -1500,6 +1500,14 @@ impl SubLevelManager {
         in_plotyard(chunk.x) && in_plotyard(chunk.y)
     }
 
+    /// The plotyard's chunks, its lower and its upper corner.
+    #[must_use]
+    pub const fn plotyard_chunks() -> (Vector2<i32>, Vector2<i32>) {
+        let first = PLOTYARD_ORIGIN << PLOT_LOG_SIZE;
+        let past = (PLOTYARD_ORIGIN + (1 << PLOT_LOG_SIZE)) << PLOT_LOG_SIZE;
+        (Vector2::new(first, first), Vector2::new(past - 1, past - 1))
+    }
+
     /// Whether `player` tracks the sub-level whose plot contains `chunk`.
     /// The entity tracker uses this to show parked entities to Sable clients.
     #[must_use]
@@ -2639,8 +2647,7 @@ impl World {
             return;
         }
 
-        // A plot chunk generates like any other chunk; empty it so the
-        // sub-level carries nothing but the region.
+        // The plot carries nothing but the region.
         for chunk in &chunks {
             self.clear_parked_chunk(*chunk);
         }
@@ -3338,7 +3345,7 @@ impl World {
         }
     }
 
-    /// Tickets every content chunk and waits for it to generate.
+    /// Tickets every content chunk and waits for it to load.
     async fn await_plot_chunks(&self, chunks: &[Vector2<i32>]) -> bool {
         for chunk in chunks {
             ticket_chunk(&self.level, *chunk);
@@ -3347,13 +3354,10 @@ impl World {
         for chunk in chunks {
             while self.level.read_chunk_sync(chunk, |_| ()).is_none() {
                 if Instant::now() >= deadline {
-                    warn!(
-                        "sublevel: plot chunk ({}, {}) did not generate",
-                        chunk.x, chunk.y
-                    );
+                    warn!("sublevel: chunk ({}, {}) did not load", chunk.x, chunk.y);
                     return false;
                 }
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
         true
@@ -3446,28 +3450,18 @@ impl World {
         }
     }
 
-    /// Writes air over an entire freshly generated plot chunk.
-    fn clear_parked_chunk(self: &Arc<Self>, chunk: Vector2<i32>) {
+    /// Empties a plot chunk of what an earlier sub-level left in it. Chunks
+    /// of the plotyard load empty, so this is only what a server restart
+    /// found parked; it goes in one go, drops and block entity contents
+    /// with it.
+    fn clear_parked_chunk(&self, chunk: Vector2<i32>) {
         if !SubLevelManager::is_plot_chunk(chunk) {
             warn!("sublevel: refusing to clear {chunk:?}, it is outside the plotyard");
             return;
         }
-        // A generated plot chunk can contain naturally placed chests; their
-        // contents must not scatter into the plot on the way out.
-        let flags = BlockFlags::SKIP_BLOCK_ADDED_CALLBACK
-            | BlockFlags::UPDATE_KNOWN_SHAPE
-            | BlockFlags::SKIP_DROPS
-            | BlockFlags::SKIP_BLOCK_ENTITY_REPLACED_CALLBACK;
-        for x in 0..16 {
-            for y in self.get_bottom_y()..=self.get_top_y() {
-                for z in 0..16 {
-                    let pos = BlockPos(Vector3::new(chunk.x * 16 + x, y, chunk.y * 16 + z));
-                    if self.get_block_state_id(&pos) != Block::AIR.default_state.id {
-                        self.set_block_state(&pos, Block::AIR.default_state.id, flags);
-                    }
-                }
-            }
-        }
+        self.level
+            .read_chunk_sync(&chunk, |packed| packed.reset_to_void());
+        self.block_entities.remove(&chunk);
     }
 
     /// Melt a sub-level back into the world where it stands, as Simulated's

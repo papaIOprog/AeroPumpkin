@@ -401,6 +401,11 @@ impl World {
             NbtCompound::new()
         };
 
+        // Sub-levels park their blocks in the plotyard, where no terrain is
+        // wanted: its chunks load empty instead of being generated.
+        let (first, last) = sublevel::SubLevelManager::plotyard_chunks();
+        level.set_void_chunks(first, last);
+
         Self {
             uuid: Uuid::new_v4(),
             level,
