@@ -786,7 +786,7 @@ pub(crate) mod tests {
         ("aeronautics:steam_vent", &[&[]]),
         ("aeronautics:levitite", &[&[]]),
         (
-            "simulated:symmetric_sail",
+            "simulated:white_symmetric_sail",
             &[&[("axis", "x")], &[("axis", "y")], &[("axis", "z")]],
         ),
         (

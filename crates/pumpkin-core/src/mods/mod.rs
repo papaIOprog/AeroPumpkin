@@ -9,6 +9,7 @@ pub mod create;
 pub mod glue;
 pub mod packets;
 pub mod profile;
+pub mod sails;
 pub mod simulated;
 
 use std::path::Path;
@@ -91,6 +92,9 @@ pub fn install(config: &ModsConfig) {
 /// switched on; called as the block registry is built.
 pub fn register_blocks(blocks: &mut crate::block::registry::BlockRegistry) {
     simulated::register_blocks(blocks);
+    blocks.register(sails::SailBlock);
+    blocks.register(sails::SailFrameBlock);
+    blocks.register(sails::SymmetricSailBlock);
 }
 
 /// Registers the behaviours of the mods' items whose ports are switched on;

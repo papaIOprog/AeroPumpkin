@@ -490,7 +490,7 @@ mod tests {
     fn sails_take_the_air_off_their_broad_sides() -> Result<(), &'static str> {
         // A symmetric sail's normal is the positive direction of its axis,
         // and it only drags.
-        let (sail, state) = modded("simulated:symmetric_sail", &[("axis", "z")])?;
+        let (sail, state) = modded("simulated:white_symmetric_sail", &[("axis", "z")])?;
         assert_eq!(
             aerodynamic_kind(sail, state, 0),
             VoxelKind::LiftSurface {

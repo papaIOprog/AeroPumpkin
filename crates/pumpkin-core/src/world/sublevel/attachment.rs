@@ -472,7 +472,7 @@ mod tests {
     fn sails_hold_what_lies_beside_them_and_springs_what_they_are_fastened_to()
     -> Result<(), &'static str> {
         crate::mods::profile::tests::install_test_profile();
-        let sail = Block::from_registry_key("simulated:symmetric_sail").ok_or("sail")?;
+        let sail = Block::from_registry_key("simulated:white_symmetric_sail").ok_or("sail")?;
         let sail = mods::state_with(sail, &[("axis", "y")]).ok_or("sail state")?;
         let stone = state(&Block::STONE);
         // A sail with an upright normal takes the block beside it, not the
@@ -480,14 +480,14 @@ mod tests {
         assert!(takes(
             &Block::STONE,
             stone,
-            Block::from_registry_key("simulated:symmetric_sail").ok_or("sail")?,
+            Block::from_registry_key("simulated:white_symmetric_sail").ok_or("sail")?,
             sail,
             Vector3::new(1, 0, 0)
         ));
         assert!(!takes(
             &Block::STONE,
             stone,
-            Block::from_registry_key("simulated:symmetric_sail").ok_or("sail")?,
+            Block::from_registry_key("simulated:white_symmetric_sail").ok_or("sail")?,
             sail,
             Vector3::new(0, 1, 0)
         ));
