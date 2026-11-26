@@ -800,6 +800,14 @@ pub(crate) mod tests {
                 &[("facing", "down")],
             ],
         ),
+        (
+            "simulated:iron_handle",
+            &[
+                &[("facing", "north"), ("axis_along_first", "false")],
+                &[("facing", "west"), ("axis_along_first", "true")],
+                &[("facing", "down"), ("axis_along_first", "false")],
+            ],
+        ),
     ];
 
     /// A dump of one modded block, item and entity type over a stub of
@@ -870,6 +878,7 @@ pub(crate) mod tests {
                 ("sable:bouncy", 0),
                 ("aeronautics:levitite", 3),
                 ("simulated:symmetric_sails", 4),
+                ("simulated:handles", 6),
             ] {
                 block_tags.push(serde_json::json!([tag, [block + 1 + of]]));
             }
@@ -1077,6 +1086,7 @@ pub(crate) mod tests {
                 "minecraft:mineable/pickaxe",
                 "sable:bouncy",
                 "sable:super_light",
+                "simulated:handles",
                 "simulated:symmetric_sails",
                 "test:sticky"
             ]

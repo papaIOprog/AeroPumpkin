@@ -109,6 +109,11 @@ pub(crate) fn attached_towards(
                 BlockDirection::Down
             };
     }
+    // A handle is fastened to the block it points away from, as its
+    // `BlockMovementChecks` has it.
+    if crate::mods::simulated::handle::is_handle(block) {
+        return crate::mods::simulated::handle::facing(state.id) == Some(direction.opposite());
+    }
     // Simulated's symmetric sails hold onto what lies beside them, across
     // their normal, and a spring onto the block it is fastened to.
     if mods::block_has_tag(block, "simulated:symmetric_sails") {
@@ -292,6 +297,12 @@ pub(crate) fn takes(
 ) -> bool {
     if let Some(direction) = face_direction(offset) {
         if attached_towards(to, to_state, direction.opposite()) {
+            return true;
+        }
+        // What a handle is fastened to goes with it.
+        if crate::mods::simulated::handle::is_handle(from)
+            && crate::mods::simulated::handle::facing(from_state.id) == Some(direction.opposite())
+        {
             return true;
         }
         // Aeronautics' `AeroBlockMovementChecks`: envelopes hold each other.
@@ -479,6 +490,41 @@ mod tests {
             Block::from_registry_key("simulated:symmetric_sail").ok_or("sail")?,
             sail,
             Vector3::new(0, 1, 0)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_handle_takes_the_block_it_is_fastened_to_and_that_block_takes_it()
+    -> Result<(), &'static str> {
+        crate::mods::profile::tests::install_test_profile();
+        let iron = Block::from_registry_key("simulated:iron_handle").ok_or("handle")?;
+        let down = mods::state_with(iron, &[("facing", "down"), ("axis_along_first", "false")])
+            .ok_or("state")?;
+        let stone = state(&Block::STONE);
+        // The handle points down, out of the stone above it: the stone
+        // takes it, and it takes the stone.
+        assert!(takes(
+            &Block::STONE,
+            stone,
+            iron,
+            down,
+            Vector3::new(0, -1, 0)
+        ));
+        assert!(takes(
+            iron,
+            down,
+            &Block::STONE,
+            stone,
+            Vector3::new(0, 1, 0)
+        ));
+        // A block beside the support is nothing to it.
+        assert!(!takes(
+            &Block::STONE,
+            stone,
+            iron,
+            down,
+            Vector3::new(1, 0, 0)
         ));
         Ok(())
     }

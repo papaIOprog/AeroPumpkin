@@ -1,9 +1,10 @@
 //! Pumpkin's port of Simulated, the physics half of Create: Aeronautics.
 //!
-//! Its physics assembler, its two ways of holding blocks together, and its
-//! creative physics staff. Simulated's other content is what the profile
-//! makes of it: real to the clients, inert here.
+//! Its physics assembler, its two ways of holding blocks together, its
+//! handles and its creative physics staff. Simulated's other content is
+//! what the profile makes of it: real to the clients, inert here.
 
+pub mod handle;
 pub mod honey_glue;
 pub mod physics_assembler;
 pub mod physics_staff;
@@ -33,10 +34,15 @@ pub const HONEY_GLUE_SPAWN: &str = "simulated:honey_glue_spawn";
 pub const HONEY_GLUE_CHANGE_BOUNDS: &str = "simulated:honey_glue_change_bounds";
 /// `S:HoneyGlueSyncBoundsPacket`: where a honey glue is now.
 pub const HONEY_GLUE_SYNC: &str = "simulated:honey_glue_sync";
+/// `S:UpdatePlayerUsingHandlePacket`: a player holds a handle, or lets it go.
+pub const UPDATE_PLAYER_HANDLE: &str = "simulated:update_player_handle";
+/// `S:ClientboundPlayersHoldingHandlePacket`: who holds a handle.
+pub const PLAYERS_HOLDING_HANDLES: &str = "simulated:players_holding_handles";
 
 /// Registers the behaviours of Simulated's blocks.
 pub fn register_blocks(blocks: &mut crate::block::registry::BlockRegistry) {
     blocks.register(physics_assembler::PhysicsAssemblerBlock);
+    blocks.register(handle::HandleBlock);
 }
 
 /// Registers the behaviours of Simulated's items.

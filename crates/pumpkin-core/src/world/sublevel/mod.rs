@@ -28,7 +28,7 @@ use pumpkin_protocol::java::client::play::{
 use pumpkin_protocol::ser::NetworkWriteExt;
 use pumpkin_protocol::{ClientPacket, MultiVersionJavaPacket};
 use pumpkin_sublevel::{
-    AeroInfo, Air, Alignment, BodySnapshot, Content, Impact, ImpactTarget, Step,
+    AeroInfo, Air, Alignment, BodySnapshot, Content, Impact, ImpactTarget, Pull, Step,
     SurroundingsRequest, Voxel,
 };
 use pumpkin_util::math::vector2::Vector2;
@@ -65,7 +65,7 @@ use crate::mods::simulated::physics_assembler;
 use crate::mods::simulated::physics_staff::{self, Action};
 use crate::mods::simulated::{
     ASSEMBLER_FAILED, FLICK_ASSEMBLER_LEVER, PHYSICS_STAFF_BEAM, PHYSICS_STAFF_DRAG_SESSIONS,
-    PHYSICS_STAFF_LOCKS,
+    PHYSICS_STAFF_LOCKS, PLAYERS_HOLDING_HANDLES, handle,
 };
 
 /// Each plot is `1 << PLOT_LOG_SIZE` chunks on a side, as in Sable.
@@ -607,7 +607,28 @@ pub struct SubLevelManager {
     punch_cooldowns: FxHashMap<Uuid, i32>,
     /// Simulated's `PhysicsStaffServerHandler.draggingSessions`, by player.
     drags: FxHashMap<Uuid, Drag>,
+    /// Simulated's `HandleBlockEntity.players`, for every handle a player
+    /// holds, by its parked block: who holds it, and from how far off
+    /// (`scrollDistance`, below zero for no pull).
+    handles: FxHashMap<BlockPos, Vec<(Uuid, f32)>>,
+    /// Simulated's `ServerHandleHoldingHandler`: who holds a handle, and
+    /// for how many ticks more that counts without word from them.
+    holding: FxHashMap<Uuid, i32>,
     staff_news: StaffNews,
+}
+
+/// How many ticks a player's word that they hold a handle counts for:
+/// `ServerHandleHoldingHandler`.
+const HOLDING_TICKS: i32 = 20;
+
+/// A handle one or more players hold.
+pub struct HeldHandle {
+    /// Where the handle is parked, in the world or in a sub-level's plot.
+    pub parked: BlockPos,
+    /// The sub-level whose parked content holds it.
+    pub sublevel: Option<u32>,
+    /// Who holds it, and from how far off, below zero for no pull.
+    pub holders: Vec<(Uuid, f32)>,
 }
 
 impl Default for SubLevelManager {
@@ -640,8 +661,86 @@ impl SubLevelManager {
             riders: FxHashMap::default(),
             punch_cooldowns: FxHashMap::default(),
             drags: FxHashMap::default(),
+            handles: FxHashMap::default(),
+            holding: FxHashMap::default(),
             staff_news: StaffNews::default(),
         }
+    }
+
+    /// Simulated's `HandleBlockEntity.startGrabbingServer`: `player` holds
+    /// the handle at `handle` from `range` blocks off, below zero for no
+    /// pull. Whether they did not hold one before.
+    pub fn hold_handle(&mut self, player: Uuid, handle: &BlockPos, range: f32) -> bool {
+        let holders = self.handles.entry(*handle).or_default();
+        match holders.iter_mut().find(|(who, _)| *who == player) {
+            Some((_, scroll)) => *scroll = range,
+            None => holders.push((player, range)),
+        }
+        self.holding
+            .insert(player, HOLDING_TICKS)
+            .is_none_or(|left| left <= 0)
+    }
+
+    /// `stopGrabbingServer` and `ServerHandleHoldingHandler.stopHolding`.
+    /// Whether the players holding a handle are not who they were.
+    pub fn release_handle(&mut self, player: Uuid, handle: &BlockPos) -> bool {
+        if let Some(holders) = self.handles.get_mut(handle) {
+            holders.retain(|(who, _)| *who != player);
+            if holders.is_empty() {
+                self.handles.remove(handle);
+            }
+        }
+        self.holding.remove(&player).is_some()
+    }
+
+    /// A handle that is gone: its holders are forgotten with it.
+    pub fn forget_handle(&mut self, handle: &BlockPos) {
+        self.handles.remove(handle);
+    }
+
+    /// Whether a player holds the handle at `handle`.
+    #[must_use]
+    pub fn handle_held(&self, handle: &BlockPos) -> bool {
+        self.handles.contains_key(handle)
+    }
+
+    /// Every handle a player holds.
+    pub fn handle_holders(&self) -> Vec<HeldHandle> {
+        self.handles
+            .iter()
+            .map(|(parked, holders)| HeldHandle {
+                parked: *parked,
+                sublevel: self.sublevel_at(parked),
+                holders: holders.clone(),
+            })
+            .collect()
+    }
+
+    /// Simulated's `ServerHandleHoldingHandler.tick`: who is left holding
+    /// a handle, and whether the players have not heard that yet.
+    pub fn holding_tick(&mut self) -> (Vec<Uuid>, bool) {
+        /// How often the players hear who holds a handle.
+        const SYNC_EVERY: i32 = 10;
+
+        let before = self.holding.len();
+        self.holding.retain(|_, left| {
+            *left -= 1;
+            *left > 0
+        });
+        let sync = self.tick % SYNC_EVERY == 0 || self.holding.len() != before;
+        (self.holding_players(), sync)
+    }
+
+    /// Who holds a handle: `ServerHandleHoldingHandler.holdingPlayers`.
+    #[must_use]
+    pub fn holding_players(&self) -> Vec<Uuid> {
+        self.holding.keys().copied().collect()
+    }
+
+    /// Whether anyone holds a handle.
+    #[must_use]
+    pub fn has_handles(&self) -> bool {
+        !self.handles.is_empty()
     }
 
     /// Allocates a plot and a body for a `width` by `width` stone slab whose
@@ -897,6 +996,12 @@ impl SubLevelManager {
         Some((disassembly.ticks, disassembly.ready_ticks))
     }
 
+    /// Sets the pulls on the sub-levels for this tick: what
+    /// [`pumpkin_sublevel::SubLevelSystem::set_pulls`] takes.
+    pub fn set_pulls(&mut self, pulls: &[Pull]) {
+        self.physics.set_pulls(pulls);
+    }
+
     /// Steers sub-level `id` to `alignment` until told otherwise.
     pub fn set_alignment(&mut self, id: u32, alignment: Option<Alignment>) -> bool {
         self.physics.set_alignment(id, alignment)
@@ -971,11 +1076,15 @@ impl SubLevelManager {
         let Some(index) = self.levels.iter().position(|level| level.id == id) else {
             return false;
         };
+        let plot = self.levels[index].plot;
         self.levels.swap_remove(index);
-        // A physics staff lock goes with its sub-level.
+        // A physics staff lock goes with its sub-level, and so do the
+        // handles parked in it.
         if self.physics.is_locked(id) {
             self.staff_news.locks = true;
         }
+        self.handles
+            .retain(|handle, _| Self::plot_of_chunk(handle.chunk_position()) != Some(plot));
         self.physics.remove(id)
     }
 
@@ -2204,6 +2313,144 @@ impl World {
         self.lock_sublevels().sync(self, &step.bodies);
         self.step_disassemblies();
         self.tell_staff_news(news);
+    }
+
+    /// Simulated's `UpdatePlayerUsingHandlePacket`, once the handle at
+    /// `handle` is the player's to hold: they hold it from `range` blocks
+    /// off, below zero for no pull.
+    pub fn handle_held(&self, player: &Arc<Player>, handle: &BlockPos, range: f32) {
+        let (changed, holding) = {
+            let mut manager = self.lock_sublevels();
+            let changed = manager.hold_handle(player.gameprofile.id, handle, range);
+            (changed, manager.holding_players())
+        };
+        if changed {
+            self.tell_who_holds_handles(&holding);
+        }
+    }
+
+    /// `stopGrabbingServer` and `ServerHandleHoldingHandler.stopHolding`.
+    pub fn handle_let_go(&self, player: &Arc<Player>, handle: &BlockPos) {
+        let (changed, holding) = {
+            let mut manager = self.lock_sublevels();
+            let changed = manager.release_handle(player.gameprofile.id, handle);
+            (changed, manager.holding_players())
+        };
+        if changed {
+            self.tell_who_holds_handles(&holding);
+        }
+    }
+
+    /// Whether a player holds the handle at `handle`: Simulated's
+    /// `HandleBlockEntity.hasPlayer`.
+    #[must_use]
+    pub fn handles_held_at(&self, handle: &BlockPos) -> bool {
+        self.lock_sublevels().handle_held(handle)
+    }
+
+    /// `S:ClientboundPlayersHoldingHandlePacket`: who holds a handle.
+    fn tell_who_holds_handles(&self, holding: &[Uuid]) {
+        let data = handle::holding(holding);
+        for player in self.players.load().iter() {
+            send_mod_payload(player, PLAYERS_HOLDING_HANDLES, &data);
+        }
+    }
+
+    /// One tick of the handles: Simulated's `HandleBlockEntity.checkPlayers`
+    /// and `physicsTick` for every handle a player holds, and
+    /// `ServerHandleHoldingHandler.tick`.
+    pub(crate) fn tick_handles(self: &Arc<Self>) {
+        if !self.has_handles.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let players = self.players.load();
+        let mut pulls = Vec::new();
+        let mut climbing = Vec::new();
+        let mut let_go = Vec::new();
+        let mut vanished = Vec::new();
+        for HeldHandle {
+            parked,
+            sublevel,
+            holders,
+        } in self.lock_sublevels().handle_holders()
+        {
+            let (block, state) = self.get_block_and_state(&parked);
+            if !handle::is_handle(block) {
+                vanished.push(parked);
+                continue;
+            }
+            for (who, scroll) in holders {
+                let Some(player) = find_player(&players, who) else {
+                    let_go.push((who, parked));
+                    continue;
+                };
+                if !player.get_entity().is_alive() {
+                    let_go.push((who, parked));
+                } else if scroll < 0.0 {
+                    // The player climbs the handle themselves; the fall is
+                    // forgotten, and nothing is pulled.
+                    climbing.push(who);
+                } else if let Some(sublevel) = sublevel
+                    && let Some(pull) =
+                        self.handle_pull(sublevel, &parked, state.id, player, scroll)
+                {
+                    pulls.push(pull);
+                }
+            }
+        }
+        let mut manager = self.lock_sublevels();
+        for parked in vanished {
+            manager.forget_handle(&parked);
+        }
+        for (who, parked) in let_go {
+            manager.release_handle(who, &parked);
+        }
+        manager.set_pulls(&pulls);
+        let (holding, sync) = manager.holding_tick();
+        let held = manager.has_handles();
+        drop(manager);
+        self.has_handles
+            .store(held, std::sync::atomic::Ordering::Relaxed);
+        for who in climbing {
+            if let Some(player) = find_player(&players, who) {
+                player.living_entity.fall_distance.store(0.0);
+            }
+        }
+        if sync {
+            self.tell_who_holds_handles(&holding);
+        }
+    }
+
+    /// Simulated's `HandleConstraint.physicsTick`: the pull `player` gives
+    /// sub-level `sublevel` through the handle parked at `parked`, or
+    /// `None` when they stand on that sub-level or are in no state to pull.
+    fn handle_pull(
+        &self,
+        sublevel: u32,
+        parked: &BlockPos,
+        state: BlockStateId,
+        player: &Arc<Player>,
+        scroll: f32,
+    ) -> Option<Pull> {
+        let (shown, pivot, standing) = {
+            let manager = self.lock_sublevels();
+            let centre = handle::grab_centre(*parked, state);
+            (
+                manager.parked_to_world(centre)?,
+                manager.pivot_of(sublevel)?,
+                manager.ridden_by(player.gameprofile.id),
+            )
+        };
+        if standing == Some(sublevel) {
+            return None;
+        }
+        let goal = handle::pull_goal(player, scroll, shown)?;
+        let held = handle::grab_centre(*parked, state) - pivot;
+        Some(Pull {
+            sublevel,
+            anchor: [held.x as f32, held.y as f32, held.z as f32],
+            goal: [goal.x as f32, goal.y as f32, goal.z as f32],
+        })
     }
 
     /// Tells every player what changed about the physics staff: Simulated's

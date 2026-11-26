@@ -285,6 +285,8 @@ pub struct World {
     /// Whether any sub-level exists, refreshed each tick, so that block
     /// sets can skip the manager while none do.
     has_sublevels: std::sync::atomic::AtomicBool,
+    /// Whether anyone holds a handle, refreshed each tick.
+    has_handles: std::sync::atomic::AtomicBool,
     /// End Dragon fight manager (only present in `THE_END` dimension).
     pub dragon_fight: Option<std::sync::Mutex<dragon_fight::DragonFight>>,
     pub spawn_state: ArcSwap<SpawnState>,
@@ -434,6 +436,7 @@ impl World {
             raids: std::sync::Mutex::new(raid::Raids::default()),
             sublevels: std::sync::Mutex::new(sublevel::SubLevelManager::with_air(sublevel_air)),
             has_sublevels: std::sync::atomic::AtomicBool::new(false),
+            has_handles: std::sync::atomic::AtomicBool::new(false),
             dragon_fight,
             spawn_state: ArcSwap::new(Arc::new(SpawnState::empty())),
             active_chunks: RwLock::new(FxHashSet::default()),
@@ -1650,8 +1653,10 @@ impl World {
             });
         let entity_elapsed = t_entities.elapsed();
 
-        // Sub-levels carry their riders here, before the tracker broadcasts,
-        // so clients receive the post-carry positions in the same tick.
+        // The handles' pulls come first, then sub-levels carry their riders
+        // here, before the tracker broadcasts, so clients receive the
+        // post-carry positions in the same tick.
+        self.tick_handles();
         self.tick_sublevels();
 
         self.entity_tracker.update_all(self);
