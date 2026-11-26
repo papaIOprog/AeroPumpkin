@@ -302,6 +302,18 @@ struct Disassembly {
     ready_ticks: u32,
     /// Where the assembler that melts it stands, for the sound it makes.
     stop_sound: Option<Vector3<f64>>,
+    /// The chunks held loaded for the test against melting into mid-air,
+    /// until the sub-level is placed.
+    held: Vec<Vector2<i32>>,
+}
+
+/// What asking to disassemble a sub-level came to.
+pub enum DisassemblyStart {
+    /// The sub-level is turning to where it can melt into the world.
+    Started,
+    /// The test against melting into mid-air reads chunks that are not
+    /// loaded yet: these, now asked for. Nothing has happened.
+    Waiting(Vec<Vector2<i32>>),
 }
 
 /// A player dragging a sub-level with Simulated's physics staff: its
@@ -815,13 +827,19 @@ impl SubLevelManager {
 
     /// Starts driving sub-level `id` to the alignment its disassembly
     /// waits for. The sound of its stopping, `stop_sound`, plays where it
-    /// is placed.
-    pub fn start_disassembly(&mut self, id: u32, stop_sound: Option<Vector3<f64>>) {
+    /// is placed; `held` are the chunks the disassembly keeps loaded.
+    pub fn start_disassembly(
+        &mut self,
+        id: u32,
+        stop_sound: Option<Vector3<f64>>,
+        held: Vec<Vector2<i32>>,
+    ) {
         if let Some(level) = self.levels.iter_mut().find(|level| level.id == id) {
             level.disassembling = Some(Disassembly {
                 ticks: 0,
                 ready_ticks: 0,
                 stop_sound,
+                held,
             });
         }
     }
@@ -837,11 +855,17 @@ impl SubLevelManager {
     }
 
     /// Stops a disassembly under way and the steering that went with it.
-    pub fn cancel_disassembly(&mut self, id: u32) {
-        if let Some(level) = self.levels.iter_mut().find(|level| level.id == id) {
-            level.disassembling = None;
-        }
+    /// The chunks it kept loaded, for the caller to let go.
+    pub fn cancel_disassembly(&mut self, id: u32) -> Vec<Vector2<i32>> {
+        let held = if let Some(level) = self.levels.iter_mut().find(|level| level.id == id)
+            && let Some(disassembly) = level.disassembling.take()
+        {
+            disassembly.held
+        } else {
+            Vec::new()
+        };
         self.physics.set_alignment(id, None);
+        held
     }
 
     /// The sub-levels being disassembled.
@@ -1784,6 +1808,17 @@ impl SubLevelManager {
                 unticket_chunk(&world.level, chunk);
             }
         }
+        // Its plot, and the chunks a disassembly under way kept: nobody
+        // needs them loaded for it any more.
+        if let Some(level) = self.levels.iter().find(|level| level.id == id) {
+            for chunk in level
+                .chunks
+                .iter()
+                .chain(level.disassembling.iter().flat_map(|held| &held.held))
+            {
+                unticket_chunk(&world.level, *chunk);
+            }
+        }
         self.remove(id)
     }
 }
@@ -1836,6 +1871,20 @@ fn region_chunks(min: Vector3<i32>, max: Vector3<i32>) -> Vec<Vector2<i32>> {
     x_chunks
         .flat_map(|x| z_chunks.clone().map(move |z| Vector2::new(x, z)))
         .collect()
+}
+
+/// How far around a sub-level, in sections, the test against melting it
+/// into mid-air looks for ground.
+const GROUND_MARGIN: i32 = 1;
+
+/// Every chunk within that margin of the world region whose corners `region`
+/// gives.
+fn ground_chunks([[x0, _, z0], [x1, _, z1]]: [[f64; 3]; 2]) -> impl Iterator<Item = Vector2<i32>> {
+    let low = |value: f64| (value.floor() as i32 - GROUND_MARGIN * 16).max(-30_000_000);
+    let high = |value: f64| (value.ceil() as i32 + GROUND_MARGIN * 16).min(30_000_000);
+    let x_chunks = low(x0) >> 4..=high(x1) >> 4;
+    let z_chunks = low(z0) >> 4..=high(z1) >> 4;
+    x_chunks.flat_map(move |x| z_chunks.clone().map(move |z| Vector2::new(x, z)))
 }
 
 fn find_player(players: &[Arc<Player>], uuid: Uuid) -> Option<&Arc<Player>> {
@@ -2071,7 +2120,7 @@ impl World {
             };
             (chunk, pivot)
         };
-        if !self.await_plot_chunks(&[chunk]).await {
+        if !self.await_chunks(&[chunk]).await {
             return;
         }
 
@@ -2296,10 +2345,16 @@ impl World {
             |id| self.assembler_disassemble(id, position),
         );
         if failed {
-            let mut failed = Vec::with_capacity(8);
-            let _ = write_block_pos(&mut failed, *position);
-            self.tell_assembler(position, ASSEMBLER_FAILED, &failed);
+            self.tell_assembler_failed(position);
         }
+    }
+
+    /// Tells the players watching the assembler at `position` that what was
+    /// asked of it could not be done: Simulated's `assemblyFailed`.
+    fn tell_assembler_failed(&self, position: &BlockPos) {
+        let mut failed = Vec::with_capacity(8);
+        let _ = write_block_pos(&mut failed, *position);
+        self.tell_assembler(position, ASSEMBLER_FAILED, &failed);
     }
 
     /// Tells the players watching the assembler at `position` `data` on
@@ -2352,7 +2407,24 @@ impl World {
         let stop_sound = self
             .lock_sublevels()
             .parked_to_world(position.to_centered_f64());
-        self.disassemble_sublevel(id, stop_sound).is_err()
+        match self.disassemble_sublevel(id, stop_sound) {
+            Ok(DisassemblyStart::Started) => false,
+            Ok(DisassemblyStart::Waiting(held)) => {
+                let world = Arc::clone(self);
+                let at = *position;
+                // The lever stays held until the chunks are in.
+                self.disassemble_after_loading(id, stop_sound, held, move || {
+                    world.tell_assembler_failed(&at);
+                });
+                false
+            }
+            Err(error) => {
+                debug!(
+                    "sublevel: the assembler at {position:?} could not disassemble sublevel {id}: {error}"
+                );
+                true
+            }
+        }
     }
 
     /// Called for every block set inside the plotyard, and for every block
@@ -2642,7 +2714,7 @@ impl World {
         // cleared: only the plot chunks carry parked content.
         let mut held = chunks.clone();
         held.extend(region_chunks(min, max));
-        if !self.await_plot_chunks(&held).await {
+        if !self.await_chunks(&held).await {
             self.lock_sublevels().end_assembly(id);
             return;
         }
@@ -2680,6 +2752,11 @@ impl World {
         self.park_entities_in_region(min, max, anchor, center, include.as_ref());
         self.park_glue(&glue, center.to_f64() - anchor.to_f64());
         self.clear_region(min, max, include.as_ref());
+        // The region's chunks were only held for the copy; the plot's stay
+        // with the sub-level.
+        for chunk in region_chunks(min, max) {
+            unticket_chunk(&self.level, chunk);
+        }
         self.lock_sublevels().end_assembly(id);
 
         // Sable's bounds are tight to the content; empty margins of the
@@ -2836,7 +2913,7 @@ impl World {
         let Some(chunks) = self.lock_sublevels().chunks_of(new) else {
             return;
         };
-        if !self.await_plot_chunks(&chunks).await {
+        if !self.await_chunks(&chunks).await {
             warn!("sublevel {new}: its plot chunks never loaded; the piece stays with {old}");
             self.lock_sublevels().remove(new);
             self.lock_sublevels().end_split(old);
@@ -3270,6 +3347,36 @@ impl World {
         }
     }
 
+    /// Brings the entities parked in a sub-level's `bounds` back into the
+    /// world, moved the way the blocks go. They keep fractional positions.
+    fn unpark_entities(&self, bounds: [i32; 6], pivot: [f64; 3], pose: [f64; 3], turns: u8) {
+        let parked_min = Vector3::new(bounds[0], bounds[1], bounds[2]);
+        let parked_max = Vector3::new(bounds[3], bounds[4], bounds[5]);
+        for entity in self.entities.load().iter() {
+            let entity = entity.get_entity();
+            let pos = entity.pos.load();
+            let block = pos.floor_to_i32();
+            if block.x < parked_min.x
+                || block.x > parked_max.x
+                || block.y < parked_min.y
+                || block.y > parked_max.y
+                || block.z < parked_min.z
+                || block.z > parked_max.z
+            {
+                continue;
+            }
+            let place = placed(
+                [pos.x - pivot[0], pos.y - pivot[1], pos.z - pivot[2]],
+                turns,
+            );
+            entity.set_pos(Vector3::new(
+                pose[0] + place[0],
+                pose[1] + place[1],
+                pose[2] + place[2],
+            ));
+        }
+    }
+
     /// Moves the glue entities `glue` into a sub-level's plot by the offset
     /// its blocks moved: Simulated's `assembleFromSingleBlock`.
     fn park_glue(self: &Arc<Self>, glue: &[i32], offset: Vector3<f64>) {
@@ -3345,11 +3452,16 @@ impl World {
         }
     }
 
-    /// Tickets every content chunk and waits for it to load.
-    async fn await_plot_chunks(&self, chunks: &[Vector2<i32>]) -> bool {
+    /// Tickets every chunk and waits for it to load.
+    async fn await_chunks(&self, chunks: &[Vector2<i32>]) -> bool {
         for chunk in chunks {
             ticket_chunk(&self.level, *chunk);
         }
+        self.wait_for_chunks(chunks).await
+    }
+
+    /// Waits for chunks that are ticketed already. Whether they all came.
+    async fn wait_for_chunks(&self, chunks: &[Vector2<i32>]) -> bool {
         let deadline = Instant::now() + PLOT_CHUNK_TIMEOUT;
         for chunk in chunks {
             while self.level.read_chunk_sync(chunk, |_| ()).is_none() {
@@ -3409,7 +3521,7 @@ impl World {
         // Recorded before the wait, so a sub-level removed meanwhile still
         // lets go of them.
         self.lock_sublevels().set_surroundings_chunks(id, chunks);
-        if !self.await_plot_chunks(&held).await {
+        if !self.await_chunks(&held).await {
             self.lock_sublevels().cancel_surroundings(id);
             return;
         }
@@ -3474,8 +3586,53 @@ impl World {
         self: &Arc<Self>,
         id: u32,
         stop_sound: Option<Vector3<f64>>,
-    ) -> Result<u32, String> {
-        self.check_disassembly(id)?;
+    ) -> Result<DisassemblyStart, String> {
+        let region = self.check_disassembly(id)?;
+        let (held, loading) = self.hold_ground(region);
+        if loading {
+            return Ok(DisassemblyStart::Waiting(held));
+        }
+        let started = self
+            .may_disassemble(id)
+            .and_then(|()| self.begin_disassembly(id, stop_sound, held.clone()));
+        if started.is_err() {
+            self.let_chunks_go(&held);
+        }
+        started.map(|()| DisassemblyStart::Started)
+    }
+
+    /// Carries a disassembly on once the chunks its ground test waited for
+    /// are in, as [`DisassemblyStart::Waiting`] hands them over. They are
+    /// let go when it cannot start after all, and `on_failed` hears of it.
+    pub(crate) fn disassemble_after_loading(
+        self: &Arc<Self>,
+        id: u32,
+        stop_sound: Option<Vector3<f64>>,
+        held: Vec<Vector2<i32>>,
+        on_failed: impl FnOnce() + Send + 'static,
+    ) {
+        let world = Arc::clone(self);
+        tokio::spawn(async move {
+            let started = world.wait_for_chunks(&held).await
+                && world.may_disassemble(id).is_ok()
+                && world
+                    .begin_disassembly(id, stop_sound, held.clone())
+                    .is_ok();
+            if !started {
+                world.let_chunks_go(&held);
+                on_failed();
+            }
+        });
+    }
+
+    /// Turns sub-level `id` to where it can melt into the world. The
+    /// chunks `held` stay loaded for it until it is placed.
+    fn begin_disassembly(
+        self: &Arc<Self>,
+        id: u32,
+        stop_sound: Option<Vector3<f64>>,
+        held: Vec<Vector2<i32>>,
+    ) -> Result<(), String> {
         let Some(pose) = self.lock_sublevels().pose_of(id) else {
             return Err(format!("No sub-level {id}"));
         };
@@ -3489,7 +3646,7 @@ impl World {
                 pivot_place([offset.x, offset.y, offset.z], quarter.turns)
             });
         let mut manager = self.lock_sublevels();
-        manager.start_disassembly(id, stop_sound);
+        manager.start_disassembly(id, stop_sound, held);
         manager.set_alignment(
             id,
             Some(Alignment {
@@ -3497,11 +3654,41 @@ impl World {
                 offset,
             }),
         );
-        Ok(id)
+        Ok(())
     }
 
-    /// Whether a sub-level may be disassembled where it is.
-    fn check_disassembly(&self, id: u32) -> Result<(), String> {
+    /// Whether a sub-level may be disassembled where it stands.
+    fn may_disassemble(&self, id: u32) -> Result<(), String> {
+        let region = self.check_disassembly(id)?;
+        if !self.ground_near(region) {
+            return Err("sub-level is too far from the ground to disassemble".to_string());
+        }
+        Ok(())
+    }
+
+    /// Keeps the chunks the test against melting into mid-air reads loaded,
+    /// as vanilla's `getChunk` loads them, and whether some are not in yet.
+    fn hold_ground(&self, region: [[f64; 3]; 2]) -> (Vec<Vector2<i32>>, bool) {
+        let mut loading = false;
+        let chunks = ground_chunks(region).collect::<Vec<_>>();
+        for chunk in &chunks {
+            ticket_chunk(&self.level, *chunk);
+            loading |= !self.level.is_chunk_loaded(chunk);
+        }
+        (chunks, loading)
+    }
+
+    /// Gives up the tickets [`Self::hold_ground`] and [`Self::await_chunks`]
+    /// took on `chunks`.
+    fn let_chunks_go(&self, chunks: &[Vector2<i32>]) {
+        for chunk in chunks {
+            unticket_chunk(&self.level, *chunk);
+        }
+    }
+
+    /// Whether a sub-level may be disassembled where it is: its corners in
+    /// the world once turned to the quarter turn it will be placed at.
+    fn check_disassembly(&self, id: u32) -> Result<[[f64; 3]; 2], String> {
         /// Simulated's `disassemblyMaxVelocity`, and its angular limit.
         const MAX_SPEED: f32 = 5.0;
         const MAX_ANGULAR_SPEED: f32 = std::f32::consts::FRAC_PI_2;
@@ -3562,44 +3749,31 @@ impl World {
                 ],
             });
         }
-        if let Some(world) = world
-            && !self.ground_near(world)
-        {
-            return Err("sub-level is too far from the ground to disassemble".to_string());
-        }
-        Ok(())
+        world.ok_or_else(|| format!("No sub-level {id}"))
     }
 
     /// Whether any block stands within a section's margin of the world
     /// region: Simulated's test against disassembly in mid-air. Read off
     /// the chunk sections, which know whether they hold anything.
     fn ground_near(&self, [[x0, y0, z0], [x1, y1, z1]]: [[f64; 3]; 2]) -> bool {
-        /// The margin around the region, in sections.
-        const MARGIN: i32 = 1;
-
-        let low = |value: f64| (value.floor() as i32 - MARGIN * 16).max(-30_000_000);
-        let high = |value: f64| (value.ceil() as i32 + MARGIN * 16).min(30_000_000);
         let bottom = self.get_bottom_y();
         let top = self.get_top_y();
-        for x in (low(x0) >> 4)..=(high(x1) >> 4) {
-            for z in (low(z0) >> 4)..=(high(z1) >> 4) {
-                let Some(chunk) = self.level.loaded_chunks.get(&Vector2::new(x, z)) else {
-                    continue;
-                };
-                let sections = chunk
-                    .section
-                    .block_sections
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let min_y = chunk.section.min_y;
-                for (index, section) in sections.iter().enumerate() {
-                    let base = min_y + index as i32 * 16;
-                    if base + 16 < low(y0).max(bottom) || base > high(y1).min(top) {
-                        continue;
-                    }
-                    if !section.is_empty() {
-                        return true;
-                    }
+        let lowest = (y0.floor() as i32 - GROUND_MARGIN * 16).max(bottom);
+        let highest = (y1.ceil() as i32 + GROUND_MARGIN * 16).min(top);
+        for chunk in ground_chunks([[x0, y0, z0], [x1, y1, z1]]) {
+            let Some(packed) = self.level.loaded_chunks.get(&chunk) else {
+                continue;
+            };
+            let sections = packed
+                .section
+                .block_sections
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let min_y = packed.section.min_y;
+            for (index, section) in sections.iter().enumerate() {
+                let base = min_y + index as i32 * 16;
+                if base + 16 >= lowest && base <= highest && !section.is_empty() {
+                    return true;
                 }
             }
         }
@@ -3623,7 +3797,8 @@ impl World {
             };
             if ticks > MAX_TICKS {
                 warn!("sublevel {id}: could not align to disassemble");
-                self.lock_sublevels().cancel_disassembly(id);
+                let held = self.lock_sublevels().cancel_disassembly(id);
+                self.let_chunks_go(&held);
             } else if ready > READY_TICKS {
                 self.place_into_world(id);
             }
@@ -3633,9 +3808,11 @@ impl World {
     /// Ends a sub-level's alignment and melts it back into the world.
     fn place_into_world(self: &Arc<Self>, id: u32) {
         let stop_sound = self.lock_sublevels().stop_sound_of(id);
-        self.lock_sublevels().cancel_disassembly(id);
-        if let Err(error) = self.check_disassembly(id) {
+        // The chunks stay with the copy, which writes into them.
+        let held = self.lock_sublevels().cancel_disassembly(id);
+        if let Err(error) = self.may_disassemble(id) {
             warn!("sublevel {id}: {error}");
+            self.let_chunks_go(&held);
             return;
         }
         if let Some(at) = stop_sound {
@@ -3651,38 +3828,48 @@ impl World {
             );
         }
         let Some(chunks) = self.lock_sublevels().chunks_of(id) else {
+            self.let_chunks_go(&held);
             return;
         };
         let world = Arc::clone(self);
-        tokio::spawn(async move { world.copy_plot_into_region(id, chunks).await });
+        tokio::spawn(async move { world.copy_plot_into_region(id, chunks, held).await });
     }
 
-    async fn copy_plot_into_region(self: Arc<Self>, id: u32, chunks: Vec<Vector2<i32>>) {
+    async fn copy_plot_into_region(
+        self: Arc<Self>,
+        id: u32,
+        chunks: Vec<Vector2<i32>>,
+        target: Vec<Vector2<i32>>,
+    ) {
         // Hold the target world chunks as well: without a player nearby the
         // server unloads them, and the write-back would land nowhere.
-        if !self.await_plot_chunks(&chunks).await {
+        let mut held = chunks.clone();
+        held.extend(target.iter().copied());
+        if !self.await_chunks(&held).await {
+            self.let_chunks_go(&target);
             return;
         }
-        let (bounds, pivot, pose, turns, rotation) = {
+        let framed = {
             let manager = self.lock_sublevels();
-            let Some(bounds) = manager.bounds_of(id) else {
-                return;
-            };
-            let Some(pose) = manager.pose_of(id) else {
-                return;
-            };
-            let Some(from_anchor) = manager.from_anchor_of(id) else {
-                return;
-            };
-            let quarter = quarter_turn(pose.orientation);
-            let pivot = [
-                pose.rotation_point[0],
-                pose.rotation_point[1],
-                pose.rotation_point[2],
-            ];
-            let placed = placed_pivot(pose.position, from_anchor, quarter.turns);
-            (bounds, pivot, placed, quarter.turns, quarter.rotation())
+            manager
+                .bounds_of(id)
+                .zip(manager.pose_of(id))
+                .zip(manager.from_anchor_of(id))
+                .map(|((bounds, pose), from_anchor)| (bounds, pose, from_anchor))
         };
+        let Some((bounds, pose, from_anchor)) = framed else {
+            self.let_chunks_go(&target);
+            return;
+        };
+        let quarter = quarter_turn(pose.orientation);
+        let pivot = [
+            pose.rotation_point[0],
+            pose.rotation_point[1],
+            pose.rotation_point[2],
+        ];
+        let pose = placed_pivot(pose.position, from_anchor, quarter.turns);
+        let turns = quarter.turns;
+        let rotation = quarter.rotation();
 
         // A parked block lands where the client renders it: turned by the
         // quarter turn and moved by the pose.
@@ -3718,34 +3905,7 @@ impl World {
         }
 
         self.unpark_glue(bounds, pivot, pose, turns);
-
-        // Entities keep fractional positions; move them the way the blocks
-        // went.
-        let parked_min = Vector3::new(bounds[0], bounds[1], bounds[2]);
-        let parked_max = Vector3::new(bounds[3], bounds[4], bounds[5]);
-        for entity in self.entities.load().iter() {
-            let entity = entity.get_entity();
-            let pos = entity.pos.load();
-            let block = pos.floor_to_i32();
-            if block.x < parked_min.x
-                || block.x > parked_max.x
-                || block.y < parked_min.y
-                || block.y > parked_max.y
-                || block.z < parked_min.z
-                || block.z > parked_max.z
-            {
-                continue;
-            }
-            let place = placed(
-                [pos.x - pivot[0], pos.y - pivot[1], pos.z - pivot[2]],
-                turns,
-            );
-            entity.set_pos(Vector3::new(
-                pose[0] + place[0],
-                pose[1] + place[1],
-                pose[2] + place[2],
-            ));
-        }
+        self.unpark_entities(bounds, pivot, pose, turns);
 
         // Leave the plot empty for whoever reuses it.
         for bx in bounds[0]..=bounds[3] {
@@ -3763,6 +3923,9 @@ impl World {
                 }
             }
         }
+        // The plot's chunks go with the sub-level; the target's were only
+        // held for the copy.
+        self.let_chunks_go(&target);
         if self.remove_sublevel(id) {
             info!("sublevel {id} disassembled");
         }

@@ -5,6 +5,7 @@ use crate::command::context::command_context::CommandContext;
 use crate::command::node::dispatcher::CommandDispatcher;
 use crate::command::node::{CommandExecutor, CommandExecutorResult};
 use crate::world::World;
+use crate::world::sublevel;
 use pumpkin_util::PermissionLvl;
 use pumpkin_util::math::vector3::Vector3;
 use pumpkin_util::permission::{Permission, PermissionDefault, PermissionRegistry};
@@ -227,10 +228,21 @@ impl CommandExecutor for DisassembleExecutor {
         };
 
         match world.disassemble_sublevel(id, None) {
-            Ok(id) => {
+            Ok(sublevel::DisassemblyStart::Started) => {
                 context.source.send_feedback(
                     green(format!(
                         "Sub-level {id} is turning to the nearest quarter turn to melt back into the world"
+                    )),
+                    true,
+                );
+                Ok(1)
+            }
+            Ok(sublevel::DisassemblyStart::Waiting(held)) => {
+                let waiting = held.len();
+                world.disassemble_after_loading(id, None, held, || {});
+                context.source.send_feedback(
+                    green(format!(
+                        "Sub-level {id} waits for {waiting} chunk(s) around it to load, then melts back into the world"
                     )),
                     true,
                 );
