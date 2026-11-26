@@ -641,6 +641,13 @@ pub fn transform_block_properties<K: AsRef<str>, V: AsRef<str>>(
     }
 
     // General property transformation
+    // Simulated's handles (`AbstractDirectionalAxisBlock.rotate`): a quarter
+    // turn swings the bar round, whichever way the handle points.
+    let sim_handle = block_name.starts_with("simulated:") && block_name.ends_with("_handle");
+    let quarter_turn = matches!(
+        rotation,
+        Rotation::Clockwise90 | Rotation::CounterClockwise90
+    );
     properties
         .iter()
         .map(|(k, v)| {
@@ -658,6 +665,9 @@ pub fn transform_block_properties<K: AsRef<str>, V: AsRef<str>>(
                 "facing" => {
                     let mirrored = mirror.mirror_facing(val);
                     rotation.rotate_facing(mirrored).to_string()
+                }
+                "axis_along_first" if sim_handle && quarter_turn => {
+                    if val == "true" { "false" } else { "true" }.to_string()
                 }
                 "orientation" => {
                     let mut parts = val.split('_');
@@ -839,5 +849,42 @@ mod tests {
             .find(|(k, _)| k == "shape")
             .map(|(_, v)| v.as_str());
         assert_eq!(shape, Some("south_west"));
+    }
+
+    #[test]
+    fn a_simulated_handle_swings_its_bar_round_on_a_quarter_turn() {
+        fn value<'a>(turned: &'a [(String, String)], key: &str) -> Option<&'a str> {
+            turned
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        }
+        let handle = [("facing", "north"), ("axis_along_first", "true")];
+        // `AbstractDirectionalAxisBlock.rotate`: a quarter turn flips which
+        // way the bar runs; half a turn leaves it.
+        let turned = transform_block_properties(
+            "simulated:iron_handle",
+            &handle,
+            Rotation::Clockwise90,
+            Mirror::None,
+        );
+        assert_eq!(value(&turned, "facing"), Some("east"));
+        assert_eq!(value(&turned, "axis_along_first"), Some("false"));
+        let turned = transform_block_properties(
+            "simulated:iron_handle",
+            &handle,
+            Rotation::Rotate180,
+            Mirror::None,
+        );
+        assert_eq!(value(&turned, "facing"), Some("south"));
+        assert_eq!(value(&turned, "axis_along_first"), Some("true"));
+        // Another block's property of that name is nobody's to flip.
+        let turned = transform_block_properties(
+            "simulated:spring",
+            &handle,
+            Rotation::Clockwise90,
+            Mirror::None,
+        );
+        assert_eq!(value(&turned, "axis_along_first"), Some("true"));
     }
 }

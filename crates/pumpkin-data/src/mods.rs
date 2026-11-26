@@ -278,14 +278,17 @@ pub fn state_props(state: BlockStateId) -> &'static [(&'static str, &'static str
         .unwrap_or(&[])
 }
 
-/// The state of the modded block `block` whose properties are exactly `props`.
+/// The state of the modded block `block` whose properties are exactly `props`, whatever their order.
 #[cfg(feature = "block")]
 #[must_use]
 pub fn state_with(block: &Block, props: &[(&str, &str)]) -> Option<&'static BlockState> {
-    block
-        .states
-        .iter()
-        .find(|state| state_props(state.id) == props)
+    block.states.iter().find(|state| {
+        let own = state_props(state.id);
+        own.len() == props.len()
+            && props
+                .iter()
+                .all(|(key, value)| own.contains(&(*key, *value)))
+    })
 }
 
 /// The state a modded block's state `id` becomes under `rotation` and
