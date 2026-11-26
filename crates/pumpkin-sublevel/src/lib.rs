@@ -178,21 +178,23 @@ pub struct Alignment {
     pub offset: [f32; 3],
 }
 
-/// How the alignment steers a sub-level: a damped spring of so many radians
-/// per second natural frequency, critically damped. Sable's own gains are
-/// joint-motor regularisation, which a free body cannot take over as they
-/// are; these settle within a few ticks, and a stiffer spring oscillates
-/// under the physics substep.
-const ALIGN_TURN_FREQUENCY: f32 = 20.0;
-const ALIGN_TURN_DAMPING: f32 = 1.0;
-const ALIGN_SHIFT_FREQUENCY: f32 = 20.0;
-const ALIGN_SHIFT_DAMPING: f32 = 1.0;
-/// The most the alignment's springs accelerate a sub-level towards where
-/// it should go, in radians per square second for the turn and blocks per
-/// square second for the shift. Sable's turn motors are stiff and its
-/// linear ones gentle; the damping is left alone, as it only ever calms.
-const MAX_ALIGN_TURN: f32 = 60.0;
-const MAX_ALIGN_SHIFT: f32 = 20.0;
+/// How the alignment turns a sub-level: towards so many radians per second
+/// per radian still to turn, at most `MAX_ALIGN_TURN_SPEED`, and as fast as
+/// `ALIGN_TURN_RESPONSE` closes the gap to that. Sable's own turn motor is
+/// stiffer than a free body can take at this substep: it oscillates. This
+/// settles within a few ticks, and still out-turns the friction of a
+/// sub-level resting on the ground.
+const ALIGN_TURN_SPEED: f32 = 8.0;
+const MAX_ALIGN_TURN_SPEED: f32 = 8.0;
+const ALIGN_TURN_RESPONSE: f32 = 40.0;
+/// How it slides the pivot onto its place in the blocks: Simulated's
+/// `LINEAR_STIFFNESS` and `LINEAR_DAMPING`, per block and per block per
+/// second of error. The most it accelerates a sub-level is kept down to
+/// what the substep takes; it still outdoes gravity and ground friction on
+/// a resting sub-level many times, as Sable's motor does.
+const ALIGN_SHIFT_STIFFNESS: f32 = 1000.0;
+const ALIGN_SHIFT_DAMPING: f32 = 50.0;
+const MAX_ALIGN_SHIFT: f32 = 100.0;
 
 /// What the creative physics staff does to a sub-level, as Simulated's
 /// `PhysicsStaffServerHandler` keeps it.
@@ -1512,8 +1514,7 @@ pub struct AeroInfo {
 }
 
 /// One substep of steering a body to `alignment`: turned to the
-/// orientation and brought onto block centres, each with its own damped
-/// spring.
+/// orientation, and the pivot brought onto its place in the blocks.
 fn steer_to_alignment(body: &mut RigidBody, alignment: Alignment) {
     let [x, y, z, w] = alignment.orientation;
     let target = rapier3d::na::UnitQuaternion::new_normalize(Quaternion::new(w, x, y, z));
@@ -1527,25 +1528,18 @@ fn steer_to_alignment(body: &mut RigidBody, alignment: Alignment) {
     let rotation = *body.rotation().to_rotation_matrix().matrix();
     let inertia_world = rotation * inertia * rotation.transpose();
 
-    // Turn towards the orientation. Sable's joint motors cannot pull harder
-    // than the solver lets them; the spring gives the same leeway by only
-    // ever seeing a bounded error, so a sub-level lying on its side comes
-    // round in a swing rather than in one step.
-    let turn_kp = ALIGN_TURN_FREQUENCY * ALIGN_TURN_FREQUENCY;
-    let turn_kd = 2.0 * ALIGN_TURN_DAMPING * ALIGN_TURN_FREQUENCY;
+    // Turn towards the orientation.
     let error: Vector3<f32> = (target * body.rotation().inverse()).scaled_axis();
-    let spring = (error * turn_kp).cap_magnitude(MAX_ALIGN_TURN);
-    let angular_acceleration: Vector3<f32> = spring - *body.angvel() * turn_kd;
+    let wanted = (error * ALIGN_TURN_SPEED).cap_magnitude(MAX_ALIGN_TURN_SPEED);
+    let angular_acceleration = (wanted - *body.angvel()) * ALIGN_TURN_RESPONSE;
     body.add_torque(inertia_world * angular_acceleration, true);
 
     // Slide onto the blocks: the pivot to its place within them.
-    let shift_kp = ALIGN_SHIFT_FREQUENCY * ALIGN_SHIFT_FREQUENCY;
-    let shift_kd = 2.0 * ALIGN_SHIFT_DAMPING * ALIGN_SHIFT_FREQUENCY;
     let position = body.translation();
     let offset = Vector3::from(alignment.offset);
     let goal = (position - offset).map(f32::round) + offset;
-    let spring = ((goal - position) * shift_kp).cap_magnitude(MAX_ALIGN_SHIFT);
-    let acceleration: Vector3<f32> = spring - *body.linvel() * shift_kd;
+    let spring = ((goal - position) * ALIGN_SHIFT_STIFFNESS).cap_magnitude(MAX_ALIGN_SHIFT);
+    let acceleration: Vector3<f32> = spring - *body.linvel() * ALIGN_SHIFT_DAMPING;
     body.add_force(acceleration * body.mass(), true);
 }
 

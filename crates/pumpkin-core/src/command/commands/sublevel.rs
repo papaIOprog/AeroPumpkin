@@ -404,7 +404,7 @@ impl CommandExecutor for ListExecutor {
         for (body, chunk, ready, tracking) in levels {
             context.source.send_feedback(
                 green(format!(
-                    "Sub-level {} at ({:.1}, {:.1}, {:.1}) vel ({:.1}, {:.1}, {:.1}), plot chunk ({}, {}), {}, {} tracker(s)",
+                    "Sub-level {} at ({:.2}, {:.2}, {:.2}) vel ({:.2}, {:.2}, {:.2}) turned ({:.3}, {:.3}, {:.3}, {:.3}), plot chunk ({}, {}), {}, {} tracker(s)",
                     body.id,
                     body.position[0],
                     body.position[1],
@@ -412,6 +412,10 @@ impl CommandExecutor for ListExecutor {
                     body.linear_velocity[0],
                     body.linear_velocity[1],
                     body.linear_velocity[2],
+                    body.rotation[0],
+                    body.rotation[1],
+                    body.rotation[2],
+                    body.rotation[3],
                     chunk.x,
                     chunk.y,
                     if ready { "ready" } else { "generating" },
