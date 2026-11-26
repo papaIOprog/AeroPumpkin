@@ -162,8 +162,9 @@ strip = false
 [profile.dev]
 debug = false
 
-# Unoptimized, rapier takes about 20 ms per sub-step for a single sub-level standing on terrain,
-# which overruns the tick once a few exist. The server's own crates stay debug builds.
+# Built optimized in debug builds: unoptimized, rapier takes about 20 ms per sub-step for a
+# single sub-level standing on terrain, and the light engine up to 40 ms for one block. The
+# crates the server's own logic lives in stay debug builds.
 [profile.dev.package.rapier3d]
 opt-level = 3
 
@@ -171,6 +172,12 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.nalgebra]
+opt-level = 3
+
+[profile.dev.package.pumpkin-data]
+opt-level = 3
+
+[profile.dev.package.pumpkin-world]
 opt-level = 3
 
 [workspace.dependencies]
